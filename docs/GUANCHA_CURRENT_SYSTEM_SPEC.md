@@ -55,11 +55,11 @@
 
 `Home → 首次偏好引导/跳过 → 候选与本次需求 → 图片提取 → 证据/感官/Personal Fit → Decision V1 → 高价值追问 → 商家回复 → Aggregate Rejudge → Decision V2 + Delta → 用户选择 → 本地茶仓/泡茶记录`
 
-代码门已经关闭已知 P0/P1 隐私和状态完整性问题；前端、无数据库后端、隐私和离线 AI Eval 有自动验证。但真实 PostgreSQL 主链、数据库 exactly-once、当前浏览器完整 E2E、当前 live provider 质量和实际部署环境仍未确认。
+代码门已经关闭已知 P0/P1 隐私和状态完整性问题；前端、真实隔离 PostgreSQL、隐私和数据库 AI Eval 均有自动验证。真实浏览器已完成一条 FakeProvider 本地闭环，但完整浏览器场景矩阵、live provider 质量和实际部署环境仍未确认。
 
 因此当前最高准确发布判断是：
 
-> `CODE_GATES_CLOSED_DB_BROWSER_VALIDATION_REQUIRED`
+> `DATABASE_GATE_CLOSED_BROWSER_FINAL_CHECK_REMAINING`
 
 这不是“已准备生产发布”，也不是“真实用户验证通过”。
 
@@ -160,7 +160,7 @@ Selection Need 位于候选页的可编辑卡片/弹层，不是独立页面。�
 
 本地持久化不保存 Need 自由文本。活跃 session reload 时由服务端 snapshot 恢复；未提交、无 session 的草稿刷新后可丢失，这是当前隐私优先取舍。
 
-状态：前端“服务端成功后再清理旧派生状态”的 transition 为 `IMPLEMENTED_VERIFIED`；PostgreSQL 原子失效链与真实浏览器 reload 为 `IMPLEMENTED_PARTIALLY_VERIFIED` / BLOCKED。
+状态：前端“服务端成功后再清理旧派生状态”的 transition 与 PostgreSQL 原子失效链为 `IMPLEMENTED_VERIFIED`；真实浏览器 reload 仍为 `IMPLEMENTED_PARTIALLY_VERIFIED`。
 
 ### 4.3 候选、图片与分析
 
@@ -214,7 +214,7 @@ Evidence strength 为 `low`、`medium`、`high`。
 - `system-consistent` 只表示系统内部没有发现矛盾，不等于现实世界验证。
 - 冲突必须保留，不能用后来的声明静默覆盖旧来源。
 
-状态：answer contract、provider 与 repository 纯逻辑/Stub 边界为 `IMPLEMENTED_VERIFIED`；真实 PostgreSQL 路径为 `IMPLEMENTED_PARTIALLY_VERIFIED`，真实模型抽取质量 `UNCONFIRMED`。
+状态：answer contract、provider 与 repository 边界及真实 PostgreSQL 持久化路径为 `IMPLEMENTED_VERIFIED`；真实模型抽取质量 `UNCONFIRMED`。
 
 ## 7. 感官翻译
 
@@ -273,7 +273,7 @@ CandidateDecision 内容随版本保存，V1/V2 可追溯。DecisionVersion 生�
 
 这是一套规则化的 Next Best Question 机制，不是训练中的主动学习系统。默认 fake provider 只返回按规则选出的前三项。已知字段不应重复问，低价值问题可以合法返回空列表；“空问题”与“生成失败”是两个不同状态。
 
-状态：纯逻辑 `IMPLEMENTED_VERIFIED`；需要数据库的问题闭环测试部分 `BLOCKED`。
+状态：纯逻辑与 PostgreSQL 问题闭环为 `IMPLEMENTED_VERIFIED`。
 
 ## 11. Merchant Reply Contract
 
@@ -292,7 +292,7 @@ Rejudge 是 session-scoped aggregate 操作：收集当前 Decision 的问题和
 
 Delta 用于回答：首选是否变化、行动档位是否变化、风险新增/解除、事实新增、冲突新增，以及为什么发生变化。`changed`、`unchanged`、`risk changed`、`still unknown/insufficient` 都是合法结果。Delta 不证明模型训练或线上学习。
 
-状态：纯 service/stub 路径 `IMPLEMENTED_VERIFIED`；真实 PostgreSQL V2/Delta `BLOCKED`。
+状态：纯 service/stub 路径与真实 PostgreSQL V2/Delta 为 `IMPLEMENTED_VERIFIED`。
 
 ## 13. 状态权威、恢复与客户端持久化
 
@@ -360,19 +360,19 @@ Server authoritative 共 13 个：
 - candidate reorder 与恢复使用稳定 candidate identity；
 - server event ID 使用稳定资源身份构造，可在 export 时去重。
 
-上述 created-edge 与进程内 duplicate enqueue 防护有代码级测试。PostgreSQL 同 key 并发、事务和 raw event exactly-once 仍为 BLOCKED，不能由进程内验证外推。
+上述 created-edge 与进程内 duplicate enqueue 防护有代码级测试；隔离 PostgreSQL 同 key 并发、事务与资源幂等性已验证。产品事件 JSONL 的进程重启后物理重复仍依赖 export 的 event-id 首见去重语义。
 
 ## 15. AI Eval
 
 当前机器可读评测矩阵共 30 个案例：
 
-- 26 PASS；
+- 30 PASS；
 - 0 FAIL；
-- 4 BLOCKED（均依赖未配置的 `TEST_DATABASE_URL`）。
+- 0 BLOCKED（Phase 17A 在隔离 `guancha_test` 运行）。
 
 评测覆盖 Decision、Need、营销边界、证据来源、回复词汇、状态/replay 以及部分 Question/Rejudge。Extraction 的固定 fixture 合同不等于真实图片/provider 端到端；runner 会把 DB 缺失写为 BLOCKED，不把 skip 当 PASS。当前结果也不代表线上准确率或商业效果。
 
-状态：离线/非 DB 层 `IMPLEMENTED_VERIFIED`；数据库层 `BLOCKED`；live provider `UNCONFIRMED`。
+状态：离线/数据库层 `IMPLEMENTED_VERIFIED`；live provider `UNCONFIRMED`。
 
 ## 16. 工程形态
 
@@ -398,11 +398,11 @@ Server authoritative 共 13 个：
 | Sensory Interpretation | 受控地把术语转成感官方向 | 不声称真实实喝或必然结果 | `IMPLEMENTED_VERIFIED` |
 | Personal Fit | Need-first 的有边界适配 | 不让长期偏好压过本次 Need | `IMPLEMENTED_VERIFIED` |
 | Decision | 规则档位和同档排序 | 不输出伪 AI 总分 | `IMPLEMENTED_VERIFIED` |
-| Question | 选择可能改变决策的未知信息 | 不把字段完整度冒充问题价值 | `IMPLEMENTED_PARTIALLY_VERIFIED` |
+| Question | 选择可能改变决策的未知信息 | 不把字段完整度冒充问题价值 | `IMPLEMENTED_VERIFIED` |
 | MerchantReply | 逐题解析商家自然语言并保留来源 | 不验证商家声明为客观事实 | `IMPLEMENTED_VERIFIED` |
-| Rejudge | 聚合当前回复后重跑同一 evaluator | 不做一答一推荐 | `IMPLEMENTED_PARTIALLY_VERIFIED` |
-| Version / Delta | 保存 V1/V2 内容和变化解释 | 不把所有生命周期字段称为 immutable | `IMPLEMENTED_PARTIALLY_VERIFIED` |
-| Persistence / PostgreSQL | 权威业务状态、lineage、恢复 | 不存图片；不依赖 localStorage 作为事实源 | `IMPLEMENTED_PARTIALLY_VERIFIED` |
+| Rejudge | 聚合当前回复后重跑同一 evaluator | 不做一答一推荐 | `IMPLEMENTED_VERIFIED` |
+| Version / Delta | 保存 V1/V2 内容和变化解释 | 不把所有生命周期字段称为 immutable | `IMPLEMENTED_VERIFIED` |
+| Persistence / PostgreSQL | 权威业务状态、lineage、恢复 | 不存图片；不依赖 localStorage 作为事实源 | `IMPLEMENTED_VERIFIED` |
 | Analytics | 匿名、闭集、fail-open 产品事件 | 不影响 Decision，不冒充真实使用数据 | `IMPLEMENTED_VERIFIED` |
 
 ### 16.2 AI / Rule Boundary
@@ -416,13 +416,13 @@ Server authoritative 共 13 个：
 | 验证层 | 结果 | 事实状态 |
 |---|---:|---|
 | Frontend tests | 61/61 PASS | `IMPLEMENTED_VERIFIED` |
-| Backend tests | 228 PASS / 76 SKIP | `IMPLEMENTED_PARTIALLY_VERIFIED` |
-| AI Eval | 26 PASS / 0 FAIL / 4 BLOCKED | `IMPLEMENTED_PARTIALLY_VERIFIED` |
+| Backend tests | 304 PASS / 0 SKIP（isolated PostgreSQL） | `IMPLEMENTED_VERIFIED` |
+| AI Eval | 30 PASS / 0 FAIL / 0 BLOCKED（isolated PostgreSQL） | `IMPLEMENTED_VERIFIED` |
 | Privacy focused | 26/26，P0/P1=0 | `IMPLEMENTED_VERIFIED` |
 | Node syntax / Python AST | PASS | `IMPLEMENTED_VERIFIED` |
 | Diff/secret checks | PASS | `IMPLEMENTED_VERIFIED` |
-| PostgreSQL full state matrix | 未运行 | `UNCONFIRMED` / BLOCKED |
-| Browser full E2E | 未建立可用会话 | `UNCONFIRMED` / BLOCKED |
+| PostgreSQL full state matrix | 304 backend PASS；DB red team PASS_WITH_BOUNDARIES | `IMPLEMENTED_VERIFIED` |
+| Browser full E2E | 一条 FakeProvider 闭环与三种 viewport PASS；完整矩阵未完成 | `IMPLEMENTED_PARTIALLY_VERIFIED` |
 | Live provider current commit | 0 calls | `UNCONFIRMED` |
 | Real user validation | 0 participants | `UNCONFIRMED` |
 
@@ -430,8 +430,8 @@ Server authoritative 共 13 个：
 
 ### 18.1 Phase 15 正式 Release Gate Blockers
 
-1. 配置独立 `TEST_DATABASE_URL`，运行全部 76 个数据库测试和 AI Eval 4 个 DB case。
-2. 建立 browser-accessible localhost / E2E runtime，验证首次/跳过 onboarding、1/2/5 candidates、Need 修改失效、active reload、商家回复、复判、选择、茶仓，以及 390×844、430×844、1280×900。
+1. 已配置隔离 `guancha_test` 并完成数据库测试、AI Eval 和 database red team；保持其 operator safety gate。
+2. 完成 browser-accessible localhost 的其余场景：首次/跳过 onboarding、两候选重排、Need 修改失效、active reload、模糊/冲突回复与 ranking-changed 分支；已完成一条商家回复→复判→选择→茶仓闭环和三种 viewport。
 
 数据库 blocker 应覆盖 Session→Candidate→Image→Analysis→Decision V1→Question→Reply→Rejudge→V2→Delta 及 same-key replay/exactly-once。
 
@@ -542,6 +542,7 @@ Server authoritative 共 13 个：
 6. Phase 14 增加隐私安全 analytics、用户验证工具包并暴露发布边界。
 7. Phase 15 关闭客户端持久化、replay、candidate identity、skip/history 语义等代码门；数据库与浏览器仍待验。
 8. Phase 16 只整合当前事实，不改变产品代码。
+9. Phase 17A 在隔离 PostgreSQL 中关闭此前 DB 验证 blocker；浏览器完整矩阵仍待完成。
 
 ## 25. Appendix A — Resume-safe Current Facts
 
@@ -558,10 +559,10 @@ Server authoritative 共 13 个：
 - 商家回复逐题绑定，统一复判，V2 + Delta。
 - selection bridge v3 不持久化自由文本或 evidence/answer/delta 树。
 - Analytics 为 13 client + 13 server，fail-open，不影响决策。
-- AI Eval 30=26 PASS/0 FAIL/4 BLOCKED。
-- 前端 61/61；后端 228 PASS/76 DB SKIP；用户验证 0。
+- AI Eval 30=30 PASS/0 FAIL/0 BLOCKED（隔离 PostgreSQL）。
+- 前端 61/61；后端 304 PASS/0 SKIP（隔离 PostgreSQL）；用户验证 0。
 - 实际部署平台、commit、provider/model、数据库 host 均未知。
-- 真实 Postgres 主链和浏览器 E2E 是下一发布门。
+- 浏览器完整场景矩阵、live provider 质量和部署审查是下一发布门。
 
 这些事实可作为作品集/简历材料的证据底稿，但不代表已经替用户写好简历，也不得删除其中的验证边界。
 
@@ -586,8 +587,8 @@ Server authoritative 共 13 个：
 | What is unclear | Why it cannot be proven | Evidence that would resolve it |
 |---|---|---|
 | deployed commit、平台、端口、provider/model、DB host | repo 配置只能说明兼容形态，没有平台侧事实 | 部署控制台/只读运行配置与 commit digest |
-| PostgreSQL 全链、并发 replay、exactly-once | 无独立 `TEST_DATABASE_URL`，76 tests skipped | 隔离测试库全套与并发 API 证据 |
-| 浏览器/移动端主链、reload、console/network、性能 | 当前无法建立可用浏览器 localhost 会话 | 受控浏览器 E2E、截图、network/console 记录 |
+| PostgreSQL 全链、并发 replay、exactly-once | 已在 `guancha_test` 执行；JSONL 物理重复跨进程仍靠 export 去重 | 进程重启/多进程 telemetry soak |
+| 浏览器/移动端主链、reload、console/network、性能 | 已完成一条 localhost FakeProvider 闭环和 viewport smoke；完整状态矩阵未跑 | 受控浏览器场景矩阵、console/network/性能记录 |
 | live extraction 质量与营销边界 | Phase 15 provider calls=0，fixture 非真实视觉质量 | 当前 commit 的受控 live provider smoke/eval |
 | 买后完整 UI 与 seed 策略 | 只有代码/局部测试，无完整浏览器链和产品决定 | 买后浏览器验收与明确 seed 决策 |
 | IndexedDB TTL/eviction | 当前实现没有机制 | 独立设计批准、实现和时间推进测试 |

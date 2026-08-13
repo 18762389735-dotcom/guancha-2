@@ -493,9 +493,10 @@ async def test_startup_recovery_makes_interrupted_enqueue_failure_retryable(
                 f"/api/v1/candidates/{candidate_id}/extraction-jobs",
                 headers={"X-Client-Id": client_id, "Idempotency-Key": str(uuid4())},
             )
+        assert retry_runner.pending_count == 1
     assert recovered.status_code == 201
     assert recovered.json()["status"] == "queued"
-    assert retry_runner.pending_count == 1
+    assert retry_runner.pending_count == 0
 
 
 async def test_interrupted_job_retry_uses_new_idempotency_key_and_replays(

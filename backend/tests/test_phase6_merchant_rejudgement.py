@@ -139,6 +139,13 @@ async def test_persisted_merchant_conflict_requires_an_explicit_known_opposite_p
     headers = {"X-Client-Id": str(uuid4())}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         session_id, v1 = await _current_decision(client, headers, runner)
+        questions = await client.post(
+            f"/api/v1/decision-versions/{v1}/questions",
+            headers={**headers, "Idempotency-Key": str(uuid4())},
+        )
+        assert questions.status_code == 201
+        question_rows = questions.json()
+        roast_question = next(item for item in question_rows if item["field_key"] == "roast_level")
         async with repository._connection.cursor() as cursor:
             await cursor.execute(
                 """select cd.extraction_version_id,v.source_image_id,c.id as candidate_id
@@ -151,19 +158,33 @@ async def test_persisted_merchant_conflict_requires_an_explicit_known_opposite_p
                 """insert into evidence_items (id,extraction_version_id,field_name,raw_text,normalized_value,model_confidence,
                    information_status,source_type,verification_status,source_image_id,source_location,evidence_strength)
                    values (%s,%s,'roast_level',%s,%s,0.8,%s,'product-claim','unverified',%s,'test','medium')""",
-                (uuid4(), evidence["extraction_version_id"], product_value, product_value, product_status, evidence["source_image_id"]),
-            )
-        questions = await client.post(
-            f"/api/v1/decision-versions/{v1}/questions",
-            headers={**headers, "Idempotency-Key": str(uuid4())},
-        )
-        roast_question = next(item for item in questions.json() if item["field_key"] == "roast_level")
+                    (uuid4(), evidence["extraction_version_id"], product_value, product_value, product_status, evidence["source_image_id"]),
+                )
         reply = await client.post(
             f"/api/v1/selection-sessions/{session_id}/merchant-replies",
             headers={**headers, "Idempotency-Key": str(uuid4())},
             json={"decision_version_id": v1, "followup_question_id": roast_question["id"], "raw_text": "light roast"},
         )
         assert reply.status_code == 201
+        for question in question_rows:
+            if question["id"] == roast_question["id"]:
+                continue
+            reply_text = {
+                "price": "280元",
+                "aroma_style": "清香",
+            }.get(question["field_key"], "不清楚")
+            extra = await client.post(
+                f"/api/v1/selection-sessions/{session_id}/merchant-replies",
+                headers={**headers, "Idempotency-Key": str(uuid4())},
+                json={"decision_version_id": v1, "followup_question_id": question["id"], "raw_text": reply_text},
+            )
+            assert extra.status_code == 201
+        rejudge = await client.post(
+            f"/api/v1/selection-sessions/{session_id}/rejudge",
+            headers={**headers, "Idempotency-Key": str(uuid4())},
+            json={},
+        )
+        assert rejudge.status_code == 201, rejudge.text
         assert await runner.drain() == 1
         async with repository._connection.cursor() as cursor:
             await cursor.execute("select information_status,conflicts_with_evidence_id from merchant_claims where merchant_reply_id=%s", (reply.json()["id"],))
