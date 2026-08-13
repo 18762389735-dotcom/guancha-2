@@ -101,7 +101,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 
 /* form and candidates */
 .need-card { position:relative; padding:15px 16px; margin-bottom:18px; min-height:98px; overflow:hidden; }
-.need-card .leaf-float { position:absolute; right:20px; bottom:17px; color:#d7e4aa; transform:rotate(-18deg); }
+.need-card .leaf-float { position:absolute; right:20px; bottom:17px; color:#d7e4aa; transform:rotate(-18deg); pointer-events:none; }
 .need-card .leaf-float svg { width:34px; height:34px; stroke-width:1.25; }
 .need-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; font-size:21px; }
 .edit-need { display:flex; gap:6px; align-items:center; border:0; background:transparent; color:#666; font-size:14px; }

@@ -24,6 +24,11 @@ function load(window, filename) {
   vm.runInNewContext(fs.readFileSync(filename, 'utf8'), window, { filename });
 }
 
+test('need-card decoration does not intercept the editable Need control', () => {
+  const styles = fs.readFileSync(path.join(root, '..', 'styles.css'), 'utf8');
+  assert.match(styles, /\.need-card \.leaf-float\s*\{[^}]*pointer-events\s*:\s*none\s*;/s);
+});
+
 test('real-flow client uses only backend contracts for session, candidate, image, job and decision', async () => {
   const window = browser();
   load(window, path.join(root, 'api-client.js'));
