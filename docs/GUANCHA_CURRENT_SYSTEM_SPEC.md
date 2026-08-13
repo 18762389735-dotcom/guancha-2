@@ -7,16 +7,16 @@
 
 观茶当前系统事实总规范
 
-版本：Phase 16 / 2026-08-13  
-当前产品代码边界：`cabc959`  
-当前发布门报告边界：`84f1435`  
+版本：Phase 17B / 2026-08-13  
+当前产品代码边界：`5bdd600`  
+当前发布门报告边界：`5bdd600`  
 文档状态：当前系统 SSOT（Single Source of Truth）
 
 ## 0. Document Authority
 
-- Current product code commit：`cabc959`
-- Current documentation baseline：`84f1435`
-- Current branch：`codex/system-spec-consolidation`
+- Current product code commit：`5bdd600`
+- Current documentation baseline：`5bdd600`
+- Current validation branch：`codex/final-browser-provider-validation`
 - Generated date：2026-08-13
 - Authority：当前系统事实唯一入口；旧 PRD 用于理解历史设计，不再单独作为“当前已实现状态”的依据。
 
@@ -55,11 +55,11 @@
 
 `Home → 首次偏好引导/跳过 → 候选与本次需求 → 图片提取 → 证据/感官/Personal Fit → Decision V1 → 高价值追问 → 商家回复 → Aggregate Rejudge → Decision V2 + Delta → 用户选择 → 本地茶仓/泡茶记录`
 
-代码门已经关闭已知 P0/P1 隐私和状态完整性问题；前端、真实隔离 PostgreSQL、隐私和数据库 AI Eval 均有自动验证。真实浏览器已完成一条 FakeProvider 本地闭环，但完整浏览器场景矩阵、live provider 质量和实际部署环境仍未确认。
+代码门已经关闭已知 P0/P1 隐私和状态完整性问题；前端、真实隔离 PostgreSQL、隐私和数据库 AI Eval 均有自动验证。FakeProvider 浏览器矩阵已执行 21 项（16 PASS、5 个诚实 BLOCKED、0 FAIL），独立浏览器红队无 P0/P1；真实 Provider 未发送 demo fixture，因无已授权真实商品截图而保持 BLOCKED。
 
 因此当前最高准确发布判断是：
 
-> `DATABASE_GATE_CLOSED_BROWSER_FINAL_CHECK_REMAINING`
+> `RUNTIME_GATES_CLOSED_PROVIDER_SMOKE_BLOCKED`
 
 这不是“已准备生产发布”，也不是“真实用户验证通过”。
 
@@ -191,7 +191,7 @@ Selection Need 位于候选页的可编辑卡片/弹层，不是独立页面。�
 
 ### 5.2 Provider 状态
 
-代码支持 unavailable、fake、OpenAI 和 MiMo 兼容 provider 配置。当前 Beta 文档以 MiMo 为目标，但本轮没有证据确认实际 runtime provider/model；Phase 15 的 live provider 调用数为 0。历史 smoke 只能标记为 `HISTORICAL_ONLY`。
+代码支持 unavailable、fake、OpenAI 和 MiMo 兼容 provider 配置。当前 Beta 文档以 MiMo 为目标，但实际部署 runtime provider/model 仍未确认。Phase 17B 检测到兼容凭据可用，但没有已授权真实商品截图，live multimodal 调用数为 0；历史 smoke 只能标记为 `HISTORICAL_ONLY`。
 
 ## 6. Evidence Contract
 
@@ -415,15 +415,15 @@ Server authoritative 共 13 个：
 
 | 验证层 | 结果 | 事实状态 |
 |---|---:|---|
-| Frontend tests | 61/61 PASS | `IMPLEMENTED_VERIFIED` |
+| Frontend tests | 62/62 PASS | `IMPLEMENTED_VERIFIED` |
 | Backend tests | 304 PASS / 0 SKIP（isolated PostgreSQL） | `IMPLEMENTED_VERIFIED` |
 | AI Eval | 30 PASS / 0 FAIL / 0 BLOCKED（isolated PostgreSQL） | `IMPLEMENTED_VERIFIED` |
 | Privacy focused | 26/26，P0/P1=0 | `IMPLEMENTED_VERIFIED` |
 | Node syntax / Python AST | PASS | `IMPLEMENTED_VERIFIED` |
 | Diff/secret checks | PASS | `IMPLEMENTED_VERIFIED` |
 | PostgreSQL full state matrix | 304 backend PASS；DB red team PASS_WITH_BOUNDARIES | `IMPLEMENTED_VERIFIED` |
-| Browser full E2E | 一条 FakeProvider 闭环与三种 viewport PASS；完整矩阵未完成 | `IMPLEMENTED_PARTIALLY_VERIFIED` |
-| Live provider current commit | 0 calls | `UNCONFIRMED` |
+| Browser full E2E | 21-case FakeProvider matrix：16 PASS / 0 FAIL / 5 BLOCKED；red team PASS_WITH_P2 | `IMPLEMENTED_PARTIALLY_VERIFIED` |
+| Live provider current commit | 0 calls；无授权真实截图，smoke BLOCKED | `UNCONFIRMED` |
 | Real user validation | 0 participants | `UNCONFIRMED` |
 
 ## 18. 发布阻塞项
@@ -507,6 +507,7 @@ Server authoritative 共 13 个：
 | Phase 15 product code | `cabc959` |
 | Release-gate branch/report | `codex/release-gate-closure` / `84f1435` |
 | Phase 16 SSOT branch | `codex/system-spec-consolidation` |
+| Phase 17B validation branch/report | `codex/final-browser-provider-validation` / `5bdd600` |
 | Actually deployed commit | `UNCONFIRMED` |
 | Platform / runtime port / provider-model / DB host | `UNCONFIRMED` |
 
@@ -542,15 +543,16 @@ Server authoritative 共 13 个：
 6. Phase 14 增加隐私安全 analytics、用户验证工具包并暴露发布边界。
 7. Phase 15 关闭客户端持久化、replay、candidate identity、skip/history 语义等代码门；数据库与浏览器仍待验。
 8. Phase 16 只整合当前事实，不改变产品代码。
-9. Phase 17A 在隔离 PostgreSQL 中关闭此前 DB 验证 blocker；浏览器完整矩阵仍待完成。
+9. Phase 17A 在隔离 PostgreSQL 中关闭此前 DB 验证 blocker。
+10. Phase 17B 完成 FakeProvider 浏览器矩阵与红队；修复 Need 编辑按钮被装饰层遮挡的 P1；真实 Provider 因缺少授权真实输入而未调用。
 
 ## 25. Appendix A — Resume-safe Current Facts
 
 后续任务可以直接依赖以下事实，无需重读所有历史文档：
 
 - 北极星是专业茶语 → 感官含义 → 候选决策，不是识茶/OCR。
-- 当前产品代码边界 `cabc959`，Phase 15 报告边界 `84f1435`。
-- 当前发布判断是 `CODE_GATES_CLOSED_DB_BROWSER_VALIDATION_REQUIRED`。
+- 当前产品代码与验证报告边界 `5bdd600`。
+- 当前发布判断是 `RUNTIME_GATES_CLOSED_PROVIDER_SMOKE_BLOCKED`。
 - 当前范围 1–5 候选、每候选 1–2 图。
 - Need 优先于偏好；skip 不产生伪偏好。
 - Evidence 来源和验证状态必须分开；商家声明未核验。
@@ -560,9 +562,9 @@ Server authoritative 共 13 个：
 - selection bridge v3 不持久化自由文本或 evidence/answer/delta 树。
 - Analytics 为 13 client + 13 server，fail-open，不影响决策。
 - AI Eval 30=30 PASS/0 FAIL/0 BLOCKED（隔离 PostgreSQL）。
-- 前端 61/61；后端 304 PASS/0 SKIP（隔离 PostgreSQL）；用户验证 0。
+- 前端 62/62；后端 304 PASS/0 SKIP、AI Eval 30/30 PASS（隔离 PostgreSQL）；用户验证 0。
 - 实际部署平台、commit、provider/model、数据库 host 均未知。
-- 浏览器完整场景矩阵、live provider 质量和部署审查是下一发布门。
+- 真实 Provider 质量、部署配置确认和用户研究是下一发布门；浏览器仍有 5 个明确 BLOCKED 的可控性验证债务。
 
 这些事实可作为作品集/简历材料的证据底稿，但不代表已经替用户写好简历，也不得删除其中的验证边界。
 
@@ -588,8 +590,8 @@ Server authoritative 共 13 个：
 |---|---|---|
 | deployed commit、平台、端口、provider/model、DB host | repo 配置只能说明兼容形态，没有平台侧事实 | 部署控制台/只读运行配置与 commit digest |
 | PostgreSQL 全链、并发 replay、exactly-once | 已在 `guancha_test` 执行；JSONL 物理重复跨进程仍靠 export 去重 | 进程重启/多进程 telemetry soak |
-| 浏览器/移动端主链、reload、console/network、性能 | 已完成一条 localhost FakeProvider 闭环和 viewport smoke；完整状态矩阵未跑 | 受控浏览器场景矩阵、console/network/性能记录 |
-| live extraction 质量与营销边界 | Phase 15 provider calls=0，fixture 非真实视觉质量 | 当前 commit 的受控 live provider smoke/eval |
+| 浏览器/移动端主链、reload、console/network、性能 | 21-case matrix 无 FAIL，但 5 个场景受 fixture/history/fault injection 限制而 BLOCKED | 可控 browser fixture、history 和 telemetry failure injection |
+| live extraction 质量与营销边界 | 没有已授权真实截图；Provider 调用为 0 | 当前 commit 的受控 live provider smoke/eval |
 | 买后完整 UI 与 seed 策略 | 只有代码/局部测试，无完整浏览器链和产品决定 | 买后浏览器验收与明确 seed 决策 |
 | IndexedDB TTL/eviction | 当前实现没有机制 | 独立设计批准、实现和时间推进测试 |
 | Analytics retention/rotation | 只实现 sink/导出，没有部署运维配置 | 当前环境 retention/rotation 配置与演练 |
