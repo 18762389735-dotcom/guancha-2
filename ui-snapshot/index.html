@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#F7F7F7" />
+    <title>观茶 · 选茶原型</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="prototype-shell" aria-label="观茶移动端交互原型">
+      <section class="app-screen" id="app" aria-live="polite"></section>
+    </main>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+      <input id="album-input" type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" hidden />
+      <input id="camera-input" type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" capture="environment" hidden />
+      <input id="candidate-image-input" type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" hidden />
+    <script src="frontend/stores.js?v=2"></script>
+    <script src="frontend/product-analytics.js?v=1"></script>
+    <script src="frontend/api-client.js"></script>
+    <script src="frontend/public-config.js"></script>
+    <script src="frontend/image-preparation.js"></script>
+    <script src="frontend/adapters.js?v=3"></script>
+    <script src="frontend/onboarding-routing.js?v=1"></script>
+    <script src="frontend/job-poller.js"></script>
+    <script src="app.js?v=16"></script>
+  </body>
+</html>

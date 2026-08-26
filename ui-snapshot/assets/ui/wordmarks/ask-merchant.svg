@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="23"
+   height="10"
+   viewBox="93 143 23 10"
+   version="1.1"
+   id="svg1"
+   inkscape:version="1.4.4 (dcaf3e7, 2026-05-05)"
+   sodipodi:docname="02_问商家1.svg"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview1"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:document-units="mm"
+     inkscape:zoom="0.71891835"
+     inkscape:cx="396.42889"
+     inkscape:cy="561.25984"
+     inkscape:window-width="1904"
+     inkscape:window-height="993"
+     inkscape:window-x="78"
+     inkscape:window-y="0"
+     inkscape:window-maximized="0"
+     inkscape:current-layer="layer1" />
+  <defs
+     id="defs1" />
+  <g
+     inkscape:label="图层 1"
+     inkscape:groupmode="layer"
+     id="layer1">
+    <path
+       style="fill:none;stroke:#3d3d3d"
+       d="m 104.21667,145.12755 c 0.88965,0.66507 1.3005,0.80389 2.38125,0.52917 m 4.7625,-0.26459 2.11666,1.05833 m -18.256247,-0.79374 0.79375,0.52916 M 97.3375,145.9213 c 0.64133,-0.006 1.660744,-0.19385 2.109318,0.39361 0.807122,1.05701 0.381885,4.38443 -0.521818,4.89805 m 5.82083,-5.55624 -1.5875,3.70416 m -0.26458,-2.91042 0.79375,0.26459 m 5.82083,0.79375 2.11667,-1.32292 m -6.35,0.26458 -1.5875,1.32292 m -8.73125,-0.52917 v 3.70417 m 11.1125,-2.11667 -0.79375,-1.32291 c 2.02823,-0.0657 1.76382,2.47712 1.32292,3.96875 l -0.79375,-0.52917 m 3.96875,-1.5875 2.64583,-2.11667 m -2.11667,0.26459 h 0.79375 m -12.96458,0.52916 -1.322916,1.5875 c -0.262794,-1.17921 0.17562,-1.75504 1.322916,-1.5875 m 4.23333,3.43959 c 0.26656,-1.43577 0.0952,-3.02719 1.32292,-3.70417 m 7.40833,0.26458 c 1.28279,1.27911 2.16764,2.31961 3.96875,2.64584 m -1.5875,-2.38125 -1.32291,1.05833 m -8.46667,-0.26458 1.5875,0.52916 c -0.45649,0.69399 -0.7396,0.66631 -1.32292,0.26459 m 7.14375,-0.79375 -1.32291,1.32291 m 2.38125,-1.05833 -2.11667,1.85208 m 2.11667,-1.32291 -0.79375,1.5875"
+       id="path1" />
+  </g>
+</svg>
