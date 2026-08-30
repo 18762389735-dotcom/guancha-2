@@ -130,7 +130,7 @@ selection_sessions
 
 ## 4. CloudBase Authentication 最小接入点（Phase 9-3 已实现前端边界）
 
-认证服务确定为 Tencent CloudBase Authentication。前端通过官方 CDN 固定使用 `@cloudbase/js-sdk` v3.8.2：`https://static.cloudbase.net/cloudbase-js-sdk/3.8.2/cloudbase.full.js`（实现时验证 HTTP 200）。不使用已经标记为旧版的 v2 SDK，也没有安装 bundler / npm auth 依赖。CloudBase SDK / API 若未来更新，应在对应实现阶段重新核验官方文档，不永久锁死一个已过时的小版本 API。
+认证服务确定为 Tencent CloudBase Authentication。前端通过官方 CDN 固定使用 `@cloudbase/js-sdk` v3.8.2：`https://static.cloudbase.net/cloudbase-js-sdk/3.8.2/cloudbase.full.js`（实现时验证 HTTP 200）。SDK 以 v3 的 `app.auth` 对象形态为主；历史 callable 形态只在完整 auth method contract 存在时作为兼容 fallback。生命周期使用 `onAuthStateChange((event, session, info) => ...)`。不使用已经标记为旧版的 v2 SDK，也没有安装 bundler / npm auth 依赖。CloudBase SDK / API 若未来更新，应在对应实现阶段重新核验官方文档，不永久锁死一个已过时的小版本 API。
 
 ### 4.1 Frontend：最小侵入边界
 
@@ -336,7 +336,7 @@ Phase 9-2 测试覆盖：authenticated A 创建 session 后，去掉 Bearer 但�
 - account switch；
 - localStorage / IndexedDB / poller isolation。
 
-实现边界：CloudBase SDK session 由 SDK 自行持久化；Guancha 不写 access token、refresh token 或密码到浏览器业务存储。public config 仅公开 env ID、region、publishable key、required/configured/provider；`GUANCHA_AUTH_REQUIRED=true` 而浏览器配置不完整时，UI 显示“登录服务暂未配置”，不会进入匿名产品。首次认证登录、账号切换和显式登出均调用 `GuanchaStores.clearAll()`，清除 pending image path 并移除 `guancha.auth-user-id.v1` marker。新认证账号使用无 warehouse、Journal、历史、候选和偏好 seed 的干净状态；旧 anonymous 数据不上传、不认领。
+实现边界：CloudBase SDK session 由 SDK 自行持久化；Guancha 不写 access token、refresh token 或密码到浏览器业务存储。public config 仅公开 env ID、region、publishable key、required/configured/provider，并只接受 `ap-shanghai`、`ap-guangzhou`、`ap-singapore`；已配置 backend 的 config 请求失败或返回不可信结构时显示阻断页，不推断 `auth.required=false`。`GUANCHA_AUTH_REQUIRED=true` 而浏览器配置不完整时，UI 显示“登录服务暂未配置”，不会进入匿名产品。首次认证登录、账号切换和显式登出均调用 `GuanchaStores.clearAll()`，清除 pending image path 并移除 `guancha.auth-user-id.v1` marker。新认证账号使用无 warehouse、Journal、历史、候选和偏好 seed 的干净状态；旧 anonymous 数据不上传、不认领。
 
 未处理：真实 CloudBase console / secure domain / publishable key 配置和 live smoke，account recovery，以及 user-scoped Warehouse / Journal / Preferences 云端 CRUD。
 
@@ -356,6 +356,6 @@ Phase 9-3 不代表真实 CloudBase runtime 已验证，也不代表账号恢复
 - 本审计基于当前实际的 `app.js`、`frontend/`、`backend/src/guancha_api/`、`supabase/migrations/` 和测试目录扫描整理。
 - Phase 9-3 只修改 public config、frontend auth/API/UI/account-boundary 以及必要测试和文档；没有改动 Provider、Selection Decision Logic、migration 或 CloudBase console。
 - 本轮没有安装认证依赖，没有接入或调用真实 CloudBase，没有使用真实 API Key、真实 access token 或生产数据库。
-- 目标工作树未配置本地 `backend\.venv`，因此使用已核验的共享环境 `C:\Users\QQ\Documents\New project\guancha-o1-o2-prototype\backend\.venv\Scripts\python.exe` 运行相同的 `backend\tests` 集合：`265 passed, 82 skipped`。数据库相关测试在未提供 `TEST_DATABASE_URL` 时 skip，不是测试失败。
-- `node --check app.js`、`node --check frontend/auth-client.js` 和 `node --check frontend/api-client.js` 通过；`node --test frontend/tests/*.test.js` 结果为 `74 passed, 0 failed`。
+- 目标工作树未配置本地 `backend\.venv`，因此使用已核验的共享环境 `C:\Users\QQ\Documents\New project\guancha-o1-o2-prototype\backend\.venv\Scripts\python.exe` 运行相同的 `backend\tests` 集合：`269 passed, 82 skipped`。数据库相关测试在未提供 `TEST_DATABASE_URL` 时 skip，不是测试失败。
+- `node --check app.js`、`node --check frontend/auth-client.js` 和 `node --check frontend/api-client.js` 通过；`node --test frontend/tests/*.test.js` 结果为 `78 passed, 0 failed`。
 - 以上验证没有连接真实 CloudBase、真实 token 或生产数据库；PostgreSQL ownership gate 是否通过，以提交时实际 `TEST_DATABASE_URL` 结果为准。已有 backend auth kernel 和 Selection ownership 不代表前端注册登录或其他云端用户数据能力已经存在。

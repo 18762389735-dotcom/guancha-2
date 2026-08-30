@@ -822,7 +822,7 @@ function authMessage() {
   const code = authBootState.errorCode;
   if (code === 'auth_not_configured') return ['登录服务暂未配置', '请联系管理员完成登录服务配置后再试。'];
   if (code === 'authentication_service_unavailable') return ['登录服务暂不可用', '请稍后重试，当前不会进入匿名选茶。'];
-  if (code === 'database_not_configured' || code === 'service_unavailable') return ['后端服务暂不可用', '请稍后重试。'];
+  if (code === 'backend_unavailable' || code === 'database_not_configured' || code === 'service_unavailable') return ['后端服务暂不可用', '请稍后重试。'];
   return ['登录暂时不可用', '请稍后重试。'];
 }
 function renderAuthGate() {
@@ -1643,9 +1643,7 @@ function bindResultSwipe() {
   });
 }
 function loadPublicConfig() {
-  if (!apiClient.isConfigured) return Promise.resolve(GuanchaPublicConfig.get());
-  return apiClient.getPublicConfig().then((config) => GuanchaPublicConfig.apply(config))
-    .catch(() => GuanchaPublicConfig.get());
+  return GuanchaPublicConfig.loadForBoot(apiClient);
 }
 
 function stopRuntimeBusinessState() {
@@ -1727,7 +1725,14 @@ async function bootAuth() {
   appReady = false;
   authBootState = { status: 'loading', errorCode: null };
   render();
-  const publicConfig = await loadPublicConfig();
+  let publicConfig;
+  try {
+    ({ config: publicConfig } = await loadPublicConfig());
+  } catch {
+    authBootState = { status: 'error', errorCode: 'backend_unavailable' };
+    render();
+    return;
+  }
   authConfig = publicConfig.auth || { required: false, configured: false };
   authClient?.destroy();
   authClient = GuanchaAuth.createAuthClient(authConfig);

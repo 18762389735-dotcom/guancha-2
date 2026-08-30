@@ -28,7 +28,7 @@ function fakeSdk(initialSession = null) {
     signOut: async () => { calls.push(['signout']); session = null; return { data: {} }; },
     onAuthStateChange: callback => { listener = callback; return { data: { subscription: { unsubscribe: () => { listener = null; } } } }; },
   };
-  return { sdk: { init: input => { calls.push(['init', input]); return { auth: () => auth }; } }, calls, emit: change => listener && listener(change) };
+  return { sdk: { init: input => { calls.push(['init', input]); return { auth }; } }, calls, emit: (event, nextSession, info = null) => listener && listener(event, nextSession, info) };
 }
 
 test('restore, login, signup verification and transient access token follow the CloudBase v3 boundary', async () => {
@@ -54,18 +54,49 @@ test('OTP failures, malformed SDK responses and signout fail closed without expo
   await assert.rejects(client.verifySignUp('bad'), error => error.code === 'verification_invalid');
   await client.signOut();
   assert.equal(client.getState().status, 'unauthenticated');
-  const malformed = auth.createAuthClient(configured(), { sdk: { init: () => ({ auth: () => ({ getSession: async () => ({ data: { session: { access_token: 3 } } }), onAuthStateChange: () => ({ data: {} }) }) }) } });
-  assert.equal((await malformed.initialize()).status, 'unauthenticated');
+  const malformed = auth.createAuthClient(configured(), { sdk: { init: () => ({ auth: { getSession: async () => ({ data: {} }) } }) } });
+  assert.deepEqual(JSON.parse(JSON.stringify(await malformed.initialize())), { status: 'error', email: null, errorCode: 'auth_sdk_unavailable' });
 });
 
-test('auth lifecycle ignores token refresh but blocks on signed out', async () => {
+test('CloudBase v3 lifecycle signature ignores token refresh and blocks a required-auth subscriber on signed out', async () => {
   const { auth } = load(); const fake = fakeSdk({ access_token: 'fake-access-token', user: { email: 'tea@example.com' } });
   const client = auth.createAuthClient(configured(), { sdk: fake.sdk });
   await client.initialize();
-  fake.emit({ event: 'TOKEN_REFRESHED', session: null });
+  let businessReady = true;
+  client.subscribe(next => { if (next.status === 'unauthenticated') businessReady = false; });
+  const refreshed = { access_token: 'refreshed-fake-token', user: { email: 'tea@example.com' } };
+  fake.emit('TOKEN_REFRESHED', refreshed, null);
   assert.equal(client.getState().status, 'authenticated');
-  fake.emit({ event: 'SIGNED_OUT', session: null });
+  assert.equal(businessReady, true);
+  fake.emit('SIGNED_OUT', null, null);
   assert.equal(client.getState().status, 'unauthenticated');
+  assert.equal(businessReady, false);
+});
+
+test('callable app.auth remains a compatibility fallback after the v3 object path', async () => {
+  const { auth } = load(); const fake = fakeSdk();
+  const client = auth.createAuthClient(configured(), { sdk: { init: () => ({ auth: () => ({
+    getSession: async () => ({ data: { session: null } }), signInWithPassword: async () => ({ error: {} }), signUp: async () => ({ error: {} }), signOut: async () => ({ data: {} }), onAuthStateChange: () => ({ data: {} }),
+  }) }) } });
+  assert.equal((await client.initialize()).status, 'unauthenticated');
+});
+
+test('auth client defensively accepts only the CloudBase region allowlist', async () => {
+  const { auth } = load();
+  for (const region of ['ap-shanghai', 'ap-guangzhou', 'ap-singapore']) {
+    const client = auth.createAuthClient({ ...configured(), region }, { sdk: fakeSdk().sdk });
+    assert.equal((await client.initialize()).status, 'unauthenticated');
+  }
+  const rejected = auth.createAuthClient({ ...configured(), region: 'ap-unknown' }, { sdk: fakeSdk().sdk });
+  assert.deepEqual(JSON.parse(JSON.stringify(await rejected.initialize())), { status: 'error', email: null, errorCode: 'auth_not_configured' });
+});
+
+test('a relevant lifecycle error fails closed without exposing CloudBase details', async () => {
+  const { auth } = load(); const fake = fakeSdk({ access_token: 'fake-access-token', user: { email: 'tea@example.com' } });
+  const client = auth.createAuthClient(configured(), { sdk: fake.sdk });
+  await client.initialize();
+  fake.emit('SIGNED_IN', null, { error: { token: 'not-exposed' } });
+  assert.deepEqual(JSON.parse(JSON.stringify(client.getState())), { status: 'error', email: null, errorCode: 'auth_state_change_failed' });
 });
 
 test('account boundaries clear legacy browser state on first login and account switch, but not same-user reload', async () => {

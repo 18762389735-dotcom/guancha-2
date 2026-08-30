@@ -3,7 +3,7 @@
 
   const ACCOUNT_MARKER_KEY = 'guancha.auth-user-id.v1';
   const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-  const REGION = /^[a-z0-9]+(?:-[a-z0-9]+){1,4}$/;
+  const ALLOWED_REGIONS = new Set(['ap-shanghai', 'ap-guangzhou', 'ap-singapore']);
 
   function error(code, message) {
     const result = new Error(message);
@@ -17,7 +17,7 @@
     const region = typeof input.region === 'string' ? input.region.trim().toLowerCase() : '';
     const publishableKey = typeof input.publishableKey === 'string' && input.publishableKey.trim() ? input.publishableKey.trim() : null;
     const required = input.required === true;
-    const configured = input.configured === true && input.provider === 'cloudbase' && Boolean(envId && publishableKey) && REGION.test(region);
+    const configured = input.configured === true && input.provider === 'cloudbase' && Boolean(envId && publishableKey) && ALLOWED_REGIONS.has(region);
     return { required, configured, envId, region, publishableKey };
   }
   function sessionFrom(result) {
@@ -38,6 +38,18 @@
   function normalizeSdk(sdk) {
     if (!sdk || typeof sdk.init !== 'function') throw error('auth_sdk_unavailable', '登录服务暂不可用，请稍后重试。');
     return sdk;
+  }
+  function isAuthObject(value) {
+    return Boolean(value) && typeof value === 'object' && ['getSession', 'signInWithPassword', 'signUp', 'signOut', 'onAuthStateChange']
+      .every(method => typeof value[method] === 'function');
+  }
+  function authFromApp(app) {
+    if (app && isAuthObject(app.auth)) return app.auth;
+    if (app && typeof app.auth === 'function') {
+      const compatibilityAuth = app.auth();
+      if (isAuthObject(compatibilityAuth)) return compatibilityAuth;
+    }
+    throw error('auth_sdk_unavailable', '登录服务暂不可用，请稍后重试。');
   }
 
   function createAuthClient(config, options) {
@@ -63,11 +75,11 @@
     }
     function subscribeLifecycle() {
       if (subscription || !auth || typeof auth.onAuthStateChange !== 'function') return;
-      const result = auth.onAuthStateChange((change) => {
-        const event = change && change.event;
+      const result = auth.onAuthStateChange((event, session, info) => {
+        if (info && info.error) { setError('auth_state_change_failed'); return; }
         if (event === 'TOKEN_REFRESHED') return;
         if (event === 'SIGNED_OUT') { applySession(null); return; }
-        if (event === 'INITIAL_SESSION' || event === 'SIGNED_IN') applySession(change && change.session || null);
+        if (event === 'INITIAL_SESSION' || event === 'SIGNED_IN') applySession(session || null);
       });
       subscription = result && result.data && result.data.subscription || null;
     }
@@ -76,8 +88,7 @@
       if (!settings.configured) { applySession(null); return getState(); }
       try {
         const app = normalizeSdk(sdk).init({ env: settings.envId, region: settings.region, accessKey: settings.publishableKey });
-        auth = app && typeof app.auth === 'function' ? app.auth() : null;
-        if (!auth || typeof auth.getSession !== 'function') throw error('auth_sdk_unavailable', '登录服务暂不可用，请稍后重试。');
+        auth = authFromApp(app);
         subscribeLifecycle();
         applySession(await restoreSession());
       } catch (cause) {

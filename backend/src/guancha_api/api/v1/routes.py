@@ -1,5 +1,4 @@
 import os
-import re
 from typing import Annotated
 from uuid import UUID, uuid4
 
@@ -42,6 +41,7 @@ from guancha_api.schemas.contracts import (
 )
 
 router = APIRouter(prefix="/api/v1", tags=["public"])
+_CLOUDBASE_PUBLIC_REGIONS = frozenset({"ap-shanghai", "ap-guangzhou", "ap-singapore"})
 
 
 async def require_admin_token(
@@ -129,7 +129,7 @@ def _public_auth_config() -> PublicAuthConfig:
     env_id = os.getenv("CLOUDBASE_ENV_ID", "").strip() or None
     region = os.getenv("CLOUDBASE_REGION", "ap-shanghai").strip().lower() or "ap-shanghai"
     publishable_key = os.getenv("CLOUDBASE_PUBLISHABLE_KEY", "").strip() or None
-    valid_region = bool(re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+){1,4}", region))
+    valid_region = region in _CLOUDBASE_PUBLIC_REGIONS
     return PublicAuthConfig(
         required=required,
         configured=bool(env_id and publishable_key and valid_region),

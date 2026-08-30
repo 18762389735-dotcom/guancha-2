@@ -29,16 +29,27 @@ test('public product bounds retain five candidates and two screenshots', () => {
   assert.equal(applied.maxImagesPerCandidate, 2);
 });
 
-test('public auth config fails closed when CloudBase browser configuration is malformed', () => {
+test('public auth config accepts only the backend CloudBase region allowlist', () => {
   const config = loadConfig();
   let applied = config.apply({ auth: { required: false, configured: false, provider: 'cloudbase', region: 'ap-shanghai' } });
   assert.equal(applied.auth.required, false);
   assert.equal(applied.auth.configured, false);
 
-  applied = config.apply({ auth: { required: true, configured: true, provider: 'cloudbase', env_id: 'env-test', region: 'ap-shanghai', publishable_key: 'public-key' } });
-  assert.deepEqual(JSON.parse(JSON.stringify(applied.auth)), { required: true, configured: true, provider: 'cloudbase', envId: 'env-test', region: 'ap-shanghai', publishableKey: 'public-key' });
+  for (const region of ['ap-shanghai', 'ap-guangzhou', 'ap-singapore']) {
+    applied = config.apply({ auth: { required: true, configured: true, provider: 'cloudbase', env_id: 'env-test', region, publishable_key: 'public-key' } });
+    assert.deepEqual(JSON.parse(JSON.stringify(applied.auth)), { required: true, configured: true, provider: 'cloudbase', envId: 'env-test', region, publishableKey: 'public-key' });
+  }
 
-  applied = config.apply({ auth: { required: true, configured: true, provider: 'other', env_id: 'env-test', region: '<script>', publishable_key: 'public-key' } });
+  applied = config.apply({ auth: { required: true, configured: true, provider: 'other', env_id: 'env-test', region: 'ap-unknown', publishable_key: 'public-key' } });
   assert.equal(applied.auth.configured, false);
   assert.equal(applied.auth.region, 'ap-shanghai');
+});
+
+test('configured API public config failures fail closed while unconfigured static mode stays legacy-compatible', async () => {
+  const config = loadConfig();
+  await assert.rejects(config.loadForBoot({ isConfigured: true, getPublicConfig: async () => { throw new Error('network unavailable'); } }));
+  await assert.rejects(config.loadForBoot({ isConfigured: true, getPublicConfig: async () => ({ auth: {} }) }));
+  const legacy = await config.loadForBoot({ isConfigured: false, getPublicConfig: async () => { throw new Error('must not call'); } });
+  assert.equal(legacy.legacy, true);
+  assert.equal(legacy.config.auth.required, false);
 });
