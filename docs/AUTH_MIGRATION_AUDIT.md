@@ -122,18 +122,15 @@ selection_sessions
 
 扫描未发现独立的 `settings` 持久化 store；目前最接近 settings 的是 `guancha_onboarding_status` 和 `guancha.ui-session.v1` 中的 UI / onboarding 状态。它们都不能作为资源授权依据，是否按账号同步应在后续产品决策中单独确定。
 
-## 4. CloudBase Authentication v2 最小接入点（只做设计）
+## 4. CloudBase Authentication 最小接入点（只做设计）
 
-本节不是实现方案落地，也没有安装 SDK 或调用真实服务。CloudBase 官方 Web v2 文档提供了 `signUp`、`signIn`、`getAccessToken` 等能力；具体 SDK 版本、token 校验方式和部署配置应在 Phase 9-1 开始时重新按官方文档确认：
-
-- [CloudBase Authentication v2 Web API reference](https://docs.cloudbase.net/en/api-reference/webv2/authentication_v2)
-- [CloudBase Authentication v2 token management](https://docs.cloudbase.net/authentication-v2/auth/token)
+本节不是实现方案落地，也没有安装 SDK 或调用真实服务。认证服务确定为 Tencent CloudBase Authentication。后续 Web 客户端计划使用当前 `@cloudbase/js-sdk` v3（Phase 9-3），不主动采用已经标记为旧版的 v2 SDK。CloudBase SDK / API 若未来更新，应在对应实现阶段重新核验官方文档，不永久锁死一个已过时的小版本 API。
 
 ### 4.1 Frontend：最小侵入边界
 
-建议新增 `frontend/auth-client.js`，职责只包括：
+建议在 Phase 9-3 新增 `frontend/auth-client.js`，职责只包括：
 
-1. 封装 CloudBase Authentication v2 Web SDK 的注册、登录、登出、当前认证状态和 access token 获取；
+1. 封装当前 `@cloudbase/js-sdk` v3 的注册、登录、登出、当前认证状态和 access token 获取；
 2. 对外提供稳定的 `getCurrentUser()` / `getAccessToken()` / auth-state subscription，不让 `app.js` 直接依赖 SDK 细节；
 3. 不把 refresh token 或 access token 写入 Git、日志、analytics payload 或业务 localStorage；SDK 的安全持久化策略需按官方能力和部署环境验证；
 4. 登录、登出和账号切换时通知应用清理内存、account-scoped local state、pending image 状态和正在运行的 poller，然后重新 hydrate。
@@ -142,27 +139,66 @@ selection_sessions
 
 `frontend/api-client.js` 后续只需增加：有经过 SDK 获取的 authenticated access token 时注入 `Authorization: Bearer <token>`；匿名请求继续发送当前 `X-Client-Id`。两种 owner 必须明确优先级，不能因为 header 仍存在就自动把匿名资源认领给账号。
 
-### 4.2 Backend：最小侵入边界
+### 4.2 Backend：Phase 9-1 Production TokenVerifier
 
-建议在当前 `backend/src/guancha_api/` 分层中新增以下抽象，而不把 CloudBase 细节散落到 routes 或 repository：
+Phase 9-1 只在当前 `backend/src/guancha_api/` 分层中建立认证 kernel，不把 CloudBase 细节散落到 routes 或 repository。`TokenVerifier` interface、CloudBase adapter、`CurrentUser`、`app_users`、`/api/v1/me` 和 auth error contract 属于 Phase 9-1；Selection Session ownership 属于 Phase 9-2。
 
-- `auth` 或 `infrastructure/auth` 下的 `TokenVerifier` interface：输入 bearer token，输出经过验证的标准 claims / external subject；
-- CloudBase Authentication v2 verifier / introspection adapter：只实现服务端官方支持的验证方式，具体机制需在 Phase 9-1 锁定；不接受客户端自报 uid；
-- `CurrentUser` value object / dependency：由 FastAPI dependency 从 `Authorization` 得到，向 Application 层传递内部用户身份；
-- anonymous owner context：保留现有 `ClientId` 路径，形成明确的 anonymous / authenticated owner union；
-- `/api/v1/me`：只返回最小非敏感账号状态，用于前端确认 auth 连接和当前 account，不暴露 token。
+Production `TokenVerifier` 的当前技术决策：
 
-Application / Repository 后续应接收 owner context，而不是接收 body 或 URL 中的 `user_id`。authenticated 请求以 `CurrentUser` 为 owner；anonymous 请求才使用当前 `X-Client-Id`。`X-Client-Id` 可继续作为兼容性 provenance，但不可覆盖 authenticated owner。
+```text
+GET https://{CLOUDBASE_ENV_ID}.api.tcloudbasegateway.com/auth/v1/token/introspect
+
+Authorization: Bearer <incoming access token>
+```
+
+成功验证时：
+
+- 响应中必须存在非空 `sub`；
+- `sub` 作为 CloudBase external subject；
+- 服务端通过 `sub` 幂等 resolve / create `app_users`；
+- 前端不得提供 internal `user_id`。
+
+无效 token 时，introspection 返回空对象即视为 invalid credentials。网络错误或 CloudBase 服务不可用时：
+
+- 不得降级为匿名 user；
+- 不得相信未经验证的 token；
+- 返回明确的 authentication service unavailable error。
+
+安全规则：
+
+- 不在日志记录 `Authorization`；
+- 不存储 access token；
+- 不存储 refresh token；
+- 不自行验证客户端提供的 `user_id`；
+- 不仅做 JWT decode 就认为 token 有效；
+- 除非未来明确启用了可信 CloudBase Gateway authentication，否则 raw decoded JWT claims 不得作为认证依据。
+
+配置只允许保存：
+
+- `CLOUDBASE_ENV_ID`；
+- `CLOUDBASE_REGION`。
+
+不得提交真实 token、API Key、SecretId 或 SecretKey。Phase 9-1 使用 `FakeTokenVerifier`，测试不得访问真实 CloudBase。
+
+Phase 9-2 之后 Application / Repository 才接收 owner context，而不是接收 body 或 URL 中的 `user_id`。authenticated 请求以 `CurrentUser` 为 owner；anonymous 请求才使用当前 `X-Client-Id`。`X-Client-Id` 可继续作为兼容性 provenance，但不可覆盖 authenticated owner。
 
 ### 4.3 测试边界
 
 后续 auth 测试必须使用 fake verifier 和 synthetic claims，覆盖缺失、过期、伪造 token、用户 A/B 隔离、anonymous 回归、登出清理和跨设备恢复。测试不能调用真实 CloudBase，也不能需要真实 access token、refresh token 或 API key。
 
+### 4.4 FastAPI Template reference boundary
+
+Phase 9-1 实现时将只读参考：
+
+`F:\观茶最新\full-stack-fastapi-template-master\`
+
+具体允许参考范围将在 Phase 9-1 任务单中指定。本轮不读取该参考项目。
+
 ## 5. PostgreSQL backward-compatible migration 策略
 
 本轮不创建 migration。推荐后续采用 additive、可回滚的过渡路径：
 
-### 5.1 第一批新增结构
+### 5.1 Authentication Kernel 第一批新增结构（Phase 9-1）
 
 建议新增：
 
@@ -172,16 +208,15 @@ app_users
   cloudbase_uid     text not null unique              -- CloudBase 外部 subject
   created_at        timestamptz not null
   updated_at        timestamptz not null
-
-selection_sessions.user_id
-  uuid null references app_users(id)
-  -- 配套 index(user_id, created_at) 或按实际 restore 查询设计
 ```
 
 `app_users` 只保存 CloudBase 外部身份映射和产品需要的非敏感元数据，不保存密码。首次通过服务端验证 token 看到一个新 `cloudbase_uid` 时，再由服务端幂等创建或取得 `app_users`，而不是接收前端传入的内部 user id。
 
+Phase 9-1 不新增 `selection_sessions.user_id`，不修改现有 Selection Session ownership。
+
 ### 5.2 与现有 anonymous_clients 共存
 
+- Phase 9-2 再新增 nullable `selection_sessions.user_id`，类型为 `uuid references app_users(id)`，并按 authenticated restore 查询增加索引。
 - 第一阶段不删除 `anonymous_clients`，不删除 `selection_sessions.anonymous_client_id`，不对既有匿名 session 做任意 backfill；既有行保持 `user_id IS NULL`。
 - 当前 `anonymous_client_id` 在 schema 中为非空。过渡期若 authenticated session 仍需满足旧约束，可以保留请求端的匿名 client 作为 compatibility / provenance 字段；它不能参与 authenticated authorization，真正的 owner 是 `selection_sessions.user_id`。
 - 后续代码完全支持双 owner 后，再评估将 `anonymous_client_id` 改为 nullable，并增加“匿名或认证二者恰一”的 check / 约束。不要在第一步同时删除旧列或重命名 owner 模型。
@@ -191,12 +226,13 @@ selection_sessions.user_id
 ### 5.3 迁移顺序建议
 
 ```text
-add app_users + nullable selection_sessions.user_id + indexes
+add app_users + indexes (Phase 9-1)
   → fake verifier / CurrentUser + /api/v1/me
+  → add nullable selection_sessions.user_id (Phase 9-2)
   → authenticated session create/read 的 user owner
   → authenticated derived-resource ownership checks
-  → 明确本地状态登录/登出边界
-  → 再做 preferences / warehouse / Journal 的 user-scoped CRUD
+  → frontend auth state 与本地状态边界 (Phase 9-3)
+  → preferences / warehouse / Journal 的 user-scoped CRUD (Phase 9-4)
   → 最后评估 anonymous_client_id nullable 化及历史迁移工具
 ```
 

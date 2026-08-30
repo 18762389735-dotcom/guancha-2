@@ -6,7 +6,7 @@
 
 目标是形成一个真实可注册、可登录、数据按用户隔离、可跨设备恢复的 AI 茶叶购买决策与冲泡记录产品。现有核心能力继续保留：用户偏好、本次需求、候选茶、商品截图、AI 提取、Evidence、多候选判断、关键未知、商家追问、商家回复、复判、茶仓、泡茶记录 / Journal 和 Brew Feedback。
 
-认证方案已经确定为腾讯云 CloudBase Authentication v2。不得自行替换为 Supabase Auth、Auth0、Clerk、Firebase 或自建密码认证。
+认证服务确定为 Tencent CloudBase Authentication。后续 Web 客户端使用当前 `@cloudbase/js-sdk` v3；不主动采用已经标记为旧版的 v2 SDK。不得自行替换为 Supabase Auth、Auth0、Clerk、Firebase 或自建密码认证。CloudBase SDK / API 若未来更新，应在实现阶段重新核验官方文档，不永久锁死一个已过时的小版本 API。
 
 后端继续使用 FastAPI、PostgreSQL 以及当前 Repository / Application / Domain 分层；前端继续使用当前 Vanilla JS SPA，不为了认证迁移 React、Vue 或 Next.js。
 

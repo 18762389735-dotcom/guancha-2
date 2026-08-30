@@ -4,7 +4,7 @@
 
 ## 当前定位
 
-观茶已进入 Beta 产品化阶段。目标是形成真实可注册、可登录、数据按用户隔离、可跨设备恢复的 AI 茶叶购买决策与冲泡记录产品。认证方案已确定为腾讯云 CloudBase Authentication v2；本轮只完成基线和迁移审计，尚未接入认证。
+观茶已进入 Beta 产品化阶段。目标是形成真实可注册、可登录、数据按用户隔离、可跨设备恢复的 AI 茶叶购买决策与冲泡记录产品。认证服务确定为 Tencent CloudBase Authentication。当前计划：frontend 使用 `@cloudbase/js-sdk` v3（Phase 9-3），backend 使用 CloudBase HTTP Token Introspection（Phase 9-1）；当前仍尚未实现任何认证能力。
 
 ## 已完成
 
