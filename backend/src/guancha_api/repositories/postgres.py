@@ -31,7 +31,11 @@ class RepositoryError(Exception):
 
 
 class ResourceNotFound(RepositoryError):
-    pass
+    """A missing persistence resource, optionally with its public API contract code."""
+
+    def __init__(self, message: str, *, error_code: ErrorCode | None = None) -> None:
+        super().__init__(message)
+        self.error_code = error_code
 
 
 class OwnershipDenied(RepositoryError):
@@ -1894,7 +1898,14 @@ class PostgresPhase2Repository:
             await cursor.execute(query, (resource_id,))
             row = await cursor.fetchone()
         if row is None:
-            raise ResourceNotFound(f"{table} not found")
+            not_found_codes = {
+                "selection_sessions": ErrorCode.SELECTION_SESSION_NOT_FOUND,
+                "candidates": ErrorCode.CANDIDATE_NOT_FOUND,
+                "candidate_images": ErrorCode.CANDIDATE_IMAGE_NOT_FOUND,
+                "merchant_replies": ErrorCode.MERCHANT_REPLY_NOT_FOUND,
+                "decision_deltas": ErrorCode.DECISION_DELTA_NOT_FOUND,
+            }
+            raise ResourceNotFound(f"{table} not found", error_code=not_found_codes.get(table))
         if not _owner_matches(owner, row):
             raise OwnershipDenied("Resource belongs to another owner")
 

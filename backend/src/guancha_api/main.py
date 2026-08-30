@@ -310,7 +310,8 @@ def _register_exception_handlers(application: FastAPI) -> None:
         if isinstance(exc, OwnershipDenied):
             return error_response(status_code=403, code="resource_not_owned", message="Resource belongs to another owner.")
         if isinstance(exc, ResourceNotFound):
-            return error_response(status_code=404, code=_not_found_code(exc), message="Requested resource was not found.")
+            code = exc.error_code.value if exc.error_code is not None else _not_found_code(exc)
+            return error_response(status_code=404, code=code, message="Requested resource was not found.")
         if isinstance(exc, IdempotencyConflict):
             return error_response(status_code=409, code="idempotency_conflict", message="Idempotency key belongs to a different request.")
         if isinstance(exc, CandidateLimitExceeded):
