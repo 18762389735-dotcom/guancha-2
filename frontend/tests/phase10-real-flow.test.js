@@ -29,6 +29,34 @@ test('need-card decoration does not intercept the editable Need control', () => 
   assert.match(styles, /\.need-card \.leaf-float\s*\{[^}]*pointer-events\s*:\s*none\s*;/s);
 });
 
+test('required-auth lifecycle guard blocks business UI on lifecycle error and signed out, but not token refresh', () => {
+  const source = fs.readFileSync(path.resolve(root, '..', 'app.js'), 'utf8');
+  const start = source.indexOf('function handleRequiredAuthLifecycle(next)');
+  const end = source.indexOf('function subscribeToAuthLifecycle()', start);
+  assert.ok(start >= 0 && end > start);
+  const context = {
+    authConfig: { required: true }, appReady: true, state: { screen: 'home' }, authBootState: { status: 'authenticated', errorCode: null },
+    stopped: 0, rendered: 0, cleared: 0,
+    stopRuntimeBusinessState: () => { context.stopped += 1; },
+    freshAuthenticatedState: () => ({ screen: 'home', fresh: true }),
+    render: () => { context.rendered += 1; },
+  };
+  vm.runInNewContext(`${source.slice(start, end)}; globalThis.guard = handleRequiredAuthLifecycle;`, context, { filename: 'app.js' });
+  assert.equal(context.guard({ status: 'authenticated', errorCode: null }), false);
+  assert.equal(context.appReady, true);
+  assert.equal(context.stopped, 0);
+  assert.equal(context.guard({ status: 'error', errorCode: 'auth_state_change_failed' }), true);
+  assert.equal(context.appReady, false);
+  assert.equal(context.authBootState.errorCode, 'auth_state_change_failed');
+  assert.equal(context.stopped, 1);
+  assert.equal(context.cleared, 0);
+
+  context.appReady = true;
+  assert.equal(context.guard({ status: 'unauthenticated', errorCode: null }), true);
+  assert.equal(context.appReady, false);
+  assert.equal(context.state.authView, 'login');
+});
+
 test('real-flow client uses only backend contracts for session, candidate, image, job and decision', async () => {
   const window = browser();
   load(window, path.join(root, 'api-client.js'));

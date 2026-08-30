@@ -1710,16 +1710,27 @@ function enterAnonymousProduct() {
   render();
   resumeLiveBackendState();
 }
+function handleRequiredAuthLifecycle(next) {
+  if (!authConfig.required || !appReady) return false;
+  if (next.status === 'unauthenticated') {
+    stopRuntimeBusinessState();
+    appReady = false;
+    state = freshAuthenticatedState();
+    state.authView = 'login';
+    render();
+    return true;
+  }
+  if (next.status === 'error') {
+    stopRuntimeBusinessState();
+    appReady = false;
+    authBootState = { status: 'error', errorCode: next.errorCode === 'auth_state_change_failed' ? next.errorCode : 'authentication_service_unavailable' };
+    render();
+    return true;
+  }
+  return false;
+}
 function subscribeToAuthLifecycle() {
-  authClient.subscribe((next) => {
-    if (next.status === 'unauthenticated' && authConfig.required && appReady) {
-      stopRuntimeBusinessState();
-      appReady = false;
-      state = freshAuthenticatedState();
-      state.authView = 'login';
-      render();
-    }
-  });
+  authClient.subscribe(handleRequiredAuthLifecycle);
 }
 async function bootAuth() {
   appReady = false;
