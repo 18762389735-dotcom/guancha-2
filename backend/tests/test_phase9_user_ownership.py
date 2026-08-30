@@ -184,6 +184,13 @@ def _provider() -> FakeProvider:
     )
 
 
+def _assert_error(response: httpx.Response, code: str) -> None:
+    body = response.json()["error"]
+    assert body["code"] == code
+    assert body["retryable"] is False
+    assert UUID(body["request_id"])
+
+
 async def _complete_authenticated_selection(
     client: httpx.AsyncClient, headers: dict[str, str], runner: ManualTaskRunner
 ) -> dict[str, str]:
@@ -399,6 +406,190 @@ async def test_authenticated_selection_and_all_derived_reads_are_session_owned(
         )
         assert claimed.status_code == 403
         assert claimed.json()["error"]["code"] == "resource_not_owned"
+
+
+@pytest.mark.asyncio
+async def test_authenticated_owner_cannot_upload_another_users_candidate_image(
+    repository: PostgresPhase2Repository,
+) -> None:
+    storage = InMemoryTemporaryPrivateStorage()
+    app = create_app(
+        repository=repository,
+        token_verifier=FakeTokenVerifier(),
+        task_runner=ManualTaskRunner(),
+        temporary_storage=storage,
+        provider=_provider(),
+    )
+    user_a = {"Authorization": "Bearer valid-token-a"}
+    user_b = {"Authorization": "Bearer valid-token-b"}
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        session = await client.post(
+            "/api/v1/selection-sessions",
+            headers={**user_a, "Idempotency-Key": str(uuid4())},
+            json={"need": {}},
+        )
+        assert session.status_code == 201, session.text
+        candidate = await client.post(
+            f"/api/v1/selection-sessions/{session.json()['id']}/candidates",
+            headers={**user_a, "Idempotency-Key": str(uuid4())},
+            json={"display_label": "A"},
+        )
+        assert candidate.status_code == 201, candidate.text
+        candidate_id = candidate.json()["id"]
+
+        denied = await client.post(
+            f"/api/v1/candidates/{candidate_id}/images",
+            headers={**user_b, "Idempotency-Key": str(uuid4())},
+            files={"file": ("tea.png", _image(), "image/png")},
+        )
+
+    assert denied.status_code == 403, denied.text
+    _assert_error(denied, "resource_not_owned")
+    async with repository._connection.cursor() as cursor:
+        await cursor.execute("select count(*) as count from candidate_images where candidate_id=%s", (candidate_id,))
+        images = await cursor.fetchone()
+        await cursor.execute("select count(*) as count from analysis_jobs where candidate_id=%s", (candidate_id,))
+        jobs = await cursor.fetchone()
+    assert images == {"count": 0}
+    assert jobs == {"count": 0}
+    assert storage.objects == {}
+
+
+@pytest.mark.asyncio
+async def test_authenticated_owner_cannot_analyze_another_users_selection(
+    repository: PostgresPhase2Repository,
+) -> None:
+    runner = ManualTaskRunner()
+    app = create_app(
+        repository=repository,
+        token_verifier=FakeTokenVerifier(),
+        task_runner=runner,
+        temporary_storage=InMemoryTemporaryPrivateStorage(),
+        provider=_provider(),
+    )
+    user_a = {"Authorization": "Bearer valid-token-a"}
+    user_b = {"Authorization": "Bearer valid-token-b"}
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        ids = await _complete_authenticated_selection(client, user_a, runner)
+        async with repository._connection.cursor() as cursor:
+            await cursor.execute(
+                """select count(*) as count from analysis_jobs j
+                   join candidates c on c.id = j.candidate_id
+                   where c.selection_session_id=%s""",
+                (ids["session_id"],),
+            )
+            jobs_before = await cursor.fetchone()
+            await cursor.execute(
+                "select count(*) as count from decision_versions where selection_session_id=%s",
+                (ids["session_id"],),
+            )
+            decisions_before = await cursor.fetchone()
+
+        denied = await client.post(
+            f"/api/v1/selection-sessions/{ids['session_id']}/analyze",
+            headers={**user_b, "Idempotency-Key": str(uuid4())},
+        )
+
+    assert denied.status_code == 403, denied.text
+    _assert_error(denied, "resource_not_owned")
+    async with repository._connection.cursor() as cursor:
+        await cursor.execute(
+            """select count(*) as count from analysis_jobs j
+               join candidates c on c.id = j.candidate_id
+               where c.selection_session_id=%s""",
+            (ids["session_id"],),
+        )
+        jobs_after = await cursor.fetchone()
+        await cursor.execute(
+            "select count(*) as count from decision_versions where selection_session_id=%s",
+            (ids["session_id"],),
+        )
+        decisions_after = await cursor.fetchone()
+    assert jobs_after == jobs_before
+    assert decisions_after == decisions_before
+
+
+@pytest.mark.asyncio
+async def test_authenticated_owner_cannot_retry_another_users_extraction(
+    repository: PostgresPhase2Repository,
+) -> None:
+    storage = InMemoryTemporaryPrivateStorage()
+    runner = ManualTaskRunner()
+    app = create_app(
+        repository=repository,
+        token_verifier=FakeTokenVerifier(),
+        task_runner=runner,
+        temporary_storage=storage,
+        provider=_provider(),
+    )
+    user_a = {"Authorization": "Bearer valid-token-a"}
+    user_b = {"Authorization": "Bearer valid-token-b"}
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        session = await client.post(
+            "/api/v1/selection-sessions",
+            headers={**user_a, "Idempotency-Key": str(uuid4())},
+            json={"need": {}},
+        )
+        assert session.status_code == 201, session.text
+        candidate = await client.post(
+            f"/api/v1/selection-sessions/{session.json()['id']}/candidates",
+            headers={**user_a, "Idempotency-Key": str(uuid4())},
+            json={"display_label": "A"},
+        )
+        assert candidate.status_code == 201, candidate.text
+        candidate_id = candidate.json()["id"]
+        upload = await client.post(
+            f"/api/v1/candidates/{candidate_id}/images",
+            headers={**user_a, "Idempotency-Key": str(uuid4())},
+            files={"file": ("tea.png", _image(), "image/png")},
+        )
+        assert upload.status_code == 201, upload.text
+        original_job_id = upload.json()["extraction_job"]["id"]
+        assert runner.pending_count == 1
+
+        denied = await client.post(
+            f"/api/v1/candidates/{candidate_id}/extraction-jobs",
+            headers={**user_b, "Idempotency-Key": str(uuid4())},
+        )
+
+    assert denied.status_code == 403, denied.text
+    _assert_error(denied, "resource_not_owned")
+    async with repository._connection.cursor() as cursor:
+        await cursor.execute("select id, status from analysis_jobs where candidate_id=%s order by created_at", (candidate_id,))
+        jobs = await cursor.fetchall()
+    assert jobs == [{"id": UUID(original_job_id), "status": "queued"}]
+    assert runner.pending_count == 1
+    assert len(storage.objects) == 1
+
+
+@pytest.mark.asyncio
+async def test_invalid_bearer_does_not_fallback_to_the_real_anonymous_selection_owner(
+    repository: PostgresPhase2Repository,
+) -> None:
+    app = create_app(repository=repository, token_verifier=FakeTokenVerifier())
+    anonymous_client_id = str(uuid4())
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        session = await client.post(
+            "/api/v1/selection-sessions",
+            headers={"X-Client-Id": anonymous_client_id, "Idempotency-Key": str(uuid4())},
+            json={"need": {}},
+        )
+        assert session.status_code == 201, session.text
+
+        denied = await client.get(
+            f"/api/v1/selection-sessions/{session.json()['id']}",
+            headers={
+                "Authorization": "Bearer invalid-token",
+                "X-Client-Id": anonymous_client_id,
+            },
+        )
+
+    assert denied.status_code == 401, denied.text
+    _assert_error(denied, "invalid_access_token")
 
 
 @pytest.mark.asyncio
