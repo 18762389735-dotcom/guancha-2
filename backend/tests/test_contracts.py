@@ -73,6 +73,23 @@ def test_required_auth_without_publishable_key_is_not_configured(monkeypatch: py
     }
 
 
+@pytest.mark.parametrize("region", ["ap-shanghai", "ap-guangzhou", "ap-singapore"])
+def test_public_auth_config_accepts_only_supported_cloudbase_regions(
+    monkeypatch: pytest.MonkeyPatch, region: str
+) -> None:
+    monkeypatch.setenv("CLOUDBASE_ENV_ID", "env-test")
+    monkeypatch.setenv("CLOUDBASE_PUBLISHABLE_KEY", "public-test-key")
+    monkeypatch.setenv("CLOUDBASE_REGION", region)
+    assert client.get("/api/v1/config/public").json()["auth"]["configured"] is True
+
+
+def test_public_auth_config_rejects_unknown_cloudbase_region(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLOUDBASE_ENV_ID", "env-test")
+    monkeypatch.setenv("CLOUDBASE_PUBLISHABLE_KEY", "public-test-key")
+    monkeypatch.setenv("CLOUDBASE_REGION", "ap-unknown")
+    assert client.get("/api/v1/config/public").json()["auth"]["configured"] is False
+
+
 def test_openapi_contains_frozen_phase2_contract_paths() -> None:
     response = client.get("/openapi.json")
     assert response.status_code == 200

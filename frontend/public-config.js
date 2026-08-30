@@ -2,6 +2,7 @@
   'use strict';
 
   const SAFE_MIME_TYPES = new Set(['image/jpeg', 'image/png']);
+  const ALLOWED_CLOUDBASE_REGIONS = new Set(['ap-shanghai', 'ap-guangzhou', 'ap-singapore']);
   const DEFAULT = Object.freeze({
     maxCandidates: 5,
     maxImagesPerCandidate: 2,
@@ -31,7 +32,7 @@
     const envId = typeof input.env_id === 'string' && input.env_id.trim() ? input.env_id.trim() : null;
     const publishableKey = typeof input.publishable_key === 'string' && input.publishable_key.trim() ? input.publishable_key.trim() : null;
     const required = input.required === true;
-    const validRegion = /^[a-z0-9]+(?:-[a-z0-9]+){1,4}$/.test(region);
+    const validRegion = ALLOWED_CLOUDBASE_REGIONS.has(region);
     const validProvider = input.provider === 'cloudbase';
     return {
       required,
@@ -43,6 +44,23 @@
     };
   }
   function copyCurrent() { return { ...current, allowedImageMimeTypes: [...current.allowedImageMimeTypes], auth: { ...current.auth } }; }
+  function isTrusted(payload) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+    const auth = payload.auth;
+    return Number.isInteger(payload.candidate_limit)
+      && Number.isInteger(payload.candidate_image_limit)
+      && Array.isArray(payload.allowed_image_mime_types)
+      && payload.poll_intervals_seconds && typeof payload.poll_intervals_seconds === 'object'
+      && auth && typeof auth === 'object' && !Array.isArray(auth)
+      && typeof auth.required === 'boolean' && typeof auth.configured === 'boolean'
+      && auth.provider === 'cloudbase' && typeof auth.region === 'string';
+  }
+  async function loadForBoot(apiClient) {
+    if (!apiClient || apiClient.isConfigured !== true) return { legacy: true, config: copyCurrent() };
+    const payload = await apiClient.getPublicConfig();
+    if (!isTrusted(payload)) throw new Error('public_config_untrusted');
+    return { legacy: false, config: apply(payload) };
+  }
   function apply(payload) {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return copyCurrent();
     const intervals = payload.poll_intervals_seconds;
@@ -61,5 +79,5 @@
     };
     return copyCurrent();
   }
-  global.GuanchaPublicConfig = { DEFAULT, get: copyCurrent, apply };
+  global.GuanchaPublicConfig = { DEFAULT, get: copyCurrent, apply, isTrusted, loadForBoot };
 }(window));
