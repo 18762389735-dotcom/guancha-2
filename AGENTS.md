@@ -55,6 +55,7 @@ node --test frontend/tests/*.test.js
 - 当前匿名流程继续保留 `X-Client-Id`，但它只是可伪造的匿名 ownership 凭证，不得当作 authenticated user identity。本 Phase 9-0 不修改它的生成、注入或 API contract。
 - 未来任何长期用户数据都必须绑定服务端解析出的 authenticated user；不得由前端传入任意 `user_id` 决定资源归属。
 - Repository 必须依据服务端 `CurrentUser` 或明确的 anonymous owner context 做 ownership check；不能信任 URL、body、localStorage 或自定义 header 中的 user id。
+- Authenticated-owned session invariant：未来如果 `selection_sessions.user_id IS NOT NULL`，该 Session 必须视为 authenticated-owned resource。此时即使请求没有 Authorization、携带匹配的 `X-Client-Id`，或 `selection_sessions.anonymous_client_id` 仍作为 transition / provenance 字段存在，也不得通过 anonymous ownership path 读取、修改或访问该 Session 及其派生资源。Legacy anonymous authorization 只允许 `selection_sessions.user_id IS NULL` 的资源；认证资源必须要求服务端解析出的 `CurrentUser`，且 `CurrentUser.id` 必须等于 `selection_sessions.user_id`，`X-Client-Id` 不得授予授权。
 - 不把密码存入当前 PostgreSQL。CloudBase Access Token 不得写入 Git、日志、分析事件、错误详情或业务数据库；Provider Key 不得放到前端。
 - authenticated 请求和 anonymous 请求必须有明确的 owner precedence。不能因为同一浏览器仍带有 `X-Client-Id` 就把匿名资源自动认领给账号。
 - 默认不自动迁移任意 anonymous data 到新账号。历史数据如需迁移，必须作为后续显式、可审计、可撤销的 migration/import 流程。

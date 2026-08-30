@@ -138,7 +138,7 @@ selection_sessions
 3. 不把 refresh token 或 access token 写入 Git、日志、analytics payload 或业务 localStorage；SDK 的安全持久化策略需按官方能力和部署环境验证；
 4. 登录、登出和账号切换时通知应用清理内存、account-scoped local state、pending image 状态和正在运行的 poller，然后重新 hydrate。
 
-`frontend/index.html` 当前没有 auth client，脚本顺序为 stores、analytics、api-client、public-config、image-preparation、adapters、onboarding-routing、job-poller、app。最小方案是在 API client 前加载 auth client，或以模块依赖方式让 API client通过注入的 token getter 读取它；不需要迁移 SPA 框架。
+根目录 `index.html` 当前没有 auth client，脚本顺序为 stores、analytics、api-client、public-config、image-preparation、adapters、onboarding-routing、job-poller、app。最小方案是在 API client 前加载 auth client，或以模块依赖方式让 API client 通过注入的 token getter 读取它；不需要迁移 SPA 框架，也不应创建 `frontend/index.html`。
 
 `frontend/api-client.js` 后续只需增加：有经过 SDK 获取的 authenticated access token 时注入 `Authorization: Bearer <token>`；匿名请求继续发送当前 `X-Client-Id`。两种 owner 必须明确优先级，不能因为 header 仍存在就自动把匿名资源认领给账号。
 
@@ -228,29 +228,73 @@ add app_users + nullable selection_sessions.user_id + indexes
 | session expiry 与跨设备恢复 | 当前 `selection_sessions` 有过期策略；没有 user-scoped restore。 | 先决定 authenticated session 保留期、撤销和跨设备显示范围，再实现恢复。 |
 | cross-link integrity | `followup_questions` 等结构有多个独立 FK，未以 composite FK 完全证明所有关系指向同一上下文。 | 未来在不扩大本轮范围的前提下，增加 service 校验或数据库完整性约束并补测试。 |
 
-## 8. 建议的 Phase 9-1 最小实现范围
+## 8. 分阶段迁移范围
 
-Phase 9-1 应只建立认证地基和账号边界：
+### Phase 9-1 — Authentication Kernel
 
-1. additive PostgreSQL migration：`app_users`、nullable `selection_sessions.user_id`、必要索引；保留 `anonymous_clients`，不建 warehouse / Journal 全量 schema。
-2. Backend auth interface、CloudBase Authentication v2 verifier adapter、`CurrentUser` dependency、明确 anonymous/authenticated owner context 和 `/api/v1/me`。
-3. Frontend `frontend/auth-client.js`：封装 SDK auth state；API client 最小增加 bearer token 注入，同时保留匿名 `X-Client-Id` 兼容路径。
-4. 最小 register / login / logout / account 状态和 loading、unauthenticated、错误状态；只增加必要页面或导航，不重设计现有产品。
-5. 将 Selection Session create/get/snapshot 及其派生资源读取改为 authenticated root ownership，并新增 fake auth 的 A/B、跨设备、无 token anonymous 回归测试。
-6. 明确登录、登出、账号切换时 localStorage、selection bridge、IndexedDB pending image、内存 state 和 poller 的边界；默认不自动 claim legacy anonymous data。
+只允许：
 
-明确不放入 Phase 9-1：
+- 确认 CloudBase Authentication 官方服务端验证方式；
+- backend `TokenVerifier` interface；
+- CloudBase verifier adapter；
+- fake verifier / synthetic claims；
+- `CurrentUser` value / dependency；
+- `app_users`；
+- `/api/v1/me`；
+- auth error contract；
+- backend auth unit / integration tests。
 
-- 完整 user preference、茶仓、Journal CRUD；
-- 任意 anonymous data 自动导入；
-- 当前 PostgreSQL 保存密码；
-- Provider 改造；
-- React / Vue / Next.js 迁移；
-- 全面 UI / CSS / 视觉重设计；
-- 删除 `anonymous_clients`；
-- 修改 Selection Decision Logic。
+Phase 9-1 不修改现有 Selection Session ownership，不实现完整 register / login / logout UI，不修改 warehouse / Journal，也不做 localStorage account migration。
 
-Phase 9-1 的最低验收标准应是：fake token 能稳定映射到一个 `app_user`；伪造或错误的 X-Client-Id 不能访问 authenticated A 的 session；无 bearer 时旧匿名链路仍可工作；A/B 数据隔离；logout 后下一账号看不到上一账号本地状态；所有 auth 测试无真实 CloudBase 网络依赖；本轮三项既有基线测试继续通过。
+### Phase 9-2 — User Ownership
+
+后续才处理：
+
+- `selection_sessions.user_id`；
+- authenticated / anonymous `OwnerContext`；
+- authenticated Session create / read；
+- derived-resource ownership；
+- IDOR 与 user A-B isolation；
+- authenticated-owned resources 禁止 anonymous fallback。
+
+其中必须遵守以下安全不变量：
+
+```text
+selection_sessions.user_id IS NOT NULL
+    → require authenticated CurrentUser
+    → CurrentUser.id must equal selection_sessions.user_id
+    → X-Client-Id must not grant authorization
+
+selection_sessions.user_id IS NULL
+    → legacy anonymous ownership may use X-Client-Id
+```
+
+后续测试必须覆盖：authenticated A 创建 session 后，去掉 Bearer 但保留完全正确的 `X-Client-Id`，请求仍必须被拒绝。
+
+### Phase 9-3 — Auth UI
+
+后续才处理：
+
+- `frontend/auth-client.js`；
+- CloudBase Web SDK；
+- `Authorization: Bearer` injection；
+- register；
+- login；
+- logout；
+- auth state；
+- account switch；
+- localStorage / IndexedDB / poller isolation。
+
+### Phase 9-4 — User Cloud State
+
+后续才处理：
+
+- preferences；
+- warehouse；
+- journal；
+- cross-device state。
+
+以上阶段均不在本轮实现。当前阶段只完成 Phase 9-0 文档审计和边界修正；不应据此推断任何认证、用户 ownership 或云端用户数据能力已经存在。
 
 ## 9. 本轮边界与验证说明
 
