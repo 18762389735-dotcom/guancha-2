@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - 'codex/**'
+      - 'phase9/**'
   pull_request:
 
 permissions:
@@ -73,4 +74,9 @@ jobs:
       - name: Install declared backend development dependencies
         run: python -m pip install --upgrade pip && python -m pip install -e "./backend[dev]"
       - name: Run PostgreSQL repository integration tests
-        run: python -m pytest backend/tests/test_postgres_repository.py
+        run: >-
+          python -m pytest
+          backend/tests/test_postgres_repository.py
+          backend/tests/test_auth_kernel.py
+          backend/tests/test_phase9_user_ownership.py
+          -q
