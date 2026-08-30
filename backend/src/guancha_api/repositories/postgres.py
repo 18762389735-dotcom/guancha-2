@@ -15,7 +15,7 @@ import psycopg
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
-from guancha_api.auth.models import AppUser
+from guancha_api.auth.models import AppUser, OwnerContext
 from guancha_api.schemas.contracts import (
     CandidateImageStatus,
     EvidenceItem,
@@ -80,6 +80,31 @@ class QuestionGenerationFailed(RepositoryError):
 
 class MerchantReplyNotAvailable(RepositoryError):
     pass
+
+
+OwnerLike = OwnerContext | UUID
+
+
+def _as_owner(value: OwnerLike) -> OwnerContext:
+    """Accept legacy UUID callers while making all SQL checks owner-aware."""
+
+    return value if isinstance(value, OwnerContext) else OwnerContext.anonymous(value)
+
+
+def _owner_predicate(owner: OwnerLike, alias: str = "s") -> tuple[str, tuple[UUID, ...]]:
+    context = _as_owner(owner)
+    if context.user_id is not None:
+        return f"{alias}.user_id = %s", (context.user_id,)
+    return f"{alias}.user_id is null and {alias}.anonymous_client_id = %s", (
+        context.anonymous_client_id,
+    )
+
+
+def _owner_matches(owner: OwnerLike, row: dict[str, object]) -> bool:
+    context = _as_owner(owner)
+    if context.user_id is not None:
+        return row.get("user_id") == context.user_id
+    return row.get("user_id") is None and row.get("anonymous_client_id") == context.anonymous_client_id
 
 
 def _explicit_product_conflict(product: dict[str, object] | None, merchant_value: object) -> bool:
@@ -223,21 +248,26 @@ class PostgresPhase2Repository:
                 await cursor.execute("select client_feedback_id,idempotency_key,request_hash,response from brew_feedback_replays where anonymous_client_id=%s and (client_feedback_id=%s or idempotency_key=%s)", (client_id,client_feedback_id,idempotency_key))
                 return await cursor.fetchone()
 
-    async def create_selection_session(self, *, session_id: UUID, client_id: UUID, idempotency_key: UUID, request_hash: str, need: dict[str, object], recent_preference_evidence: tuple[dict[str, object], ...] = (), expires_at: datetime) -> tuple[dict[str, object], bool]:
-        await self.create_client(client_id)
+    async def create_selection_session(self, *, session_id: UUID, client_id: OwnerLike, idempotency_key: UUID, request_hash: str, need: dict[str, object], recent_preference_evidence: tuple[dict[str, object], ...] = (), expires_at: datetime) -> tuple[dict[str, object], bool]:
+        owner = _as_owner(client_id)
+        if owner.anonymous_client_id is not None:
+            await self.create_client(owner.anonymous_client_id)
+        owner_value = owner.user_id or owner.anonymous_client_id
+        owner_column = "user_id" if owner.user_id is not None else "anonymous_client_id"
+        owner_predicate, owner_params = _owner_predicate(owner)
         try:
             async with self._connection.transaction():
                 async with self._connection.cursor() as cursor:
-                    await cursor.execute("select id, anonymous_client_id, need, expires_at, created_at, updated_at, request_hash from selection_sessions where anonymous_client_id=%s and idempotency_key=%s", (client_id, idempotency_key))
+                    await cursor.execute(f"select id, anonymous_client_id, need, expires_at, created_at, updated_at, request_hash from selection_sessions s where {owner_predicate} and s.idempotency_key=%s", (*owner_params, idempotency_key))
                     row=await cursor.fetchone()
                     if row:
                         if row['request_hash'] != request_hash: raise IdempotencyConflict('Session key belongs to a different request')
                         return row, False
-                    await cursor.execute("insert into selection_sessions (id, anonymous_client_id, need, recent_preference_evidence, idempotency_key, request_hash, expires_at) values (%s,%s,%s,%s,%s,%s,%s) returning id, anonymous_client_id, need, expires_at, created_at, updated_at", (session_id,client_id,psycopg.types.json.Jsonb(need),psycopg.types.json.Jsonb(list(recent_preference_evidence)),idempotency_key,request_hash,expires_at))
+                    await cursor.execute(f"insert into selection_sessions (id, {owner_column}, need, recent_preference_evidence, idempotency_key, request_hash, expires_at) values (%s,%s,%s,%s,%s,%s,%s) returning id, anonymous_client_id, need, expires_at, created_at, updated_at", (session_id,owner_value,psycopg.types.json.Jsonb(need),psycopg.types.json.Jsonb(list(recent_preference_evidence)),idempotency_key,request_hash,expires_at))
                     return await cursor.fetchone(), True
         except psycopg.errors.UniqueViolation:
             async with self._connection.cursor() as cursor:
-                await cursor.execute("select id, anonymous_client_id, need, expires_at, created_at, updated_at, request_hash from selection_sessions where anonymous_client_id=%s and idempotency_key=%s", (client_id,idempotency_key))
+                await cursor.execute(f"select id, anonymous_client_id, need, expires_at, created_at, updated_at, request_hash from selection_sessions s where {owner_predicate} and s.idempotency_key=%s", (*owner_params, idempotency_key))
                 row=await cursor.fetchone()
             if row and row['request_hash'] == request_hash: return row, False
             raise IdempotencyConflict('Session key belongs to a different request')
@@ -463,20 +493,17 @@ class PostgresPhase2Repository:
         await self._require_owned_candidate(candidate_id, client_id)
 
     async def get_job_for_client(self, *, job_id: UUID, client_id: UUID) -> StoredJob:
+        await self._require_owned_resource("analysis_jobs", job_id, client_id)
         async with self._connection.cursor() as cursor:
             await cursor.execute(
-                """select j.id, j.candidate_id, j.candidate_image_id, j.status, j.stage, j.attempt,
-                          j.error_code, j.extraction_version_id, j.decision_version_id, j.decision_delta_id, j.processing_mode, j.input_image_ids, j.input_set_version, j.created_at, j.updated_at
-                   from analysis_jobs j join candidates c on c.id = j.candidate_id
-                   join selection_sessions s on s.id = c.selection_session_id
-                   where j.id = %s and s.anonymous_client_id = %s""",
-                (job_id, client_id),
+                """select id, candidate_id, candidate_image_id, status, stage, attempt,
+                          error_code, extraction_version_id, decision_version_id, decision_delta_id, processing_mode,
+                          input_image_ids, input_set_version, created_at, updated_at
+                   from analysis_jobs where id = %s""",
+                (job_id,),
             )
             row = await cursor.fetchone()
-        if row is not None:
-            return self._to_job(row)
-        await self._raise_ownership_or_not_found("analysis_jobs", job_id, client_id)
-        raise AssertionError("unreachable")
+        return self._to_job(row)
 
     async def get_latest_job_for_candidate(
         self, *, candidate_id: UUID, client_id: UUID
@@ -496,6 +523,7 @@ class PostgresPhase2Repository:
         self, *, session_id: UUID, client_id: UUID
     ) -> tuple[StoredJob, ...]:
         """Return the one newest queued input set for every owned candidate."""
+        await self._require_owned_session(session_id, client_id)
         async with self._connection.cursor() as cursor:
             await cursor.execute(
                 """select distinct on (j.candidate_id)
@@ -508,10 +536,10 @@ class PostgresPhase2Repository:
                    from analysis_jobs j
                    join candidates c on c.id=j.candidate_id
                    join selection_sessions s on s.id=c.selection_session_id
-                   where s.id=%s and s.anonymous_client_id=%s
+                   where s.id=%s
                      and j.job_kind='extraction' and j.status='queued'
                    order by j.candidate_id, j.created_at desc""",
-                (session_id, client_id),
+                (session_id,),
             )
             rows = await cursor.fetchall()
         return tuple(self._to_job(row) for row in rows)
@@ -613,26 +641,26 @@ class PostgresPhase2Repository:
         return claimed
 
     async def get_selection_session_for_client(self, *, session_id: UUID, client_id: UUID) -> dict[str, object]:
+        await self._require_owned_session(session_id, client_id)
         async with self._connection.cursor() as cursor:
             await cursor.execute(
                 """select id, anonymous_client_id, need, expires_at, created_at, updated_at
-                   from selection_sessions where id=%s and anonymous_client_id=%s""",
-                (session_id, client_id),
+                   from selection_sessions where id=%s""",
+                (session_id,),
             )
             row = await cursor.fetchone()
-        if row is None:
-            await self._raise_ownership_or_not_found("selection_sessions", session_id, client_id)
         return row
 
     async def update_selection_need_for_client(
         self, *, session_id: UUID, client_id: UUID, need: dict[str, object], recent_preference_evidence: tuple[dict[str, object], ...] = ()
     ) -> dict[str, object]:
         """Replace a session's raw need and invalidate its current decision atomically."""
+        await self._require_owned_session(session_id, client_id)
         async with self._connection.transaction():
             async with self._connection.cursor() as cursor:
                 await cursor.execute(
-                    "select id from selection_sessions where id=%s and anonymous_client_id=%s for update",
-                    (session_id, client_id),
+                    "select id from selection_sessions where id=%s for update",
+                    (session_id,),
                 )
                 if await cursor.fetchone() is None:
                     await self._raise_ownership_or_not_found("selection_sessions", session_id, client_id)
@@ -656,19 +684,12 @@ class PostgresPhase2Repository:
             return list(await cursor.fetchall())
 
     async def get_image_for_client(self, *, image_id: UUID, client_id: UUID) -> dict[str, object]:
+        await self._require_owned_resource("candidate_images", image_id, client_id)
         async with self._connection.cursor() as cursor:
             await cursor.execute("""select i.id, i.candidate_id, i.content_type, i.size_bytes, i.sanitized_sha256, i.width, i.height, i.display_order, i.status, i.error_code, i.created_at,
               (select id from analysis_jobs where candidate_image_id=i.id order by created_at desc limit 1) current_job_id
-              from candidate_images i join candidates c on c.id=i.candidate_id join selection_sessions s on s.id=c.selection_session_id
-              where i.id=%s and s.anonymous_client_id=%s""", (image_id, client_id))
+              from candidate_images i where i.id=%s""", (image_id,))
             row = await cursor.fetchone()
-        if row is None:
-            async with self._connection.cursor() as cursor:
-                await cursor.execute("select 1 from candidate_images where id=%s", (image_id,))
-                exists = await cursor.fetchone() is not None
-            if exists:
-                raise OwnershipDenied("Candidate image belongs to another anonymous client")
-            raise ResourceNotFound("Candidate image not found")
         return row
 
     async def get_extraction_version_for_client(self, *, version_id: UUID, client_id: UUID) -> tuple[dict[str, object], list[dict[str, object]]]:
@@ -735,12 +756,14 @@ class PostgresPhase2Repository:
                 return self._to_job(await cursor.fetchone()), True
 
     async def complete_session_decision_job(self, *, job_id: UUID, session_id: UUID, client_id: UUID, version_id: UUID, rule_version: str, input_fingerprint: str, decisions: list[dict[str, object]]) -> None:
+        await self._require_owned_session(session_id, client_id)
+        owner = _as_owner(client_id)
         async with self._connection.transaction():
             async with self._connection.cursor() as cursor:
                 await cursor.execute("select expected_extraction_version_ids, decision_need_snapshot from analysis_jobs where id=%s and job_kind='session_decision' and status='processing' for update", (job_id,))
                 job = await cursor.fetchone()
                 if job is None: raise RepositoryError("Decision job is not claimable for completion")
-                await cursor.execute("select need from selection_sessions where id=%s and anonymous_client_id=%s for update", (session_id, client_id))
+                await cursor.execute("select need from selection_sessions where id=%s for update", (session_id,))
                 session = await cursor.fetchone()
                 if session is None: raise RepositoryError("Decision session changed before completion")
                 await cursor.execute("""select v.id from candidates c join extraction_versions v on v.candidate_id=c.id
@@ -755,7 +778,7 @@ class PostgresPhase2Repository:
                     await cursor.execute("update decision_versions set is_current=false,status='stale' where selection_session_id=%s and is_current", (session_id,))
                 await cursor.execute("""insert into decision_versions
                     (id,selection_session_id,anonymous_client_id,version,status,rule_version,need_snapshot,input_fingerprint,top_candidate_id,is_current)
-                    values (%s,%s,%s,%s,'completed',%s,%s::jsonb,%s,%s,%s)""", (version_id,session_id,client_id,next_version,rule_version,psycopg.types.json.Jsonb(job["decision_need_snapshot"]),input_fingerprint,decisions[0]["candidate_id"],is_current))
+                    values (%s,%s,%s,%s,'completed',%s,%s::jsonb,%s,%s,%s)""", (version_id,session_id,owner.anonymous_client_id,next_version,rule_version,psycopg.types.json.Jsonb(job["decision_need_snapshot"]),input_fingerprint,decisions[0]["candidate_id"],is_current))
                 for decision in decisions:
                     await cursor.execute("""insert into candidate_decisions
                        (id,decision_version_id,candidate_id,extraction_version_id,action_bucket,rank_within_bucket,overall_order,reasons,risk_flags,missing_critical_fields,score_components,internal_score)
@@ -766,11 +789,10 @@ class PostgresPhase2Repository:
                 await cursor.execute("update analysis_jobs set status='completed',stage='completed',decision_version_id=%s,finished_at=now(),updated_at=now() where id=%s", (version_id,job_id))
 
     async def get_decision_version_for_client(self, *, version_id: UUID, client_id: UUID) -> tuple[dict[str, object], list[dict[str, object]]]:
+        await self._require_owned_resource("decision_versions", version_id, client_id)
         async with self._connection.cursor() as cursor:
-            await cursor.execute("select * from decision_versions where id=%s and anonymous_client_id=%s", (version_id,client_id))
+            await cursor.execute("select * from decision_versions where id=%s", (version_id,))
             version = await cursor.fetchone()
-        if version is None:
-            await self._raise_ownership_or_not_found("decision_versions", version_id, client_id)
         async with self._connection.cursor() as cursor:
             await cursor.execute("select * from candidate_decisions where decision_version_id=%s order by overall_order", (version_id,))
             return version, list(await cursor.fetchall())
@@ -943,17 +965,17 @@ class PostgresPhase2Repository:
             await cursor.execute(
                 """select id,selection_session_id,decision_version_id,followup_question_id,candidate_id,
                           raw_text,status,processing_status,parse_status,created_at
-                   from merchant_replies where decision_version_id=%s and anonymous_client_id=%s
+                   from merchant_replies where decision_version_id=%s
                    order by created_at""",
-                (question_version_id, client_id),
+                (question_version_id,),
             )
             replies = list(await cursor.fetchall())
             await cursor.execute(
                 """select id,status,stage,error_code,decision_version_id,decision_delta_id,created_at,updated_at
                    from analysis_jobs where job_kind='merchant_rejudgement'
-                     and merchant_reply_id in (select id from merchant_replies where decision_version_id=%s and anonymous_client_id=%s)
+                     and merchant_reply_id in (select id from merchant_replies where decision_version_id=%s)
                    order by created_at desc limit 1""",
-                (question_version_id, client_id),
+                (question_version_id,),
             )
             rejudge_job = await cursor.fetchone()
             await cursor.execute(
@@ -985,11 +1007,12 @@ class PostgresPhase2Repository:
 
     async def claim_question_generation(self, *, version_id: UUID, client_id: UUID, idempotency_key: UUID) -> bool:
         """Atomically elect one provider caller; completed runs replay their immutable rows."""
+        await self._require_owned_resource("decision_versions", version_id, client_id)
         async with self._connection.transaction():
             async with self._connection.cursor() as cursor:
                 await cursor.execute(
-                    "select id from decision_versions where id=%s and anonymous_client_id=%s and is_current and status='completed' for update",
-                    (version_id, client_id),
+                    "select id from decision_versions where id=%s and is_current and status='completed' for update",
+                    (version_id,),
                 )
                 if await cursor.fetchone() is None:
                     raise DecisionStale("Decision version is no longer current")
@@ -1014,11 +1037,12 @@ class PostgresPhase2Repository:
         questions: list[dict[str, object]],
     ) -> None:
         """Persist the run terminal state and all questions atomically; records are append-only."""
+        await self._require_owned_resource("decision_versions", version_id, client_id)
         async with self._connection.transaction():
             async with self._connection.cursor() as cursor:
                 await cursor.execute(
-                    "select id from decision_versions where id=%s and anonymous_client_id=%s and is_current and status='completed' for update",
-                    (version_id, client_id),
+                    "select id from decision_versions where id=%s and is_current and status='completed' for update",
+                    (version_id,),
                 )
                 if await cursor.fetchone() is None:
                     raise DecisionStale("Decision version is no longer current")
@@ -1049,6 +1073,9 @@ class PostgresPhase2Repository:
     ) -> tuple[dict[str, object], bool]:
         """Bind reply targets from the current question record, never from client supplied fields."""
         await self.question_context_for_current_decision(version_id=decision_version_id, client_id=client_id)
+        owner = _as_owner(client_id)
+        idempotency_column = "selection_session_id" if owner.user_id is not None else "anonymous_client_id"
+        idempotency_owner = session_id if owner.user_id is not None else owner.anonymous_client_id
         async with self._connection.transaction():
             async with self._connection.cursor() as cursor:
                 await cursor.execute(
@@ -1062,8 +1089,8 @@ class PostgresPhase2Repository:
                 await cursor.execute(
                     """select id,selection_session_id,decision_version_id,followup_question_id,candidate_id,
                        raw_text,status,processing_status,parse_status,request_hash,created_at from merchant_replies
-                       where anonymous_client_id=%s and followup_question_id=%s and idempotency_key=%s""",
-                    (client_id, followup_question_id, idempotency_key),
+                       where """ + idempotency_column + """=%s and followup_question_id=%s and idempotency_key=%s""",
+                    (idempotency_owner, followup_question_id, idempotency_key),
                 )
                 existing = await cursor.fetchone()
                 if existing:
@@ -1073,19 +1100,19 @@ class PostgresPhase2Repository:
                 await cursor.execute(
                     """insert into merchant_replies
                        (id,selection_session_id,decision_version_id,followup_question_id,candidate_id,anonymous_client_id,
-                        idempotency_key,request_hash,raw_text,status,processing_status)
+                       idempotency_key,request_hash,raw_text,status,processing_status)
                        values (%s,%s,%s,%s,%s,%s,%s,%s,%s,'submitted','queued')
-                       on conflict (anonymous_client_id,followup_question_id,idempotency_key) do nothing
+                       on conflict do nothing
                        returning id,selection_session_id,decision_version_id,followup_question_id,candidate_id,raw_text,status,processing_status,parse_status,created_at""",
-                    (reply_id, session_id, decision_version_id, followup_question_id, question["candidate_id"], client_id, idempotency_key, request_hash, raw_text),
+                    (reply_id, session_id, decision_version_id, followup_question_id, question["candidate_id"], owner.anonymous_client_id, idempotency_key, request_hash, raw_text),
                 )
                 inserted = await cursor.fetchone()
                 if inserted is not None:
                     return inserted, True
                 await cursor.execute(
                     """select id,selection_session_id,decision_version_id,followup_question_id,candidate_id,raw_text,status,processing_status,parse_status,request_hash,created_at
-                       from merchant_replies where anonymous_client_id=%s and followup_question_id=%s and idempotency_key=%s""",
-                    (client_id, followup_question_id, idempotency_key),
+                       from merchant_replies where """ + idempotency_column + """=%s and followup_question_id=%s and idempotency_key=%s""",
+                    (idempotency_owner, followup_question_id, idempotency_key),
                 )
                 replay = await cursor.fetchone()
                 if replay is None:
@@ -1095,28 +1122,28 @@ class PostgresPhase2Repository:
                 return replay, False
 
     async def get_merchant_reply_for_client(self, *, reply_id: UUID, client_id: UUID) -> dict[str, object]:
+        await self._require_owned_resource("merchant_replies", reply_id, client_id)
         async with self._connection.cursor() as cursor:
             await cursor.execute(
                 """select id,selection_session_id,decision_version_id,followup_question_id,candidate_id,raw_text,status,processing_status,parse_status,created_at
-                   from merchant_replies where id=%s and anonymous_client_id=%s""", (reply_id, client_id)
+                   from merchant_replies where id=%s""", (reply_id,)
             )
             row = await cursor.fetchone()
-        if row is None:
-            await self._raise_ownership_or_not_found("merchant_replies", reply_id, client_id)
         return row
 
     async def persist_merchant_reply_parse(
         self, *, reply_id: UUID, client_id: UUID, parsed_status: str, claims: tuple[dict[str, str], ...],
     ) -> None:
         """Append merchant claims without mutating an immutable extraction version."""
+        await self._require_owned_resource("merchant_replies", reply_id, client_id)
         async with self._connection.transaction():
             async with self._connection.cursor() as cursor:
                 await cursor.execute(
                     """select r.*,q.field_key,d.extraction_version_id from merchant_replies r
                        join followup_questions q on q.id=r.followup_question_id
                        join candidate_decisions d on d.decision_version_id=r.decision_version_id and d.candidate_id=r.candidate_id
-                       where r.id=%s and r.anonymous_client_id=%s and r.processing_status='processing' for update""",
-                    (reply_id, client_id),
+                       where r.id=%s and r.processing_status='processing' for update""",
+                    (reply_id,),
                 )
                 reply = await cursor.fetchone()
                 if reply is None:
@@ -1143,19 +1170,21 @@ class PostgresPhase2Repository:
 
     async def fail_merchant_reply_parse(self, *, reply_id: UUID, client_id: UUID) -> None:
         """Leave no partial claim rows when the parser cannot produce a result."""
+        await self._require_owned_resource("merchant_replies", reply_id, client_id)
         async with self._connection.transaction():
             async with self._connection.cursor() as cursor:
                 await cursor.execute(
                     """update merchant_replies set status='failed',processing_status='failed'
-                       where id=%s and anonymous_client_id=%s and processing_status='processing'""",
-                    (reply_id, client_id),
+                       where id=%s and processing_status='processing'""",
+                    (reply_id,),
                 )
 
     async def claim_merchant_reply_for_parse(self, *, reply_id: UUID, client_id: UUID) -> tuple[dict[str, object], tuple[dict[str, object], ...]] | None:
+        await self._require_owned_resource("merchant_replies", reply_id, client_id)
         async with self._connection.transaction():
             async with self._connection.cursor() as cursor:
-                await cursor.execute("""update merchant_replies set processing_status='processing' where id=%s and anonymous_client_id=%s and processing_status='queued'
-                    returning id,decision_version_id,followup_question_id,candidate_id,raw_text""", (reply_id, client_id))
+                await cursor.execute("""update merchant_replies set processing_status='processing' where id=%s and processing_status='queued'
+                    returning id,decision_version_id,followup_question_id,candidate_id,raw_text""", (reply_id,))
                 reply = await cursor.fetchone()
                 if reply is None: return None
                 await cursor.execute("select field_key from followup_questions where id=%s", (reply["followup_question_id"],))
@@ -1168,6 +1197,7 @@ class PostgresPhase2Repository:
         idempotency_key: UUID, request_hash: str,
     ) -> tuple[StoredJob, bool]:
         """Create exactly one asynchronous rejudgement job per merchant reply."""
+        await self._require_owned_resource("merchant_replies", reply_id, client_id)
         async with self._connection.transaction():
             async with self._connection.cursor() as cursor:
                 await cursor.execute(
@@ -1175,8 +1205,8 @@ class PostgresPhase2Repository:
                        from merchant_replies r join decision_versions d on d.id=r.decision_version_id
                        join candidate_decisions cd on cd.decision_version_id=d.id and cd.candidate_id=r.candidate_id
                        join extraction_versions v on v.id=cd.extraction_version_id
-                       where r.id=%s and r.selection_session_id=%s and r.anonymous_client_id=%s for update""",
-                    (reply_id, session_id, client_id),
+                       where r.id=%s and r.selection_session_id=%s for update""",
+                    (reply_id, session_id),
                 )
                 reply = await cursor.fetchone()
                 if reply is None:
@@ -1195,8 +1225,8 @@ class PostgresPhase2Repository:
                 questioned_ids = {row["id"] for row in await cursor.fetchall()}
                 await cursor.execute(
                     """select distinct followup_question_id from merchant_replies
-                       where decision_version_id=%s and anonymous_client_id=%s and status <> 'failed'""",
-                    (reply["decision_version_id"], client_id),
+                       where decision_version_id=%s and status <> 'failed'""",
+                    (reply["decision_version_id"],),
                 )
                 replied_question_ids = {row["followup_question_id"] for row in await cursor.fetchall()}
                 if not questioned_ids.issubset(replied_question_ids):
@@ -1253,10 +1283,10 @@ class PostgresPhase2Repository:
             await cursor.execute(
                 """select r.id from merchant_replies r
                    join decision_versions d on d.id=r.decision_version_id
-                   where r.selection_session_id=%s and r.anonymous_client_id=%s
+                   where r.selection_session_id=%s
                      and d.is_current and d.status='completed'
                    order by r.created_at desc limit 1""",
-                (session_id, client_id),
+                (session_id,),
             )
             row = await cursor.fetchone()
         if row is None:
@@ -1294,8 +1324,8 @@ class PostgresPhase2Repository:
         async with self._connection.cursor() as cursor:
             await cursor.execute(
                 """select recent_preference_evidence from selection_sessions
-                   where id=%s and anonymous_client_id=%s""",
-                (version["selection_session_id"], client_id),
+                   where id=%s""",
+                (version["selection_session_id"],),
             )
             session = await cursor.fetchone()
             if session is None:
@@ -1308,17 +1338,17 @@ class PostgresPhase2Repository:
             await cursor.execute(
                 """select r.id,r.candidate_id,r.raw_text,r.processing_status,r.parse_status,q.field_key
                    from merchant_replies r join followup_questions q on q.id=r.followup_question_id
-                   where r.decision_version_id=%s and r.anonymous_client_id=%s
+                   where r.decision_version_id=%s
                    order by r.created_at""",
-                (anchor["decision_version_id"], client_id),
+                (anchor["decision_version_id"],),
             )
             replies = list(await cursor.fetchall())
             await cursor.execute(
                 """select c.merchant_reply_id,c.candidate_id,c.field_key,c.raw_text,c.normalized_value,
                           c.information_status,c.source_type,c.verification_status,c.evidence_strength
                    from merchant_claims c join merchant_replies r on r.id=c.merchant_reply_id
-                   where r.decision_version_id=%s and r.anonymous_client_id=%s order by c.created_at""",
-                (anchor["decision_version_id"], client_id),
+                   where r.decision_version_id=%s order by c.created_at""",
+                (anchor["decision_version_id"],),
             )
             claims = list(await cursor.fetchall())
         return anchor, version, inputs, replies, claims
@@ -1328,6 +1358,8 @@ class PostgresPhase2Repository:
         decisions: list[dict[str, object]], delta: dict[str, object], input_fingerprint: str,
     ) -> None:
         """Commit one V2 decision from all saved merchant claims in one transaction."""
+        await self._require_owned_resource("merchant_replies", anchor_reply_id, client_id)
+        owner = _as_owner(client_id)
         async with self._connection.transaction():
             async with self._connection.cursor() as cursor:
                 await cursor.execute(
@@ -1336,8 +1368,8 @@ class PostgresPhase2Repository:
                        from analysis_jobs j join merchant_replies r on r.id=j.merchant_reply_id
                        join decision_versions d on d.id=r.decision_version_id
                        where j.id=%s and j.merchant_reply_id=%s and j.status='processing'
-                         and r.anonymous_client_id=%s for update""",
-                    (job_id, anchor_reply_id, client_id),
+                         for update""",
+                    (job_id, anchor_reply_id),
                 )
                 state = await cursor.fetchone()
                 if state is None:
@@ -1351,7 +1383,7 @@ class PostgresPhase2Repository:
                     """insert into decision_versions (id,selection_session_id,anonymous_client_id,version,status,rule_version,
                        need_snapshot,input_fingerprint,top_candidate_id,is_current,parent_decision_version_id,trigger_type,trigger_resource_id)
                        values (%s,%s,%s,%s,'completed','v1',%s::jsonb,%s,%s,true,%s,'merchant_reply_batch',%s)""",
-                    (version_id, state["selection_session_id"], client_id, next_version,
+                    (version_id, state["selection_session_id"], owner.anonymous_client_id, next_version,
                      psycopg.types.json.Jsonb(state["need_snapshot"]), input_fingerprint, decisions[0]["candidate_id"],
                      state["decision_version_id"], anchor_reply_id),
                 )
@@ -1389,6 +1421,8 @@ class PostgresPhase2Repository:
         delta: dict[str, object], input_fingerprint: str,
     ) -> None:
         """One transaction: claims/evidence, immutable V2, delta, and terminal job state."""
+        await self._require_owned_resource("merchant_replies", reply_id, client_id)
+        owner = _as_owner(client_id)
         async with self._connection.transaction():
             async with self._connection.cursor() as cursor:
                 await cursor.execute(
@@ -1399,8 +1433,8 @@ class PostgresPhase2Repository:
                        join decision_versions d on d.id=r.decision_version_id
                        join candidate_decisions cd on cd.decision_version_id=d.id and cd.candidate_id=r.candidate_id
                        where j.id=%s and j.merchant_reply_id=%s and j.status='processing'
-                         and r.anonymous_client_id=%s and r.processing_status='processing' for update""",
-                    (job_id, reply_id, client_id),
+                         and r.processing_status='processing' for update""",
+                    (job_id, reply_id),
                 )
                 state = await cursor.fetchone()
                 if state is None:
@@ -1441,7 +1475,7 @@ class PostgresPhase2Repository:
                     """insert into decision_versions (id,selection_session_id,anonymous_client_id,version,status,rule_version,
                        need_snapshot,input_fingerprint,top_candidate_id,is_current,parent_decision_version_id,trigger_type,trigger_resource_id)
                        values (%s,%s,%s,%s,'completed','v1',%s::jsonb,%s,%s,true,%s,'merchant_reply',%s)""",
-                    (version_id, state["selection_session_id"], client_id, next_version,
+                    (version_id, state["selection_session_id"], owner.anonymous_client_id, next_version,
                      psycopg.types.json.Jsonb(state["need_snapshot"]), input_fingerprint, decisions[0]["candidate_id"],
                      state["decision_version_id"], reply_id),
                 )
@@ -1483,8 +1517,9 @@ class PostgresPhase2Repository:
                 await cursor.execute("update analysis_jobs set status='failed',stage='failed',error_code='candidate_extraction_not_retryable',finished_at=now(),updated_at=now() where id=%s and status='processing'", (job_id,))
 
     async def get_decision_delta_for_client(self, *, delta_id: UUID, client_id: UUID) -> dict[str, object]:
+        await self._require_owned_resource("decision_deltas", delta_id, client_id)
         async with self._connection.cursor() as cursor:
-            await cursor.execute("select d.* from decision_deltas d join selection_sessions s on s.id=d.selection_session_id where d.id=%s and s.anonymous_client_id=%s", (delta_id, client_id))
+            await cursor.execute("select d.* from decision_deltas d where d.id=%s", (delta_id,))
             row = await cursor.fetchone()
         if row is None:
             await self._raise_ownership_or_not_found("decision_deltas", delta_id, client_id)
@@ -1790,29 +1825,32 @@ class PostgresPhase2Repository:
             )
         await self._connection.commit()
 
-    async def _require_owned_session(self, session_id: UUID, client_id: UUID) -> None:
-        async with self._connection.cursor() as cursor:
-            await cursor.execute(
-                "select anonymous_client_id from selection_sessions where id = %s", (session_id,)
-            )
-            row = await cursor.fetchone()
-        if row is None:
-            raise ResourceNotFound("Selection session not found")
-        if row["anonymous_client_id"] != client_id:
-            raise OwnershipDenied("Selection session belongs to another anonymous client")
+    async def require_session_for_owner(self, *, session_id: UUID, owner: OwnerLike) -> None:
+        """Authorize a root Selection Session for either owner branch."""
 
-    async def _require_owned_candidate(self, candidate_id: UUID, client_id: UUID) -> None:
+        await self._require_owned_session(session_id, owner)
+
+    async def require_candidate_for_owner(self, *, candidate_id: UUID, owner: OwnerLike) -> None:
+        """Authorize a candidate by resolving its owning Selection Session."""
+
+        await self._require_owned_candidate(candidate_id, owner)
+
+    async def _require_owned_session(self, session_id: UUID, owner: OwnerLike) -> None:
+        await self._require_owned_resource("selection_sessions", session_id, owner)
+
+    async def _require_owned_candidate(self, candidate_id: UUID, owner: OwnerLike) -> None:
         async with self._connection.cursor() as cursor:
             await cursor.execute(
-                """select s.anonymous_client_id from candidates c
-                   join selection_sessions s on s.id = c.selection_session_id where c.id = %s and c.status='active'""",
+                """select s.user_id, s.anonymous_client_id from candidates c
+                   join selection_sessions s on s.id = c.selection_session_id
+                   where c.id = %s and c.status='active'""",
                 (candidate_id,),
             )
             row = await cursor.fetchone()
         if row is None:
             raise ResourceNotFound("Candidate not found")
-        if row["anonymous_client_id"] != client_id:
-            raise OwnershipDenied("Candidate belongs to another anonymous client")
+        if not _owner_matches(owner, row):
+            raise OwnershipDenied("Candidate belongs to another owner")
 
     async def _require_image_for_candidate(self, image_id: UUID, candidate_id: UUID) -> None:
         async with self._connection.cursor() as cursor:
@@ -1823,27 +1861,59 @@ class PostgresPhase2Repository:
             if await cursor.fetchone() is None:
                 raise ResourceNotFound("Candidate image not found for candidate")
 
-    async def _require_owned_extraction_version(self, version_id: UUID, client_id: UUID) -> None:
+    async def _require_owned_extraction_version(self, version_id: UUID, owner: OwnerLike) -> None:
+        await self._require_owned_resource("extraction_versions", version_id, owner)
+
+    async def _require_owned_resource(self, table: str, resource_id: UUID, owner: OwnerLike) -> None:
+        owner_queries = {
+            "selection_sessions": "select user_id, anonymous_client_id from selection_sessions where id = %s",
+            "candidates": """select s.user_id, s.anonymous_client_id from candidates r
+                join selection_sessions s on s.id = r.selection_session_id where r.id = %s""",
+            "candidate_images": """select s.user_id, s.anonymous_client_id from candidate_images r
+                join candidates c on c.id = r.candidate_id
+                join selection_sessions s on s.id = c.selection_session_id where r.id = %s""",
+            "analysis_jobs": """select s.user_id, s.anonymous_client_id from analysis_jobs r
+                join candidates c on c.id = r.candidate_id
+                join selection_sessions s on s.id = c.selection_session_id where r.id = %s""",
+            "extraction_versions": """select s.user_id, s.anonymous_client_id from extraction_versions r
+                join candidates c on c.id = r.candidate_id
+                join selection_sessions s on s.id = c.selection_session_id where r.id = %s""",
+            "decision_versions": """select s.user_id, s.anonymous_client_id from decision_versions r
+                join selection_sessions s on s.id = r.selection_session_id where r.id = %s""",
+            "followup_questions": """select s.user_id, s.anonymous_client_id from followup_questions r
+                join selection_sessions s on s.id = r.selection_session_id where r.id = %s""",
+            "merchant_replies": """select s.user_id, s.anonymous_client_id from merchant_replies r
+                join selection_sessions s on s.id = r.selection_session_id where r.id = %s""",
+            "decision_deltas": """select s.user_id, s.anonymous_client_id from decision_deltas r
+                join selection_sessions s on s.id = r.selection_session_id where r.id = %s""",
+        }
+        query = owner_queries.get(table)
+        if query is None:
+            raise ValueError(f"Unsupported owner resource: {table}")
         async with self._connection.cursor() as cursor:
-            await cursor.execute(
-                """select s.anonymous_client_id from extraction_versions v
-                   join candidates c on c.id = v.candidate_id
-                   join selection_sessions s on s.id = c.selection_session_id
-                   where v.id = %s""",
-                (version_id,),
-            )
+            await cursor.execute(query, (resource_id,))
             row = await cursor.fetchone()
         if row is None:
-            raise ResourceNotFound("Extraction version not found")
-        if row["anonymous_client_id"] != client_id:
-            raise OwnershipDenied("Extraction version belongs to another anonymous client")
+            raise ResourceNotFound(f"{table} not found")
+        if not _owner_matches(owner, row):
+            raise OwnershipDenied("Resource belongs to another owner")
 
-    async def _raise_ownership_or_not_found(self, table: str, resource_id: UUID, client_id: UUID) -> None:
+    async def _raise_ownership_or_not_found(self, table: str, resource_id: UUID, owner: OwnerLike) -> None:
+        owner_queries = {
+            "selection_sessions": "select 1 from selection_sessions where id = %s",
+            "analysis_jobs": "select 1 from analysis_jobs where id = %s",
+            "decision_versions": "select 1 from decision_versions where id = %s",
+            "merchant_replies": "select 1 from merchant_replies where id = %s",
+            "decision_deltas": "select 1 from decision_deltas where id = %s",
+        }
+        query = owner_queries.get(table)
+        if query is None:
+            raise ValueError(f"Unsupported owner resource: {table}")
         async with self._connection.cursor() as cursor:
-            await cursor.execute(f"select 1 from {table} where id = %s", (resource_id,))
+            await cursor.execute(query, (resource_id,))
             exists = await cursor.fetchone() is not None
         if exists:
-            raise OwnershipDenied("Resource belongs to another anonymous client")
+            raise OwnershipDenied("Resource belongs to another owner")
         resource_names = {
             "selection_sessions": "Selection session",
             "candidate_images": "Candidate image",

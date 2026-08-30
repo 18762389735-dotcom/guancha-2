@@ -308,7 +308,7 @@ def _register_exception_handlers(application: FastAPI) -> None:
     @application.exception_handler(RepositoryError)
     async def repository_error_handler(request: Request, exc: RepositoryError) -> JSONResponse:
         if isinstance(exc, OwnershipDenied):
-            return error_response(status_code=403, code="resource_not_owned", message="Resource belongs to another anonymous client.")
+            return error_response(status_code=403, code="resource_not_owned", message="Resource belongs to another owner.")
         if isinstance(exc, ResourceNotFound):
             return error_response(status_code=404, code=_not_found_code(exc), message="Requested resource was not found.")
         if isinstance(exc, IdempotencyConflict):

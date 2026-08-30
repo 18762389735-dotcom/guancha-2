@@ -4,6 +4,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
+from guancha_api.auth.models import OwnerContext, repository_owner, resolve_owner
 from guancha_api.repositories.idempotency import request_hash
 from guancha_api.repositories.postgres import CandidateExtractionInProgress, PostgresPhase2Repository
 from guancha_api.schemas.contracts import Candidate, CreateCandidateRequest, SelectionNeedInput, SelectionSession
@@ -51,38 +52,60 @@ class Phase2ExtractionService:
             if owns_worker_repository:
                 await worker_repository.close()
 
-    async def create_session(self, *, client_id: UUID, idempotency_key: UUID, need: SelectionNeedInput, recent_preference_evidence: tuple[dict[str, object], ...] = ()) -> tuple[SelectionSession, bool]:
+    async def create_session(
+        self, *, idempotency_key: UUID, need: SelectionNeedInput,
+        recent_preference_evidence: tuple[dict[str, object], ...] = (),
+        owner: OwnerContext | None = None, client_id: UUID | None = None,
+    ) -> tuple[SelectionSession, bool]:
+        request_owner = resolve_owner(owner=owner, client_id=client_id)
         now = datetime.now(timezone.utc)
         evidence = tuple(item for item in recent_preference_evidence if item.get("confidence") == "low")[-12:]
         row, created = await self.repository.create_selection_session(
-            session_id=uuid4(), client_id=client_id, idempotency_key=idempotency_key,
+            session_id=uuid4(), client_id=repository_owner(request_owner), idempotency_key=idempotency_key,
             request_hash=request_hash({"need": need.model_dump(mode="json"), "recent_preference_evidence": evidence}), need=need.model_dump(mode="json"), recent_preference_evidence=evidence,
             expires_at=now + timedelta(days=15),
         )
         return self._session(row), created
 
-    async def get_session(self, *, client_id: UUID, session_id: UUID) -> SelectionSession:
-        return self._session(await self.repository.get_selection_session_for_client(session_id=session_id, client_id=client_id))
+    async def get_session(
+        self, *, session_id: UUID, owner: OwnerContext | None = None, client_id: UUID | None = None
+    ) -> SelectionSession:
+        request_owner = resolve_owner(owner=owner, client_id=client_id)
+        return self._session(await self.repository.get_selection_session_for_client(session_id=session_id, client_id=repository_owner(request_owner)))
 
     async def update_session_need(
-        self, *, client_id: UUID, session_id: UUID, need: SelectionNeedInput, recent_preference_evidence: tuple[dict[str, object], ...] = ()
+        self, *, session_id: UUID, need: SelectionNeedInput,
+        recent_preference_evidence: tuple[dict[str, object], ...] = (),
+        owner: OwnerContext | None = None, client_id: UUID | None = None,
     ) -> SelectionSession:
+        request_owner = resolve_owner(owner=owner, client_id=client_id)
         row = await self.repository.update_selection_need_for_client(
-            session_id=session_id, client_id=client_id, need=need.model_dump(mode="json"), recent_preference_evidence=tuple(item for item in recent_preference_evidence if item.get("confidence") == "low")[-12:]
+            session_id=session_id, client_id=repository_owner(request_owner), need=need.model_dump(mode="json"), recent_preference_evidence=tuple(item for item in recent_preference_evidence if item.get("confidence") == "low")[-12:]
         )
         return self._session(row)
 
-    async def create_candidate(self, *, client_id: UUID, session_id: UUID, idempotency_key: UUID, request: CreateCandidateRequest) -> tuple[Candidate, bool]:
-        row, created = await self.repository.create_candidate(candidate_id=uuid4(), session_id=session_id, client_id=client_id, label=request.display_label, display_name=request.display_name, idempotency_key=idempotency_key, request_hash=request_hash(request.model_dump(mode="json")))
+    async def create_candidate(
+        self, *, session_id: UUID, idempotency_key: UUID, request: CreateCandidateRequest,
+        owner: OwnerContext | None = None, client_id: UUID | None = None,
+    ) -> tuple[Candidate, bool]:
+        request_owner = resolve_owner(owner=owner, client_id=client_id)
+        row, created = await self.repository.create_candidate(candidate_id=uuid4(), session_id=session_id, client_id=repository_owner(request_owner), label=request.display_label, display_name=request.display_name, idempotency_key=idempotency_key, request_hash=request_hash(request.model_dump(mode="json")))
         if created:
             await self.repository.stale_current_decision_for_session(session_id=session_id)
         return self._candidate(row), created
 
-    async def list_candidates(self, *, client_id: UUID, session_id: UUID) -> tuple[Candidate, ...]:
-        return tuple(self._candidate(row) for row in await self.repository.list_candidates_for_session(session_id=session_id, client_id=client_id))
+    async def list_candidates(
+        self, *, session_id: UUID, owner: OwnerContext | None = None, client_id: UUID | None = None
+    ) -> tuple[Candidate, ...]:
+        request_owner = resolve_owner(owner=owner, client_id=client_id)
+        return tuple(self._candidate(row) for row in await self.repository.list_candidates_for_session(session_id=session_id, client_id=repository_owner(request_owner)))
 
-    async def delete_candidate(self, *, client_id: UUID, candidate_id: UUID, storage: TemporaryPrivateStorage) -> None:
-        image_ids = await self.repository.delete_candidate(candidate_id=candidate_id, client_id=client_id)
+    async def delete_candidate(
+        self, *, candidate_id: UUID, storage: TemporaryPrivateStorage,
+        owner: OwnerContext | None = None, client_id: UUID | None = None,
+    ) -> None:
+        request_owner = resolve_owner(owner=owner, client_id=client_id)
+        image_ids = await self.repository.delete_candidate(candidate_id=candidate_id, client_id=repository_owner(request_owner))
         for image_id in image_ids:
             try:
                 await storage.delete(object_key=temporary_image_object_key(image_id))
@@ -90,10 +113,12 @@ class Phase2ExtractionService:
                 continue
 
     async def upload_image(
-        self, *, client_id: UUID, candidate_id: UUID, idempotency_key: UUID,
+        self, *, candidate_id: UUID, idempotency_key: UUID,
         data: bytes, declared_content_type: str, storage: TemporaryPrivateStorage,
         task_runner: InProcessTaskRunner | ManualTaskRunner, provider: StructuredVisionProvider,
+        owner: OwnerContext | None = None, client_id: UUID | None = None,
     ) -> tuple[UploadCandidateImageResponse, bool]:
+        request_owner = resolve_owner(owner=owner, client_id=client_id)
         image = sanitize_image_upload(data=data, declared_content_type=declared_content_type)
         # The stable request digest binds the logical target to sanitized pixels.
         digest = request_hash({"candidate_id": str(candidate_id), "sanitized_sha256": image.sanitized_sha256, "content_type": image.content_type})
@@ -107,7 +132,7 @@ class Phase2ExtractionService:
         job_id = uuid5(NAMESPACE_URL, f"{identity}:job")
         object_key = temporary_image_object_key(image_id)
         replay = await self.repository.find_image_job_replay(
-            candidate_id=candidate_id, client_id=client_id, idempotency_key=idempotency_key, request_hash=digest
+            candidate_id=candidate_id, client_id=repository_owner(request_owner), idempotency_key=idempotency_key, request_hash=digest
         )
         if replay is not None:
             return self._upload_response(replay.image, replay.job), False
@@ -117,7 +142,7 @@ class Phase2ExtractionService:
             raise TaskEnqueueError("Temporary private storage did not accept the image") from storage_error
         try:
             result = await self.repository.create_image_and_initial_job(
-                image_id=image_id, job_id=job_id, candidate_id=candidate_id, client_id=client_id,
+                image_id=image_id, job_id=job_id, candidate_id=candidate_id, client_id=repository_owner(request_owner),
                 idempotency_key=idempotency_key, content_type=image.content_type, size_bytes=image.size_bytes,
                 source_sha256=image.source_sha256,
                 sanitized_sha256=image.sanitized_sha256,
@@ -165,13 +190,15 @@ class Phase2ExtractionService:
         return self._upload_response(result.image, result.job), True
 
     async def start_staged_extractions(
-        self, *, session_id: UUID, client_id: UUID,
+        self, *, session_id: UUID,
         storage: TemporaryPrivateStorage,
         task_runner: InProcessTaskRunner | ManualTaskRunner,
         provider: StructuredVisionProvider,
+        owner: OwnerContext | None = None, client_id: UUID | None = None,
     ) -> tuple[AnalysisJobResponse, ...]:
+        request_owner = resolve_owner(owner=owner, client_id=client_id)
         jobs = await self.repository.list_queued_extraction_jobs_for_session(
-            session_id=session_id, client_id=client_id
+            session_id=session_id, client_id=repository_owner(request_owner)
         )
         started: list[AnalysisJobResponse] = []
         for job in jobs:
@@ -194,24 +221,27 @@ class Phase2ExtractionService:
         return tuple(started)
 
     async def list_staged_extractions(
-        self, *, session_id: UUID, client_id: UUID
+        self, *, session_id: UUID, owner: OwnerContext | None = None, client_id: UUID | None = None
     ) -> tuple[AnalysisJobResponse, ...]:
         """Return queued response anchors without dispatching or emitting."""
+        request_owner = resolve_owner(owner=owner, client_id=client_id)
         jobs = await self.repository.list_queued_extraction_jobs_for_session(
-            session_id=session_id, client_id=client_id
+            session_id=session_id, client_id=repository_owner(request_owner)
         )
         return tuple(self._job_response(job) for job in jobs)
 
     async def delete_image(
-        self, *, client_id: UUID, image_id: UUID, storage: TemporaryPrivateStorage
+        self, *, image_id: UUID, storage: TemporaryPrivateStorage,
+        owner: OwnerContext | None = None, client_id: UUID | None = None,
     ) -> None:
-        image = await self.repository.get_image_for_client(image_id=image_id, client_id=client_id)
+        request_owner = resolve_owner(owner=owner, client_id=client_id)
+        image = await self.repository.get_image_for_client(image_id=image_id, client_id=repository_owner(request_owner))
         job_id = image.get("current_job_id")
         # Persist the recoverable deletion intent before external I/O.  If the
         # private delete fails, a repeated DELETE can safely finish cleanup;
         # the inverse order could leave an apparently usable DB image whose
         # only private object has already disappeared.
-        await self.repository.mark_image_deleted(image_id=image_id, client_id=client_id)
+        await self.repository.mark_image_deleted(image_id=image_id, client_id=repository_owner(request_owner))
         await self.repository.stale_current_decision_for_candidate(candidate_id=image["candidate_id"])
         if job_id is not None:
             try:
@@ -221,17 +251,20 @@ class Phase2ExtractionService:
                     "Unable to remove the temporary image during deletion"
                 ) from cleanup_error
 
-    async def reject_retry(self, *, client_id: UUID, candidate_id: UUID) -> None:
-        await self.repository.require_candidate_for_client(candidate_id=candidate_id, client_id=client_id)
+    async def reject_retry(self, *, candidate_id: UUID, owner: OwnerContext | None = None, client_id: UUID | None = None) -> None:
+        request_owner = resolve_owner(owner=owner, client_id=client_id)
+        await self.repository.require_candidate_for_client(candidate_id=candidate_id, client_id=repository_owner(request_owner))
 
-    async def get_job(self, *, client_id: UUID, job_id: UUID) -> AnalysisJobResponse:
-        return self._job_response(await self.repository.get_job_for_client(job_id=job_id, client_id=client_id))
+    async def get_job(self, *, job_id: UUID, owner: OwnerContext | None = None, client_id: UUID | None = None) -> AnalysisJobResponse:
+        request_owner = resolve_owner(owner=owner, client_id=client_id)
+        return self._job_response(await self.repository.get_job_for_client(job_id=job_id, client_id=repository_owner(request_owner)))
 
     async def get_image_metadata(
-        self, *, client_id: UUID, image_id: UUID
+        self, *, image_id: UUID, owner: OwnerContext | None = None, client_id: UUID | None = None
     ) -> CandidateImageMetadata:
+        request_owner = resolve_owner(owner=owner, client_id=client_id)
         row = await self.repository.get_image_for_client(
-            image_id=image_id, client_id=client_id
+            image_id=image_id, client_id=repository_owner(request_owner)
         )
         return CandidateImageMetadata(
             id=row["id"], candidate_id=row["candidate_id"],
@@ -242,10 +275,12 @@ class Phase2ExtractionService:
         )
 
     async def retry_job(
-        self, *, client_id: UUID, candidate_id: UUID, idempotency_key: UUID, storage: TemporaryPrivateStorage,
+        self, *, candidate_id: UUID, idempotency_key: UUID, storage: TemporaryPrivateStorage,
         task_runner: InProcessTaskRunner | ManualTaskRunner, provider: StructuredVisionProvider,
+        owner: OwnerContext | None = None, client_id: UUID | None = None,
     ) -> AnalysisJobResponse:
-        job = await self.repository.get_latest_job_for_candidate(candidate_id=candidate_id, client_id=client_id)
+        request_owner = resolve_owner(owner=owner, client_id=client_id)
+        job = await self.repository.get_latest_job_for_candidate(candidate_id=candidate_id, client_id=repository_owner(request_owner))
         retry_digest = request_hash({"candidate_id": str(candidate_id), "operation": "retry-extraction"})
         if job is None:
             raise ValueError("candidate_extraction_not_retryable")

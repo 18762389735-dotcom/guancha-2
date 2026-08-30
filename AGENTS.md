@@ -26,7 +26,7 @@ node --test frontend/tests/*.test.js
 ## 活跃文档与历史文档
 
 - `docs/CURRENT_STATE.md`：当前能力、未完成项和运行方式的唯一简明状态说明。
-- `docs/AUTH_MIGRATION_AUDIT.md`：Phase 9-0 基于实际代码的身份、ownership、浏览器存储和认证迁移审计。
+- `docs/AUTH_MIGRATION_AUDIT.md`：基于实际代码的 Phase 9-0 身份审计，以及 Phase 9-1/9-2 认证与 Selection ownership 实现记录。
 - 其他旧阶段文档、比赛 PRD、历史交接和旧审计仅作对照，不再自动构成“永不实现登录、云端茶仓或云端 Journal”等产品禁令。
 - 研究结论、产品定位、长期架构和数据规则若发生冲突，以当前已确认任务、研究宪法、决策记录和本文件/活跃状态文档为准；不得因为旧文件存在就自动恢复旧结论。
 
@@ -47,15 +47,15 @@ node --test frontend/tests/*.test.js
 - `app.js`、`styles.css`、`index.html`：已验收的前端视觉与交互基线。
 - `frontend/`：API Client、适配器、浏览器状态/存储以及后续最小 auth client 的边界。
 - `backend/src/guancha_api/`：FastAPI、Application、Domain、Repository、Provider、任务和图片存储。
-- `supabase/migrations/`：当前仅保存 PostgreSQL 迁移文件；认证迁移需要新建但本阶段不创建 migration。
+- `supabase/migrations/`：保存 PostgreSQL 迁移文件；新增迁移必须保持 additive、可回滚思路，并明确兼容旧 anonymous 数据。
 - `backend/tests/`、`frontend/tests/`：当前回归基线。新增认证测试必须使用 fake verifier / synthetic claims，不连接真实认证服务。
 
 ## 身份与数据原则
 
-- 当前匿名流程继续保留 `X-Client-Id`，但它只是可伪造的匿名 ownership 凭证，不得当作 authenticated user identity。本 Phase 9-0 不修改它的生成、注入或 API contract。
+- 当前匿名流程继续保留 `X-Client-Id`，但它只是可伪造的匿名 ownership 凭证，不得当作 authenticated user identity。Selection 路由的 owner precedence 是：Authorization 存在就必须认证；仅当 Authorization 完全缺失时才解析 `X-Client-Id`。
 - 未来任何长期用户数据都必须绑定服务端解析出的 authenticated user；不得由前端传入任意 `user_id` 决定资源归属。
 - Repository 必须依据服务端 `CurrentUser` 或明确的 anonymous owner context 做 ownership check；不能信任 URL、body、localStorage 或自定义 header 中的 user id。
-- Authenticated-owned session invariant：未来如果 `selection_sessions.user_id IS NOT NULL`，该 Session 必须视为 authenticated-owned resource。此时即使请求没有 Authorization、携带匹配的 `X-Client-Id`，或 `selection_sessions.anonymous_client_id` 仍作为 transition / provenance 字段存在，也不得通过 anonymous ownership path 读取、修改或访问该 Session 及其派生资源。Legacy anonymous authorization 只允许 `selection_sessions.user_id IS NULL` 的资源；认证资源必须要求服务端解析出的 `CurrentUser`，且 `CurrentUser.id` 必须等于 `selection_sessions.user_id`，`X-Client-Id` 不得授予授权。
+- Authenticated-owned session invariant：`selection_sessions.user_id IS NOT NULL` 时，该 Session 必须视为 authenticated-owned resource。即使请求没有 Authorization、携带匹配的 `X-Client-Id`，或 `anonymous_client_id` 作为历史 provenance 字段存在，也不得通过 anonymous ownership path 读取、修改或访问该 Session 及其派生资源。Legacy anonymous authorization 只允许 `selection_sessions.user_id IS NULL` 的资源；认证资源必须要求服务端解析出的 `CurrentUser`，且 `CurrentUser.id` 必须等于 `selection_sessions.user_id`，`X-Client-Id` 不得授予授权。
 - 不把密码存入当前 PostgreSQL。CloudBase Access Token 不得写入 Git、日志、分析事件、错误详情或业务数据库；Provider Key 不得放到前端。
 - authenticated 请求和 anonymous 请求必须有明确的 owner precedence。不能因为同一浏览器仍带有 `X-Client-Id` 就把匿名资源自动认领给账号。
 - 默认不自动迁移任意 anonymous data 到新账号。历史数据如需迁移，必须作为后续显式、可审计、可撤销的 migration/import 流程。
@@ -64,7 +64,7 @@ node --test frontend/tests/*.test.js
 ## 开发与验证纪律
 
 - 先完成最小可运行、可审查、可回滚的改动，再逐步扩展。
-- 不得顺手重构无关文件、升级无关依赖、删除 `anonymous_clients` 或改变 Provider / Selection Decision Logic。
+- 不得顺手重构无关文件、升级无关依赖、删除 `anonymous_clients` 或改变 Provider / Selection Decision Logic。认证 ownership 改造只允许触及当前 Selection 链路所需的最小边界。
 - 修改后运行最相关的测试、lint、类型检查、构建或启动验证；无法验证时明确说明原因和剩余不确定性。
 - 新增依赖、联网安装、删除文件、修改数据库、修改权限或调整部署配置前，先获得确认。
 - 生产代码、测试、日志和文档中都不得出现真实 API Key、Access Token、数据库 URL、用户截图内容或本机绝对路径。

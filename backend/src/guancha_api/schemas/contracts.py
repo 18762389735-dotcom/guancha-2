@@ -221,7 +221,7 @@ class SelectionNeedInput(ContractModel):
 
 class SelectionSession(ContractModel):
     id: UUID
-    anonymous_client_id: UUID
+    anonymous_client_id: UUID | None
     need: SelectionNeedInput
     evidence_version_id: UUID | None = None
     context_version_id: UUID | None = None
@@ -383,7 +383,7 @@ class ExtractionVersion(ContractModel):
 class DecisionVersion(ContractModel):
     id: UUID
     selection_session_id: UUID
-    anonymous_client_id: UUID
+    anonymous_client_id: UUID | None
     version: int = Field(ge=1)
     status: ExtractionStatus
     rule_version: str

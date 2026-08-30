@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from uuid import UUID, uuid4
 
+from guancha_api.auth.models import OwnerContext, repository_owner, resolve_owner
 from guancha_api.domain.tieguanyin.questioning import ANSWER_BRANCHES, simulate_decision_branch
 from guancha_api.domain.tieguanyin.merchant_fields import merchant_field_label
 from guancha_api.domain.tieguanyin.question_value_config import load_question_value_config
@@ -21,10 +22,15 @@ class QuestionGenerationService:
         self.repository = repository
         self.provider = provider or FakeReasoningProvider()
 
-    async def generate(self, *, version_id: UUID, client_id: UUID, idempotency_key: UUID) -> tuple[FollowupQuestion, ...]:
-        version, decisions, inputs = await self.repository.question_context_for_current_decision(version_id=version_id, client_id=client_id)
-        if not await self.repository.claim_question_generation(version_id=version_id, client_id=client_id, idempotency_key=idempotency_key):
-            return await self.list_current(version_id=version_id, client_id=client_id)
+    async def generate(
+        self, *, version_id: UUID, idempotency_key: UUID,
+        owner: OwnerContext | None = None, client_id: UUID | None = None,
+    ) -> tuple[FollowupQuestion, ...]:
+        request_owner = resolve_owner(owner=owner, client_id=client_id)
+        repo_owner = repository_owner(request_owner)
+        version, decisions, inputs = await self.repository.question_context_for_current_decision(version_id=version_id, client_id=repo_owner)
+        if not await self.repository.claim_question_generation(version_id=version_id, client_id=repo_owner, idempotency_key=idempotency_key):
+            return await self.list_current(version_id=version_id, owner=request_owner)
         try:
             candidates = self._candidates(version=version, decisions=decisions, inputs=inputs)
             expressed = await self.provider.generate_questions(tuple(candidates[:3]))
@@ -40,14 +46,17 @@ class QuestionGenerationService:
             if len(selected) > 3:
                 raise ValueError("Reasoning provider selected an unsupported question candidate")
             records = [self._record(version, item, candidates) for item in selected]
-            await self.repository.persist_followup_questions(version_id=version_id, client_id=client_id, status="completed", error_code=None, questions=records)
+            await self.repository.persist_followup_questions(version_id=version_id, client_id=repo_owner, status="completed", error_code=None, questions=records)
         except Exception as error:
-            await self.repository.persist_followup_questions(version_id=version_id, client_id=client_id, status="failed", error_code="ai_schema_invalid", questions=[])
+            await self.repository.persist_followup_questions(version_id=version_id, client_id=repo_owner, status="failed", error_code="ai_schema_invalid", questions=[])
             raise QuestionGenerationFailed("Question generation failed") from error
-        return await self.list_current(version_id=version_id, client_id=client_id)
+        return await self.list_current(version_id=version_id, owner=request_owner)
 
-    async def list_current(self, *, version_id: UUID, client_id: UUID) -> tuple[FollowupQuestion, ...]:
-        return tuple(self._dto(item) for item in await self.repository.get_followup_questions_for_current_decision(version_id=version_id, client_id=client_id))
+    async def list_current(
+        self, *, version_id: UUID, owner: OwnerContext | None = None, client_id: UUID | None = None
+    ) -> tuple[FollowupQuestion, ...]:
+        request_owner = resolve_owner(owner=owner, client_id=client_id)
+        return tuple(self._dto(item) for item in await self.repository.get_followup_questions_for_current_decision(version_id=version_id, client_id=repository_owner(request_owner)))
 
     def _candidates(self, *, version: dict[str, object], decisions: list[dict[str, object]], inputs: list[dict[str, object]]) -> list[ReasoningCandidate]:
         rules = load_approved_rules()

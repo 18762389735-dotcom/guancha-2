@@ -1,10 +1,10 @@
 # 观茶 Beta 产品当前状态
 
-更新日期：2026-08-30。本文记录 Phase 9-0 完成后的真实能力边界、运行方式和当前产品化状态；历史阶段文档仅作对照，不覆盖本文。
+更新日期：2026-08-30。本文记录 Phase 9-2 完成后的真实能力边界、运行方式和当前产品化状态；历史阶段文档仅作对照，不覆盖本文。
 
 ## 当前定位
 
-观茶已进入 Beta 产品化阶段。目标是形成真实可注册、可登录、数据按用户隔离、可跨设备恢复的 AI 茶叶购买决策与冲泡记录产品。认证服务确定为 Tencent CloudBase Authentication。当前计划：frontend 使用 `@cloudbase/js-sdk` v3（Phase 9-3），backend 使用 CloudBase HTTP Token Introspection（Phase 9-1）；当前仍尚未实现任何认证能力。
+观茶已进入 Beta 产品化阶段。目标是形成真实可注册、可登录、数据按用户隔离、可跨设备恢复的 AI 茶叶购买决策与冲泡记录产品。认证服务确定为 Tencent CloudBase Authentication。backend 已完成 Phase 9-1 token verification kernel 与 Phase 9-2 Selection ownership；frontend 的 `@cloudbase/js-sdk` v3 接入、注册登录界面仍属于 Phase 9-3，当前尚未实现注册、登录、登出界面。
 
 ## 已完成
 
@@ -22,27 +22,28 @@
 - PostgreSQL 数据持久化与当前 Repository / Application / Domain 分层。
 - Fake / OpenAI / MiMo Provider。
 - 当前 Vanilla JS SPA 中的 Tea Warehouse / Journal UI；目前是浏览器本地用户数据与演示初始状态，不是用户级云端持久化。
+- `OwnerContext` 以及以 `selection_sessions.user_id` 为根的 authenticated Selection ownership；匿名 `X-Client-Id` 路径继续兼容。
+- authenticated / anonymous Selection idempotency scope、派生资源 root-session authorization，以及 A/B IDOR 测试（数据库测试需 `TEST_DATABASE_URL`）。
 
 ## 尚未完成
 
-- authenticated user。
-- register/login/logout。
+- register/login/logout UI 与完整账户体验。
 - account recovery。
 - user-scoped warehouse persistence。
 - user-scoped journal persistence。
 - user preference cloud persistence。
-- authenticated selection-session ownership。
-- cross-device restore。
+- frontend auth state、Bearer 注入和 localStorage / IndexedDB account isolation。
+- authenticated Selection 的跨设备产品界面恢复与本地状态同步。
 
-当前尚无用户账户表、CloudBase token verifier、`/api/v1/me` 或用户级茶仓/Journal 数据表；不应将上述能力描述为已实现。
+当前已有 `app_users`、CloudBase token verifier、`/api/v1/me` 和 authenticated Selection ownership；这不代表注册登录 UI、用户级茶仓/Journal/偏好云端数据或 legacy anonymous history claim 已实现。
 
 ## 当前数据边界
 
-- 服务端当前的选茶链路由 anonymous client ownership 保护：`selection_session` 是根，候选、图片、提取、决策、追问、商家回复和复判通过直接字段或外键关系延续 ownership。
+- 服务端选茶链路以 `selection_session` 为根：authenticated session 使用 `user_id`，legacy anonymous session 使用 `anonymous_client_id`；候选、图片、提取、决策、追问、商家回复和复判均通过 root session 授权。
 - O1 / O2 偏好、茶仓、Journal 和部分 UI session 仍保存在浏览器 localStorage；IndexedDB 只缓存待上传图片 Blob，用于本地上传恢复。
 - `recent_preference_evidence` 会作为当前选茶会话快照提交到服务端，但还不是用户偏好档案。
 - Brew Feedback replay 当前按匿名 client 与 feedback id 做幂等保存，不等同于用户级 Journal 或 Brew Record。
-- 不存在 authenticated user，因此不存在可靠的账号级数据隔离和跨设备恢复。
+- authenticated Selection 已具备服务端账号级隔离和跨设备读取；浏览器本地 Warehouse / Journal / Preferences 仍未账号化，也没有跨设备本地状态同步。
 
 ## 运行方式
 
@@ -78,5 +79,5 @@ node --test frontend/tests/*.test.js
 - 临时图片存储为进程内实现；服务重启会影响尚未完成或仍可重试的 Job。
 - 当前 Selection Session 有过期策略；authenticated restore 的保留期尚未确定。
 - Tea Warehouse / Journal 当前含浏览器本地状态和演示 seed，尚未形成账号级云端数据边界。
-- 尚无注册登录、账号恢复、CloudBase verifier、用户级数据库表或真实 auth 测试；这些属于后续阶段，不是本轮完成项。
-- Phase 9-0 的详细实现前审计见 `docs/AUTH_MIGRATION_AUDIT.md`。
+- 尚无注册登录、账号恢复、前端 CloudBase SDK、Warehouse / Journal / Preferences 云端 CRUD，以及 legacy anonymous history claim/import；这些属于后续阶段。
+- Phase 9-0/9-2 的身份与 ownership 审计见 `docs/AUTH_MIGRATION_AUDIT.md`。
