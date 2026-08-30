@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, Header, HTTPException, Request, Response, UploadFile, status
 
+from guancha_api.auth.dependencies import CurrentUser
 from guancha_api.application.phase2_service import Phase2ExtractionService
 from guancha_api.application.decision_service import SessionDecisionService
 from guancha_api.application.question_service import QuestionGenerationService
@@ -34,6 +35,7 @@ from guancha_api.schemas.contracts import (
     ExtractionVersionResponse,
     PublicConfig,
     SelectionSession,
+    CurrentUserResponse,
     UploadCandidateImageResponse,
 )
 
@@ -121,6 +123,15 @@ async def admin_rule_version(_: Annotated[None, Depends(require_admin_token)]) -
 
 @router.get("/config/public", response_model=PublicConfig)
 async def get_public_config() -> PublicConfig: return PublicConfig()
+
+
+@router.get("/me", response_model=CurrentUserResponse, tags=["auth"])
+async def get_current_user_profile(current_user: CurrentUser) -> CurrentUserResponse:
+    return CurrentUserResponse(
+        id=current_user.id,
+        authenticated=True,
+        created_at=current_user.created_at,
+    )
 
 @router.post("/brew-feedback/analyze", response_model=BrewFeedbackAnalysisResponse)
 async def analyze_brew_feedback(

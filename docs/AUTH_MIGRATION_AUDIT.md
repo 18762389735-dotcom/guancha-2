@@ -146,10 +146,16 @@ Phase 9-1 只在当前 `backend/src/guancha_api/` 分层中建立认证 kernel�
 Production `TokenVerifier` 的当前技术决策：
 
 ```text
+region = ap-shanghai / ap-guangzhou:
 GET https://{CLOUDBASE_ENV_ID}.api.tcloudbasegateway.com/auth/v1/token/introspect
+
+region = ap-singapore:
+GET https://{CLOUDBASE_ENV_ID}.api.intl.tcloudbasegateway.com/auth/v1/token/introspect
 
 Authorization: Bearer <incoming access token>
 ```
+
+`CLOUDBASE_REGION` 默认使用 `ap-shanghai`，当前支持 `ap-shanghai`、`ap-guangzhou` 和 `ap-singapore`。未知 region 必须作为配置错误处理，不得猜测 endpoint。
 
 成功验证时：
 
@@ -205,12 +211,12 @@ Phase 9-1 实现时将只读参考：
 ```text
 app_users
   id                uuid primary key                 -- 内部稳定用户 id
-  cloudbase_uid     text not null unique              -- CloudBase 外部 subject
+  cloudbase_user_id text not null unique              -- CloudBase 外部 subject
   created_at        timestamptz not null
   updated_at        timestamptz not null
 ```
 
-`app_users` 只保存 CloudBase 外部身份映射和产品需要的非敏感元数据，不保存密码。首次通过服务端验证 token 看到一个新 `cloudbase_uid` 时，再由服务端幂等创建或取得 `app_users`，而不是接收前端传入的内部 user id。
+`app_users` 只保存 CloudBase 外部身份映射和产品需要的非敏感元数据，不保存密码。首次通过服务端验证 token 看到一个新 `cloudbase_user_id` 时，再由服务端幂等创建或取得 `app_users`，而不是接收前端传入的内部 user id。
 
 Phase 9-1 不新增 `selection_sessions.user_id`，不修改现有 Selection Session ownership。
 

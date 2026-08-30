@@ -15,6 +15,7 @@ import psycopg
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
+from guancha_api.auth.models import AppUser
 from guancha_api.schemas.contracts import (
     CandidateImageStatus,
     EvidenceItem,
@@ -168,6 +169,34 @@ class PostgresPhase2Repository:
                 (client_id,),
             )
         await self._connection.commit()
+
+    async def resolve_or_create_app_user(self, cloudbase_user_id: str) -> AppUser:
+        """Map a verified CloudBase subject to one stable internal user id."""
+        normalized_subject = cloudbase_user_id.strip()
+        if not normalized_subject:
+            raise ValueError("cloudbase_user_id must not be empty")
+        app_user_id = uuid4()
+        async with self._connection.transaction():
+            async with self._connection.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    insert into app_users (id, cloudbase_user_id)
+                    values (%s, %s)
+                    on conflict (cloudbase_user_id) do update
+                      set updated_at = app_users.updated_at
+                    returning id, cloudbase_user_id, created_at, updated_at
+                    """,
+                    (app_user_id, normalized_subject),
+                )
+                row = await cursor.fetchone()
+        if row is None:
+            raise RepositoryError("App user could not be resolved")
+        return AppUser(
+            id=row["id"],
+            cloudbase_user_id=row["cloudbase_user_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
 
     async def get_brew_feedback_replay(self, *, client_id: UUID, client_feedback_id: UUID, idempotency_key: UUID) -> dict[str, object] | None:
         async with self._connection.cursor() as cursor:

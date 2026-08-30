@@ -11,6 +11,12 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from guancha_api.auth.cloudbase import CloudBaseTokenVerifier
+from guancha_api.auth.fake import (
+    ConfigurationErrorTokenVerifier,
+    UnconfiguredTokenVerifier,
+)
+from guancha_api.auth.interfaces import TokenVerifier
 from guancha_api.api.v1.routes import router as v1_router
 from guancha_api.application.task_runners import InProcessTaskRunner
 from guancha_api.application.task_runners import TaskEnqueueError
@@ -100,6 +106,20 @@ def _provider_from_environment(storage: InMemoryTemporaryPrivateStorage) -> Stru
         )
     raise RuntimeError("GUANCHA_PROVIDER must be fake, openai, or mimo")
 
+
+def _token_verifier_from_environment() -> TokenVerifier:
+    env_id = os.getenv("CLOUDBASE_ENV_ID", "").strip()
+    if not env_id:
+        return UnconfiguredTokenVerifier()
+    try:
+        return CloudBaseTokenVerifier(
+            env_id=env_id,
+            region=os.getenv("CLOUDBASE_REGION", "ap-shanghai"),
+        )
+    except ValueError:
+        # Keep anonymous startup available while making /me fail closed.
+        return ConfigurationErrorTokenVerifier()
+
 def create_app(
     *,
     repository: PostgresPhase2Repository | None = None,
@@ -111,6 +131,7 @@ def create_app(
     merchant_reply_provider: MerchantReplyReasoningProvider | None = None,
     feedback_provider: FeedbackReasoningProvider | None = None,
     product_event_sink: ProductEventSink | None = None,
+    token_verifier: TokenVerifier | None = None,
 ) -> FastAPI:
     """Build an injectable API application; tests never need external services."""
     resolved_task_runner = task_runner or InProcessTaskRunner()
@@ -120,6 +141,7 @@ def create_app(
     resolved_merchant_reply_provider = merchant_reply_provider or FakeMerchantReplyReasoningProvider()
     resolved_feedback_provider = feedback_provider or FakeFeedbackProvider()
     resolved_product_event_sink = product_event_sink or ProductEventSink.from_environment()
+    resolved_token_verifier = token_verifier or _token_verifier_from_environment()
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -138,6 +160,7 @@ def create_app(
         application.state.merchant_reply_provider = resolved_merchant_reply_provider
         application.state.feedback_provider = resolved_feedback_provider
         application.state.product_event_sink = resolved_product_event_sink
+        application.state.token_verifier = resolved_token_verifier
         if application.state.repository is not None:
             await application.state.repository.recover_interrupted_jobs()
         try:
@@ -159,6 +182,7 @@ def create_app(
     application.state.merchant_reply_provider = resolved_merchant_reply_provider
     application.state.feedback_provider = resolved_feedback_provider
     application.state.product_event_sink = resolved_product_event_sink
+    application.state.token_verifier = resolved_token_verifier
     application.state.feedback_replays = {}
     application.state.feedback_client_ids = {}
     application.include_router(v1_router)
@@ -263,6 +287,14 @@ def _register_exception_handlers(application: FastAPI) -> None:
             return error_response(status_code=503, code=detail, message="Brew feedback analysis is temporarily unavailable.", retryable=True)
         if detail == "feedback_duplicate":
             return error_response(status_code=409, code=detail, message="Feedback idempotency key belongs to a different request.")
+        if detail == "authentication_required":
+            return error_response(status_code=401, code=detail, message="Authentication is required.")
+        if detail == "invalid_access_token":
+            return error_response(status_code=401, code=detail, message="Access token is invalid.")
+        if detail == "auth_not_configured":
+            return error_response(status_code=503, code=detail, message="Authentication is not configured.")
+        if detail == "authentication_service_unavailable":
+            return error_response(status_code=503, code=detail, message="Authentication service is unavailable.", retryable=True)
         if exc.status_code == 404:
             return error_response(status_code=404, code="not_found", message="Resource not found.")
         if exc.status_code == 405:

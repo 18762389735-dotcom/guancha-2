@@ -36,6 +36,7 @@ def test_openapi_contains_frozen_phase2_contract_paths() -> None:
     assert set(response.json()["paths"]) == {
         "/health",
         "/api/v1/config/public",
+        "/api/v1/me",
         "/api/v1/events",
         "/api/v1/admin/jobs",
         "/api/v1/admin/ai-calls",

@@ -177,6 +177,10 @@ class ErrorCode(StrEnum):
     INSUFFICIENT_FEEDBACK = "insufficient_feedback"
     FEEDBACK_ANALYSIS_FAILED = "feedback_analysis_failed"
     FEEDBACK_DUPLICATE = "feedback_duplicate"
+    AUTHENTICATION_REQUIRED = "authentication_required"
+    INVALID_ACCESS_TOKEN = "invalid_access_token"
+    AUTHENTICATION_SERVICE_UNAVAILABLE = "authentication_service_unavailable"
+    AUTH_NOT_CONFIGURED = "auth_not_configured"
     CONTRACT_NOT_IMPLEMENTED = "contract_not_implemented"
     INTERNAL_ERROR = "internal_error"
 
@@ -198,6 +202,12 @@ class PublicConfig(ContractModel):
         initial=1, after_initial=2, background=5
     )
     max_concurrent_candidate_extractions: int = Field(3, ge=1)
+
+
+class CurrentUserResponse(ContractModel):
+    id: UUID
+    authenticated: bool = True
+    created_at: datetime
 
 
 class SelectionNeedInput(ContractModel):
