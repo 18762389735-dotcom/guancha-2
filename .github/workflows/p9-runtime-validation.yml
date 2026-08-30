@@ -1,0 +1,132 @@
+name: P9 Runtime Validation
+
+on:
+  push:
+    branches:
+      - codex/p9-runtime-validation
+
+permissions:
+  contents: read
+
+jobs:
+  p9-user-ownership:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: guancha_test
+          POSTGRES_USER: guancha
+          POSTGRES_PASSWORD: guancha
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U guancha -d guancha_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgresql://guancha:guancha@localhost:5432/guancha_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install backend test dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e "./backend[dev]"
+      - name: Run P9-2 ownership validation
+        shell: bash
+        run: set -o pipefail; python -m pytest backend/tests/test_phase9_user_ownership.py -q -vv | tee p9-user-ownership.txt
+      - name: Upload P9 ownership evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p9-runtime-validation-evidence-p9-user-ownership
+          path: p9-user-ownership.txt
+          if-no-files-found: warn
+
+  postgres-regression:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: guancha_test
+          POSTGRES_USER: guancha
+          POSTGRES_PASSWORD: guancha
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U guancha -d guancha_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgresql://guancha:guancha@localhost:5432/guancha_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install backend test dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e "./backend[dev]"
+      - name: Run PostgreSQL Selection regression tests
+        shell: bash
+        run: >-
+          set -o pipefail;
+          python -m pytest
+          backend/tests/test_postgres_repository.py
+          backend/tests/test_auth_kernel.py
+          backend/tests/test_phase2_session_candidate_api.py
+          backend/tests/test_phase2_image_job_api.py
+          backend/tests/test_phase3_multi_candidate_multi_image.py
+          backend/tests/test_phase4_decision_api.py
+          backend/tests/test_phase5_followup_questions.py
+          backend/tests/test_phase6_merchant_rejudgement.py
+          backend/tests/test_phase7_brew_feedback.py
+          backend/tests/test_phase8_demo_postgres.py
+          backend/tests/test_competition_acceptance_flow.py
+          -q -vv | tee postgres-regression.txt
+      - name: Upload PostgreSQL regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p9-runtime-validation-evidence-postgres-regression
+          path: postgres-regression.txt
+          if-no-files-found: warn
+
+  full-backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: guancha_test
+          POSTGRES_USER: guancha
+          POSTGRES_PASSWORD: guancha
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U guancha -d guancha_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgresql://guancha:guancha@localhost:5432/guancha_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install backend test dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e "./backend[dev]"
+      - name: Run full backend suite
+        shell: bash
+        run: set -o pipefail; python -m pytest backend/tests -q | tee full-backend.txt
+      - name: Upload full backend evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p9-runtime-validation-evidence-full-backend
+          path: full-backend.txt
+          if-no-files-found: warn
