@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Annotated
 from uuid import UUID, uuid4
 
@@ -33,6 +34,7 @@ from guancha_api.schemas.contracts import (
     DecisionDelta,
     MerchantReply,
     ExtractionVersionResponse,
+    PublicAuthConfig,
     PublicConfig,
     SelectionSession,
     CurrentUserResponse,
@@ -121,8 +123,26 @@ async def admin_ai_calls(raw: Request, _: Annotated[None, Depends(require_admin_
 async def admin_rule_version(_: Annotated[None, Depends(require_admin_token)]) -> dict[str, str]:
     return {"rule_version": "tieguanyin-rules-v1"}
 
+def _public_auth_config() -> PublicAuthConfig:
+    """Expose only the browser-safe CloudBase initialization values."""
+    required = os.getenv("GUANCHA_AUTH_REQUIRED", "false").strip().lower() in {"1", "true", "yes", "on"}
+    env_id = os.getenv("CLOUDBASE_ENV_ID", "").strip() or None
+    region = os.getenv("CLOUDBASE_REGION", "ap-shanghai").strip().lower() or "ap-shanghai"
+    publishable_key = os.getenv("CLOUDBASE_PUBLISHABLE_KEY", "").strip() or None
+    valid_region = bool(re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+){1,4}", region))
+    return PublicAuthConfig(
+        required=required,
+        configured=bool(env_id and publishable_key and valid_region),
+        provider="cloudbase",
+        env_id=env_id,
+        region=region,
+        publishable_key=publishable_key,
+    )
+
+
 @router.get("/config/public", response_model=PublicConfig)
-async def get_public_config() -> PublicConfig: return PublicConfig()
+async def get_public_config() -> PublicConfig:
+    return PublicConfig(auth=_public_auth_config())
 
 
 @router.get("/me", response_model=CurrentUserResponse, tags=["auth"])

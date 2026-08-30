@@ -21,10 +21,15 @@ const ART = {
   bag: 'art-bag-clean.png',
 };
 const configuredApiBaseUrl = window.GUANCHA_API_BASE_URL || window.API_BASE_URL || (/^https?:$/.test(window.location?.protocol || '') ? window.location.origin : '');
-const apiClient = GuanchaApi.createApiClient({
+let apiClient = GuanchaApi.createApiClient({
   baseUrl: configuredApiBaseUrl,
   clientId: GuanchaApi.getOrCreateClientId(),
 });
+let authClient = null;
+let authConfig = { required: false, configured: false };
+let authBootState = { status: 'loading', errorCode: null };
+let appReady = false;
+let logoutPending = false;
 const productAnalytics = GuanchaProductAnalytics.create({ endpoint: `${configuredApiBaseUrl || ''}/api/v1/events` });
 productAnalytics.track('app_open', { metadata: { screen: 'home' } });
 const runtimeImages = new Map();
@@ -70,6 +75,22 @@ const defaultState = {
     { id: 'demo-0804', date: '2026-08-04', teaId: 'spring', infusions: [{ number: 1, suggested: 10, actual: 11 }, { number: 2, suggested: 12, actual: 12 }], plan: { ware: '盖碗', water: '110 ml', grams: '5 g', temp: '95℃' }, feedback: { taste: '喜欢', strength: '刚好', tags: ['清爽', '花香'], aroma: ['兰花', '茉莉花'], impression: '滋味顺口，花香清晰。', score: 4, repurchase: '想回购' }, suggestion: '暂时保持本次参数', createdAt: '14:20' },
   ],
 };
+
+function freshAuthenticatedState() {
+  const fresh = structuredClone(defaultState);
+  fresh.o1 = { tea: [], coffee: [], milk: [], juice: [] };
+  fresh.o2 = { sweetness: 50, flavors: [] };
+  fresh.need = { taste: '', purpose: '', budget: '' };
+  fresh.candidates = [];
+  fresh.history = [];
+  fresh.warehouse = [];
+  fresh.journalRecords = [];
+  fresh.selectedTeaId = null;
+  fresh.brew = null;
+  fresh.activeSelectionFlow = false;
+  fresh.preferenceFlow = null;
+  return fresh;
+}
 
 function storedObject(key) {
   try {
@@ -177,7 +198,7 @@ async function restorePendingImages() {
     const file = await pendingImageStore.load(image.id);
     if (file instanceof Blob) runtimeImages.set(image.id, { file, url: URL.createObjectURL(file) });
   }));
-  render();
+  if (appReady) render();
 }
 const pendingImageRestore = restorePendingImages();
 function publicLimits() { return GuanchaPublicConfig.get(); }
@@ -728,6 +749,10 @@ function syncActiveCandidate(anchor = state.activeCandidateId) {
 }
 
 function render() {
+  if (!appReady) {
+    renderAuthGate();
+    return;
+  }
   // Most interactions re-render the current screen so that selected states
   // are reflected immediately. Keep the scroll position of that same screen;
   // navigation still starts at the top because the screen name changes.
@@ -791,6 +816,44 @@ function render() {
   bindResultSwipe();
   if (state.overlay === 'camera') requestAnimationFrame(startCamera);
   syncBrewTimer();
+}
+
+function authMessage() {
+  const code = authBootState.errorCode;
+  if (code === 'auth_not_configured') return ['登录服务暂未配置', '请联系管理员完成登录服务配置后再试。'];
+  if (code === 'authentication_service_unavailable') return ['登录服务暂不可用', '请稍后重试，当前不会进入匿名选茶。'];
+  if (code === 'database_not_configured' || code === 'service_unavailable') return ['后端服务暂不可用', '请稍后重试。'];
+  return ['登录暂时不可用', '请稍后重试。'];
+}
+function renderAuthGate() {
+  const authState = authClient ? authClient.getState() : authBootState;
+  if (logoutPending) {
+    app.innerHTML = '<section class="page auth-page"><article class="auth-card card"><h1>退出登录暂时不可用</h1><p>本地账号状态已清理。请重试退出，期间不会恢复上一账号界面。</p><button class="primary-btn" data-action="retry-auth">重试退出</button></article></section>';
+    return;
+  }
+  if (authBootState.status === 'error') {
+    const [title, copy] = authMessage();
+    app.innerHTML = `<section class="page auth-page"><article class="auth-card card"><h1>${title}</h1><p>${copy}</p><button class="primary-btn" data-action="retry-auth">重试</button></article></section>`;
+    return;
+  }
+  if (authState.status === 'loading') {
+    app.innerHTML = '<section class="page auth-page"><article class="auth-card card"><h1>正在准备登录</h1><p>正在恢复你的登录状态。</p></article></section>';
+    return;
+  }
+  if (authState.status === 'error') {
+    const [title, copy] = authMessage();
+    app.innerHTML = `<section class="page auth-page"><article class="auth-card card"><h1>${title}</h1><p>${copy}</p><button class="primary-btn" data-action="retry-auth">重试</button></article></section>`;
+    return;
+  }
+  if (state?.authView === 'register') {
+    app.innerHTML = '<section class="page auth-page"><article class="auth-card card"><h1>创建账号</h1><p>注册后可在不同设备继续使用选茶记录。</p><form data-action="auth-signup"><label>邮箱<input name="email" type="email" autocomplete="email" required /></label><label>密码<input name="password" type="password" autocomplete="new-password" required /></label><label>确认密码<input name="confirm-password" type="password" autocomplete="new-password" required /></label><button class="primary-btn" type="submit">注册</button></form><button class="text-link" data-action="show-login">已有账号？去登录</button></article></section>';
+    return;
+  }
+  if (state?.authView === 'verify') {
+    app.innerHTML = '<section class="page auth-page"><article class="auth-card card"><h1>验证邮箱</h1><p>请输入邮件中的验证码。</p><form data-action="auth-verify"><label>验证码<input name="code" inputmode="numeric" autocomplete="one-time-code" required /></label><button class="primary-btn" type="submit">完成验证</button></form><button class="text-link" data-action="show-login">返回登录</button></article></section>';
+    return;
+  }
+  app.innerHTML = '<section class="page auth-page"><article class="auth-card card"><h1>登录观茶</h1><p>登录后，你的选茶数据会按账号隔离。</p><form data-action="auth-login"><label>邮箱<input name="email" type="email" autocomplete="email" required /></label><label>密码<input name="password" type="password" autocomplete="current-password" required /></label><button class="primary-btn" type="submit">登录</button></form><button class="text-link" data-action="show-register">创建账号</button></article></section>';
 }
 
 function cleanRenderedArts() {
@@ -1167,7 +1230,7 @@ function renderRecordDetail() { const record=state.journalRecords.find(item=>ite
   ${detailSection('整次冲泡信息',`${record.plan.ware} · ${record.plan.water} · 投茶 ${record.plan.grams} · ${record.plan.temp}`)}${detailSection('泡次记录',record.infusions.map(item=>`第 ${item.number} 泡：建议 ${item.suggested} 秒，实际 ${item.actual} 秒`).join('<br>'))}${detailSection('基础反馈',`合口味程度：${f.taste||'未填写'}<br>本次浓淡：${f.strength||'未填写'}<br>感受：${f.tags?.length?f.tags.join('、'):'未填写'}`)}${detailSection('进阶记录',`香气：${f.aroma?.length?f.aroma.join('、'):'未填写'}<br>${Object.entries(f.advanced||{}).map(([k,v])=>`${k}：${v}`).join('<br>')||'未填写'}`)}${detailSection('个人记录',`印象：${f.impression||'未填写'}<br>评分：${f.score ? `${f.score}/5` : '未评分'} · 回购：${f.repurchase||'未填写'}`)}${detailSection('反馈影响',record.suggestion||'暂时保持本次参数')}<button class="danger-link" data-action="delete-record">删除这次泡茶记录</button></section>`; }
 function detailSection(title, body) { return `<section class="detail-list card"><h3>${title}</h3><p>${body}</p></section>`; }
 
-function renderSettings() { return `<section class="page settings-page">${greeting()}${titleWithSub('标题_设置.svg','设置','把你的偏好和本地演示数据放在这里。')}<section class="settings-list card"><button data-action="open-preferences"><span>${icon('leaf',23)} 初始口味偏好</span>${icon('right',20)}</button><button data-action="show-evidence"><span>${icon('book',23)} 近期饮用证据</span>${icon('right',20)}</button><button data-action="reset-demo"><span>${icon('jar',23)} 清除本地演示数据</span>${icon('right',20)}</button></section>${tabbar()}</section>`; }
+function renderSettings() { const signedIn = authClient?.getState().status === 'authenticated'; return `<section class="page settings-page">${greeting()}${titleWithSub('标题_设置.svg','设置','把你的偏好和本地演示数据放在这里。')}<section class="settings-list card"><button data-action="open-preferences"><span>${icon('leaf',23)} 初始口味偏好</span>${icon('right',20)}</button><button data-action="show-evidence"><span>${icon('book',23)} 近期饮用证据</span>${icon('right',20)}</button><button data-action="reset-demo"><span>${icon('jar',23)} 清除本地演示数据</span>${icon('right',20)}</button>${signedIn ? '<button data-action="logout"><span>退出登录</span><span>›</span></button>' : ''}</section>${tabbar()}</section>`; }
 
 function renderOverlay() {
   if (state.overlay === 'source') return `<div class="overlay" data-action="close-overlay"><section class="sheet"><div class="sheet-handle"></div>${wordmark('add-candidate.svg', 'wordmark--source-add', '添加候选')}<button class="source-choice" data-action="choose-camera"><span>${icon('camera')}</span><b>拍照</b><span>›</span></button><button class="source-choice" data-action="choose-album"><span>${icon('photo')}</span><b>从相册上传商品截图</b><span>›</span></button><button class="sheet-close" style="display:block;margin:28px auto 0" data-action="close-overlay" aria-label="关闭">${icon('close')}</button></section></div>`;
@@ -1355,6 +1418,10 @@ function setScreen(screen) { stopCamera(); state.screen = screen; state.overlay 
 document.addEventListener('click', event => {
   const target = event.target.closest('[data-action]'); if (!target) return;
   const action = target.dataset.action;
+  if (action === 'retry-auth') return logoutPending ? logoutCurrentAccount() : bootAuth();
+  if (action === 'show-register') { state.authView = 'register'; return render(); }
+  if (action === 'show-login') { state.authView = 'login'; return render(); }
+  if (action === 'logout') return logoutCurrentAccount();
   if (action === 'go-home') { if (state.activeSelectionFlow) productAnalytics.track('flow_abandoned', { stage: state.screen, metadata: { screen: state.screen } }); return setScreen('home'); }
   if (action === 'start-task') return routeAfterHomeStart();
   if (action === 'open-preferences') { state.preferenceFlow = 'edit'; return setScreen('o1'); }
@@ -1461,12 +1528,29 @@ document.addEventListener('click', event => {
   if (action === 'open-latest-record') { state.activeRecordId=state.journalRecords.at(-1)?.id; return setScreen('record-detail'); }
   if (action === 'delete-record') { if (!window.confirm('确定删除这次泡茶记录吗？')) return; const recordId=state.activeRecordId; state.journalRecords=state.journalRecords.filter(item=>item.id!==recordId); GuanchaStores.preferenceEvidence.save({items:readPreferenceEvidence().filter(item=>item.source_brew_session_id!==recordId)}); saveState(); return setScreen('journal-day'); }
   if (action === 'show-evidence') return showToast('近期饮用证据：清爽花香、兰花与茉莉花偏好。');
-  if (action === 'reset-demo') { if (!window.confirm('清除本地演示数据并恢复初始状态？')) return; runtimeImages.forEach(item=>URL.revokeObjectURL(item.url)); runtimeImages.clear(); GuanchaStores.clearAll(); state=structuredClone(defaultState); return setScreen('home'); }
+  if (action === 'reset-demo') { if (!window.confirm('清除本地演示数据并恢复初始状态？')) return; stopRuntimeBusinessState(); GuanchaStores.clearAll(); state=authConfig.required ? freshAuthenticatedState() : structuredClone(defaultState); return setScreen('home'); }
   if (action === 'open-history') return showToast('选茶记录详情将在后续版本补齐');
 });
 document.addEventListener('submit', event => {
   const form = event.target.closest('form[data-action]'); if (!form) return;
   event.preventDefault(); const data = new FormData(form);
+  if (form.dataset.action === 'auth-login') {
+    const email = String(data.get('email') || '').trim(); const password = String(data.get('password') || '');
+    if (!/^\S+@\S+\.\S+$/.test(email) || !password) return showToast('请输入有效邮箱和密码');
+    return authClient.signIn(email, password).then(completeAuthLogin).catch(() => showToast('邮箱或密码不正确，请重试。'));
+  }
+  if (form.dataset.action === 'auth-signup') {
+    const email = String(data.get('email') || '').trim(); const password = String(data.get('password') || ''); const confirmation = String(data.get('confirm-password') || '');
+    if (!/^\S+@\S+\.\S+$/.test(email)) return showToast('请输入有效邮箱');
+    if (!/^(?=.*[A-Za-z])(?=.*\d).{8,32}$/.test(password)) return showToast('密码需为 8–32 位，并包含字母和数字');
+    if (password !== confirmation) return showToast('两次输入的密码不一致');
+    return authClient.startSignUp(email, password).then(() => { state.authView = 'verify'; render(); }).catch(() => showToast('注册暂时不可用，请稍后重试。'));
+  }
+  if (form.dataset.action === 'auth-verify') {
+    const code = String(data.get('code') || '').trim();
+    if (!code) return showToast('请输入验证码');
+    return authClient.verifySignUp(code).then(completeAuthLogin).catch(() => showToast('验证码无效或已过期，请重试。'));
+  }
   if (form.dataset.action === 'submit-merchant-reply') { const reply=String(data.get('merchant-reply') || '').trim(); if (reply) { productAnalytics.track('merchant_reply_started', { candidate_id: currentCandidate()?.serverCandidateId, decision_version_id: state.decisionVersionId || undefined, metadata: { screen: state.screen } }); submitMerchantReply(reply); } return; }
   if (form.dataset.action === 'save-needs') {
     const nextNeed = { taste:data.get('taste').trim()||'清爽花香', purpose:data.get('purpose').trim()||'送礼', budget:data.get('budget').trim()||'150–300 元' };
@@ -1559,14 +1643,126 @@ function bindResultSwipe() {
   });
 }
 function loadPublicConfig() {
-  if (!apiClient.isConfigured) return;
-  apiClient.getPublicConfig().then((config) => {
-    GuanchaPublicConfig.apply(config);
-    state = normalizeState(state);
+  if (!apiClient.isConfigured) return Promise.resolve(GuanchaPublicConfig.get());
+  return apiClient.getPublicConfig().then((config) => GuanchaPublicConfig.apply(config))
+    .catch(() => GuanchaPublicConfig.get());
+}
+
+function stopRuntimeBusinessState() {
+  stopBrewTimer();
+  stopCamera();
+  GuanchaJobPoller.cancelAll?.();
+  runtimeImages.forEach(item => URL.revokeObjectURL(item.url));
+  runtimeImages.clear();
+  pendingImageCandidateId = null;
+}
+function authErrorCode(error) {
+  if (error?.code === 'authentication_service_unavailable') return 'authentication_service_unavailable';
+  if (error?.code === 'service_unavailable' || error?.code === 'database_not_configured') return 'database_not_configured';
+  if (error?.code === 'invalid_access_token' || error?.code === 'authentication_required') return 'invalid_session';
+  return 'authentication_service_unavailable';
+}
+function rebuildApiClient() {
+  apiClient = GuanchaApi.createApiClient({
+    baseUrl: configuredApiBaseUrl,
+    clientId: GuanchaApi.getOrCreateClientId(),
+    authRequired: authConfig.required === true,
+    getAccessToken: authClient ? () => authClient.getAccessToken() : null,
+  });
+}
+function hasAccountLocalState() {
+  return [GuanchaStores.uiSession.key, GuanchaStores.selectionBridge.key, GuanchaStores.localPostPurchase.key, GuanchaStores.preferenceEvidence.key]
+    .some(key => Boolean(localStorage.getItem(key)));
+}
+async function enterAuthenticatedProduct() {
+  authBootState = { status: 'loading', errorCode: null };
+  try {
+    const currentUser = await apiClient.getMe();
+    const hadLocalState = hasAccountLocalState();
+    const changed = await GuanchaAuth.establishAccountBoundary({ userId: currentUser.id, stores: GuanchaStores });
+    if (changed || !hadLocalState) {
+      stopRuntimeBusinessState();
+      state = freshAuthenticatedState();
+    }
+    state.authView = null;
+    authBootState = { status: 'authenticated', errorCode: null };
+    appReady = true;
     render();
     resumeLiveBackendState();
-  }).catch(() => { /* 静态演示与网络失败均使用已批准的本地默认配置。 */ });
+  } catch (error) {
+    stopRuntimeBusinessState();
+    appReady = false;
+    state.authView = 'login';
+    if (authErrorCode(error) === 'invalid_session') {
+      try {
+        await authClient.signOut();
+        authBootState = { status: 'unauthenticated', errorCode: null };
+      } catch {
+        logoutPending = true;
+        authBootState = { status: 'error', errorCode: 'authentication_service_unavailable' };
+      }
+    } else {
+      authBootState = { status: 'error', errorCode: authErrorCode(error) };
+    }
+    render();
+  }
+}
+function enterAnonymousProduct() {
+  appReady = true;
+  render();
+  resumeLiveBackendState();
+}
+function subscribeToAuthLifecycle() {
+  authClient.subscribe((next) => {
+    if (next.status === 'unauthenticated' && authConfig.required && appReady) {
+      stopRuntimeBusinessState();
+      appReady = false;
+      state = freshAuthenticatedState();
+      state.authView = 'login';
+      render();
+    }
+  });
+}
+async function bootAuth() {
+  appReady = false;
+  authBootState = { status: 'loading', errorCode: null };
+  render();
+  const publicConfig = await loadPublicConfig();
+  authConfig = publicConfig.auth || { required: false, configured: false };
+  authClient?.destroy();
+  authClient = GuanchaAuth.createAuthClient(authConfig);
+  rebuildApiClient();
+  const restored = await authClient.initialize();
+  authBootState = restored;
+  subscribeToAuthLifecycle();
+  if (authConfig.required) {
+    if (restored.status === 'authenticated') return enterAuthenticatedProduct();
+    state.authView = 'login';
+    return render();
+  }
+  if (restored.status === 'authenticated') return enterAuthenticatedProduct();
+  return enterAnonymousProduct();
+}
+async function completeAuthLogin() {
+  appReady = false;
+  await enterAuthenticatedProduct();
+}
+async function logoutCurrentAccount() {
+  stopRuntimeBusinessState();
+  appReady = false;
+  state = freshAuthenticatedState();
+  state.authView = 'login';
+  logoutPending = true;
+  await GuanchaAuth.clearAccountBoundary({ stores: GuanchaStores });
+  try {
+    await authClient.signOut();
+    logoutPending = false;
+    render();
+  } catch (error) {
+    authBootState = { status: 'error', errorCode: 'authentication_service_unavailable' };
+    render();
+  }
 }
 
 render();
-loadPublicConfig();
+bootAuth();

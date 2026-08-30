@@ -140,3 +140,13 @@ test('job poller keeps a transport failure separate from a server Job failure', 
   assert.equal(transportErrors, 1);
   assert.equal(received.status, 'completed');
 });
+
+test('job poller can cancel every active business poller for logout and account switches', () => {
+  const { window } = browser();
+  window.GuanchaPublicConfig = { get: () => ({ pollInitialWindowMs: 1000, pollInitialMs: 1000, pollAfterInitialMs: 1000, pollBackgroundMs: 1000 }) };
+  load(window, path.join(root, 'job-poller.js'));
+  window.GuanchaJobPoller.start({ jobId: 'job-a', resourceId: 'resource-a', versionId: 'v1', fetchStatus: async () => ({ status: 'processing' }), getCurrentVersion: () => 'v1', onUpdate: () => {} });
+  assert.equal(window.GuanchaJobPoller.activeCount(), 1);
+  window.GuanchaJobPoller.cancelAll();
+  assert.equal(window.GuanchaJobPoller.activeCount(), 0);
+});

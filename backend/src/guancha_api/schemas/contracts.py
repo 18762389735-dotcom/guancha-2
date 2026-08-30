@@ -191,6 +191,15 @@ class PollIntervalsSeconds(ContractModel):
     background: int = Field(ge=1)
 
 
+class PublicAuthConfig(ContractModel):
+    required: bool = False
+    configured: bool = False
+    provider: str = "cloudbase"
+    env_id: str | None = None
+    region: str = "ap-shanghai"
+    publishable_key: str | None = None
+
+
 class PublicConfig(ContractModel):
     candidate_limit: int = Field(5, ge=1, le=5, description="Product absolute maximum")
     candidate_image_limit: int = Field(2, ge=1, le=2, description="Product absolute maximum")
@@ -202,6 +211,7 @@ class PublicConfig(ContractModel):
         initial=1, after_initial=2, background=5
     )
     max_concurrent_candidate_extractions: int = Field(3, ge=1)
+    auth: PublicAuthConfig = PublicAuthConfig()
 
 
 class CurrentUserResponse(ContractModel):

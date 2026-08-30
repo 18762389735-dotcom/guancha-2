@@ -1,16 +1,16 @@
-# Phase 9-0 / 9-2 — Auth and Selection Ownership Audit
+# Phase 9-0 / 9-3 — Auth and Selection Ownership Audit
 
-审计日期：2026-08-30  
+审计日期：2026-08-31  
 审计范围：当前 Vanilla JS SPA、FastAPI、Application / Domain / Repository、PostgreSQL migrations、浏览器存储和现有测试边界。  
-本文件先记录 Phase 9-0 的实现前事实，再记录 Phase 9-1/9-2 已落地的最小认证与 Selection ownership 边界。本轮没有接入真实 CloudBase、没有使用真实 token 或生产数据库；Phase 9-2 新增的 PostgreSQL migration 和服务端 ownership 代码均保持在当前 Selection 链路内。
+本文件先记录 Phase 9-0 的实现前事实，再记录 Phase 9-1/9-2 的认证与 Selection ownership 边界以及 Phase 9-3 的前端认证边界。本轮没有接入真实 CloudBase、没有使用真实 token 或生产数据库；Phase 9-3 使用 Fake SDK 测试，真实 CloudBase console/runtime smoke 仍待单独审查。
 
 ## 结论摘要
 
-当前前端仍只生成并发送匿名 `X-Client-Id`，但后端已增加 authenticated owner 分支：Selection 请求由 `OwnerContext` 表示，Authorization 存在时必须通过 CloudBase-compatible `TokenVerifier`，再由 `app_users.id` 作为内部 owner；只有 Authorization 完全缺失时才解析 `X-Client-Id`。匿名 header 仍是客户端可控制的凭证，不能当作 authenticated identity。
+当前前端已通过 `frontend/auth-client.js` 封装 CloudBase Web SDK v3.8.2，使用 SDK 维护 session，临时读取 access token 并只为 owner-scoped Selection 请求注入 Bearer。后端以 `OwnerContext` 表示 authenticated / anonymous owner：Authorization 存在时必须通过 CloudBase-compatible `TokenVerifier`，再由 `app_users.id` 作为内部 owner；只有 Authorization 完全缺失时才解析 `X-Client-Id`。匿名 header 仍是客户端可控制的凭证，不能当作 authenticated identity。
 
 当前选择链路的 ownership 以 `selection_sessions` 为根：认证 session 使用 `user_id`，legacy anonymous session 使用 `anonymous_client_id`；候选、图片、提取、任务、Evidence、决策、追问、商家回复和复判通过 FK 解析回该 root。Tea Warehouse、Journal、O1 / O2 等用户长期状态仍主要在浏览器 localStorage，不能当作账号级云端持久化。
 
-下一阶段应采用“认证用户 owner 优先、匿名 owner 兼容”的双轨过渡。第一步只做 additive migration 和最小认证边界，不删除 `anonymous_clients`，也不自动把任意匿名数据认领到新账号。
+前端保持“认证用户 owner 优先、匿名 owner 兼容”的双轨过渡：required-auth 模式 token 缺失、token supplier 失败或 `/me` 不可用时不会退回匿名 Selection。既有 `anonymous_clients` 保留，且不自动把任意匿名数据认领到新账号。
 
 ## 1. Anonymous identity：创建、保存、注入和校验
 
@@ -20,8 +20,8 @@
 | --- | --- | --- | --- |
 | 生成与读取 | `frontend/api-client.js` | `getOrCreateClientId()` | 读取 `localStorage`；已有合法 UUID v4 则复用，否则通过 `createIdempotencyKey()` 生成并写回。 |
 | localStorage key | `frontend/api-client.js` | `getOrCreateClientId()` | key 为 `guancha.anonymous-client-id.v1`。 |
-| API client 创建 | `app.js` | 初始化 `createApiClient({ clientId: GuanchaApi.getOrCreateClientId(), ... })` | 应用启动时取得一次 client id，交给 API client。 |
-| 请求注入 | `frontend/api-client.js` | `createApiClient()` 内的 `request()` | 业务请求注入 `X-Client-Id`；同时可注入 `X-Analytics-Session-Id`，后者只是分析会话标识。当前没有 Authorization 注入。 |
+| API client 创建 | `app.js` | `bootAuth()` / `rebuildApiClient()` | 先读取 public config、恢复 SDK session，再用 async token supplier 创建 API client。匿名兼容时仍取得 client id。 |
+| 请求注入 | `frontend/api-client.js` | `createApiClient()` 内的 `ownerHeaders()` | owner-scoped Selection 请求有 token 时只注入 `Authorization: Bearer ...`，不以 `X-Client-Id` 授权；required-auth 模式无 token 或 token supplier 失败时本地拒绝。Brew Feedback、events 和 public config 不自动附带 Bearer。 |
 | 前端接口入口 | `frontend/api-client.js`、`frontend/adapters.js`、`app.js` | API adapter 与页面动作 | Selection、图片、分析、追问、回复、复判、Brew Feedback 等调用复用该 client。 |
 | FastAPI dependency | `backend/src/guancha_api/auth/dependencies.py`、`backend/src/guancha_api/api/v1/routes.py` | `get_owner_context()`、`Owner`；`ClientId` 仅保留给 Brew Feedback | Authorization 存在时必须走 `_resolve_authenticated_user()`；完全缺失时才解析 `X-Client-Id` 为 anonymous owner。 |
 | authenticated mapping | `backend/src/guancha_api/auth/dependencies.py`、`backend/src/guancha_api/repositories/postgres.py` | `_resolve_authenticated_user()`、`resolve_or_create_app_user()` | 只使用已验证 `VerifiedIdentity.external_subject` 幂等解析 `app_users.id`；前端不能提供 internal `user_id`。 |
@@ -34,10 +34,11 @@
 
 ```text
 app.js 启动
-  → GuanchaApi.getOrCreateClientId()
-  → localStorage['guancha.anonymous-client-id.v1']（UUID v4）
-  → createApiClient 捕获 clientId
-  → 业务请求加入 X-Client-Id
+  → GET /api/v1/config/public
+  → GuanchaAuth（CloudBase v3.8.2 SDK）恢复 session
+  → authenticated：临时 token → GET /api/v1/me → account marker / local clear → Bearer Selection
+  → unauthenticated 且 auth.required=false：GuanchaApi.getOrCreateClientId() → X-Client-Id anonymous Selection
+  → unauthenticated 且 auth.required=true：停留登录 UI，不发匿名 Selection
   → Selection 路由的 Owner dependency：Bearer 优先，否则 X-Client-Id
   → verified subject → app_users.id，或 UUID anonymous owner
   → Repository 按 selection_sessions root / FK 链授权
@@ -127,22 +128,22 @@ selection_sessions
 
 扫描未发现独立的 `settings` 持久化 store；目前最接近 settings 的是 `guancha_onboarding_status` 和 `guancha.ui-session.v1` 中的 UI / onboarding 状态。它们都不能作为资源授权依据，是否按账号同步应在后续产品决策中单独确定。
 
-## 4. CloudBase Authentication 最小接入点（只做设计）
+## 4. CloudBase Authentication 最小接入点（Phase 9-3 已实现前端边界）
 
-本节不是实现方案落地，也没有安装 SDK 或调用真实服务。认证服务确定为 Tencent CloudBase Authentication。后续 Web 客户端计划使用当前 `@cloudbase/js-sdk` v3（Phase 9-3），不主动采用已经标记为旧版的 v2 SDK。CloudBase SDK / API 若未来更新，应在对应实现阶段重新核验官方文档，不永久锁死一个已过时的小版本 API。
+认证服务确定为 Tencent CloudBase Authentication。前端通过官方 CDN 固定使用 `@cloudbase/js-sdk` v3.8.2：`https://static.cloudbase.net/cloudbase-js-sdk/3.8.2/cloudbase.full.js`（实现时验证 HTTP 200）。不使用已经标记为旧版的 v2 SDK，也没有安装 bundler / npm auth 依赖。CloudBase SDK / API 若未来更新，应在对应实现阶段重新核验官方文档，不永久锁死一个已过时的小版本 API。
 
 ### 4.1 Frontend：最小侵入边界
 
-建议在 Phase 9-3 新增 `frontend/auth-client.js`，职责只包括：
+Phase 9-3 已新增 `frontend/auth-client.js`，职责只包括：
 
 1. 封装当前 `@cloudbase/js-sdk` v3 的注册、登录、登出、当前认证状态和 access token 获取；
 2. 对外提供稳定的 `getCurrentUser()` / `getAccessToken()` / auth-state subscription，不让 `app.js` 直接依赖 SDK 细节；
 3. 不把 refresh token 或 access token 写入 Git、日志、analytics payload 或业务 localStorage；SDK 的安全持久化策略需按官方能力和部署环境验证；
 4. 登录、登出和账号切换时通知应用清理内存、account-scoped local state、pending image 状态和正在运行的 poller，然后重新 hydrate。
 
-根目录 `index.html` 当前没有 auth client，脚本顺序为 stores、analytics、api-client、public-config、image-preparation、adapters、onboarding-routing、job-poller、app。最小方案是在 API client 前加载 auth client，或以模块依赖方式让 API client 通过注入的 token getter 读取它；不需要迁移 SPA 框架，也不应创建 `frontend/index.html`。
+根目录 `index.html` 通过固定 CDN 先加载 SDK，再加载 auth client；`app.js` 仅使用其最小 API 和 API client 注入的 token getter，不直接保存或传播 session。没有迁移 SPA 框架，也没有创建 `frontend/index.html`。
 
-`frontend/api-client.js` 后续只需增加：有经过 SDK 获取的 authenticated access token 时注入 `Authorization: Bearer <token>`；匿名请求继续发送当前 `X-Client-Id`。两种 owner 必须明确优先级，不能因为 header 仍存在就自动把匿名资源认领给账号。
+`frontend/api-client.js` 已增加 owner-scoped token getter：有经过 SDK 获取的 token 时注入 `Authorization: Bearer <token>`；可选认证且无 token 时才继续发送 `X-Client-Id`。`/me` 总是 Bearer；`/events` 不自动接收 Bearer；Brew Feedback 保持 `X-Client-Id`。两种 owner 有明确优先级，不能因为 header 仍存在就自动把匿名资源认领给账号。
 
 ### 4.2 Backend：Phase 9-1 Production TokenVerifier 与 Phase 9-2 OwnerContext
 
@@ -191,6 +192,8 @@ Authorization: Bearer <incoming access token>
 
 - `CLOUDBASE_ENV_ID`；
 - `CLOUDBASE_REGION`。
+- `CLOUDBASE_PUBLISHABLE_KEY`（仅作为 `/config/public` 的浏览器公开 credential）；
+- `GUANCHA_AUTH_REQUIRED`。
 
 不得提交真实 token、API Key、SecretId 或 SecretKey。Phase 9-1 使用 `FakeTokenVerifier`，测试不得访问真实 CloudBase。
 
@@ -321,7 +324,7 @@ Phase 9-2 测试覆盖：authenticated A 创建 session 后，去掉 Bearer 但�
 
 ### Phase 9-3 — Auth UI
 
-后续才处理：
+已处理：
 
 - `frontend/auth-client.js`；
 - CloudBase Web SDK；
@@ -333,6 +336,10 @@ Phase 9-2 测试覆盖：authenticated A 创建 session 后，去掉 Bearer 但�
 - account switch；
 - localStorage / IndexedDB / poller isolation。
 
+实现边界：CloudBase SDK session 由 SDK 自行持久化；Guancha 不写 access token、refresh token 或密码到浏览器业务存储。public config 仅公开 env ID、region、publishable key、required/configured/provider；`GUANCHA_AUTH_REQUIRED=true` 而浏览器配置不完整时，UI 显示“登录服务暂未配置”，不会进入匿名产品。首次认证登录、账号切换和显式登出均调用 `GuanchaStores.clearAll()`，清除 pending image path 并移除 `guancha.auth-user-id.v1` marker。新认证账号使用无 warehouse、Journal、历史、候选和偏好 seed 的干净状态；旧 anonymous 数据不上传、不认领。
+
+未处理：真实 CloudBase console / secure domain / publishable key 配置和 live smoke，account recovery，以及 user-scoped Warehouse / Journal / Preferences 云端 CRUD。
+
 ### Phase 9-4 — User Cloud State
 
 后续才处理：
@@ -342,13 +349,13 @@ Phase 9-2 测试覆盖：authenticated A 创建 session 后，去掉 Bearer 但�
 - journal；
 - cross-device state。
 
-Phase 9-3/9-4 不在本轮实现；不应据此推断注册登录 UI、账号恢复、云端 Warehouse / Journal / Preferences 或 legacy anonymous history claim/import 已完成。
+Phase 9-3 不代表真实 CloudBase runtime 已验证，也不代表账号恢复、云端 Warehouse / Journal / Preferences 或 legacy anonymous history claim/import 已完成。Phase 9-4 不在本轮实现。
 
 ## 9. 本轮边界与验证说明
 
 - 本审计基于当前实际的 `app.js`、`frontend/`、`backend/src/guancha_api/`、`supabase/migrations/` 和测试目录扫描整理。
-- 本轮未修改 `app.js`、`styles.css`、frontend auth、Provider 或 Selection Decision Logic；新增了 Phase 9-2 additive migration、OwnerContext、Selection repository/service/route ownership 边界和对应测试。
-- 本轮没有安装认证依赖，没有接入或调用真实 CloudBase，没有使用真实 API Key 或生产数据库。
-- 目标工作树未配置本地 `backend\.venv`，因此使用已核验的共享环境 `C:\Users\QQ\Documents\New project\guancha-o1-o2-prototype\backend\.venv\Scripts\python.exe` 运行相同的 `backend\tests` 集合：`263 passed, 82 skipped`。数据库相关测试在未提供 `TEST_DATABASE_URL` 时 skip，不是测试失败。
-- `node --check app.js` 通过；`node --test frontend/tests/*.test.js` 结果为 `62 passed, 0 failed`。
+- Phase 9-3 只修改 public config、frontend auth/API/UI/account-boundary 以及必要测试和文档；没有改动 Provider、Selection Decision Logic、migration 或 CloudBase console。
+- 本轮没有安装认证依赖，没有接入或调用真实 CloudBase，没有使用真实 API Key、真实 access token 或生产数据库。
+- 目标工作树未配置本地 `backend\.venv`，因此使用已核验的共享环境 `C:\Users\QQ\Documents\New project\guancha-o1-o2-prototype\backend\.venv\Scripts\python.exe` 运行相同的 `backend\tests` 集合：`265 passed, 82 skipped`。数据库相关测试在未提供 `TEST_DATABASE_URL` 时 skip，不是测试失败。
+- `node --check app.js`、`node --check frontend/auth-client.js` 和 `node --check frontend/api-client.js` 通过；`node --test frontend/tests/*.test.js` 结果为 `74 passed, 0 failed`。
 - 以上验证没有连接真实 CloudBase、真实 token 或生产数据库；PostgreSQL ownership gate 是否通过，以提交时实际 `TEST_DATABASE_URL` 结果为准。已有 backend auth kernel 和 Selection ownership 不代表前端注册登录或其他云端用户数据能力已经存在。

@@ -11,8 +11,9 @@
     pollAfterInitialMs: 2000,
     pollBackgroundMs: 5000,
     pollInitialWindowMs: 5000,
+    auth: Object.freeze({ required: false, configured: false, provider: 'cloudbase', envId: null, region: 'ap-shanghai', publishableKey: null }),
   });
-  let current = { ...DEFAULT, allowedImageMimeTypes: [...DEFAULT.allowedImageMimeTypes] };
+  let current = { ...DEFAULT, allowedImageMimeTypes: [...DEFAULT.allowedImageMimeTypes], auth: { ...DEFAULT.auth } };
   function integerInRange(value, minimum, maximum, fallback) {
     return Number.isInteger(value) && value >= minimum && value <= maximum ? value : fallback;
   }
@@ -24,8 +25,26 @@
     const types = [...new Set(value)];
     return types.every(type => typeof type === 'string' && SAFE_MIME_TYPES.has(type)) ? types : [...DEFAULT.allowedImageMimeTypes];
   }
+  function authConfig(value) {
+    const input = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    const region = typeof input.region === 'string' ? input.region.trim().toLowerCase() : '';
+    const envId = typeof input.env_id === 'string' && input.env_id.trim() ? input.env_id.trim() : null;
+    const publishableKey = typeof input.publishable_key === 'string' && input.publishable_key.trim() ? input.publishable_key.trim() : null;
+    const required = input.required === true;
+    const validRegion = /^[a-z0-9]+(?:-[a-z0-9]+){1,4}$/.test(region);
+    const validProvider = input.provider === 'cloudbase';
+    return {
+      required,
+      configured: input.configured === true && validProvider && validRegion && Boolean(envId && publishableKey),
+      provider: 'cloudbase',
+      envId,
+      region: validRegion ? region : DEFAULT.auth.region,
+      publishableKey,
+    };
+  }
+  function copyCurrent() { return { ...current, allowedImageMimeTypes: [...current.allowedImageMimeTypes], auth: { ...current.auth } }; }
   function apply(payload) {
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return { ...current, allowedImageMimeTypes: [...current.allowedImageMimeTypes] };
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return copyCurrent();
     const intervals = payload.poll_intervals_seconds;
     current = {
       // The product ceilings are the live UI bounds.  Historical Phase-2
@@ -38,8 +57,9 @@
       pollAfterInitialMs: secondsToMs(intervals && intervals.after_initial, DEFAULT.pollAfterInitialMs),
       pollBackgroundMs: secondsToMs(intervals && intervals.background, DEFAULT.pollBackgroundMs),
       pollInitialWindowMs: DEFAULT.pollInitialWindowMs,
+      auth: authConfig(payload.auth),
     };
-    return { ...current, allowedImageMimeTypes: [...current.allowedImageMimeTypes] };
+    return copyCurrent();
   }
-  global.GuanchaPublicConfig = { DEFAULT, get: () => ({ ...current, allowedImageMimeTypes: [...current.allowedImageMimeTypes] }), apply };
+  global.GuanchaPublicConfig = { DEFAULT, get: copyCurrent, apply };
 }(window));

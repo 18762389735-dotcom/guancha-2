@@ -284,8 +284,8 @@
     }
   };
   stores.clearAll = () => {
-    [stores.uiSession.key, stores.selectionBridge.key, stores.localPostPurchase.key, stores.preferenceEvidence.key, 'guancha-prototype-v2'].forEach((key) => global.localStorage.removeItem(key));
-    pendingImages.clear();
+    [stores.uiSession.key, stores.selectionBridge.key, stores.localPostPurchase.key, stores.preferenceEvidence.key, 'guancha-prototype-v2', 'guancha_onboarding_status'].forEach((key) => global.localStorage.removeItem(key));
+    return pendingImages.clear();
   };
   global.GuanchaStores = stores;
 }(window));

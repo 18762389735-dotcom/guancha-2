@@ -38,6 +38,12 @@ test('future selection saves use a second merchant reply allowlist and reset cle
   assert.equal(values.has(store.key), false);
 });
 
+test('account-boundary clear also removes the browser-global onboarding marker', () => {
+  const { window, values } = loadStore({ guancha_onboarding_status: 'completed' });
+  window.GuanchaStores.clearAll();
+  assert.equal(values.has('guancha_onboarding_status'), false);
+});
+
 test('corrupt selection JSON is removed immediately and falls back safely', () => {
   const key = 'guancha.selection-bridge.v1';
   const { window, values } = loadStore({ [key]: '{broken' });
