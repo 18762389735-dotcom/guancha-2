@@ -41,12 +41,25 @@
     const baseUrl = options && options.baseUrl;
     const clientId = options && options.clientId;
     const timeoutMs = Number.isFinite(options && options.timeoutMs) ? options.timeoutMs : 15000;
+    const getAccessToken = options && options.getAccessToken;
+    const authRequired = options && options.authRequired === true;
     const transport = (options && options.transport) || (baseUrl ? fetchTransport(baseUrl.replace(/\/$/, ''), timeoutMs) : unconfiguredTransport);
-    function request(method, path, payload, requestOptions) {
+    async function ownerHeaders(opts) {
+      if (!opts.ownerScoped && !opts.bearerRequired) return clientId ? { 'X-Client-Id': clientId } : {};
+      let token = null;
+      if (typeof getAccessToken === 'function') {
+        try { token = await getAccessToken(); }
+        catch { throw new ApiContractError('authentication_required', '登录状态不可用，请重新登录。'); }
+      }
+      if (typeof token === 'string' && token.trim()) return { Authorization: `Bearer ${token.trim()}` };
+      if (opts.bearerRequired || authRequired) throw new ApiContractError('authentication_required', '请先登录后再继续。');
+      return clientId ? { 'X-Client-Id': clientId } : {};
+    }
+    async function request(method, path, payload, requestOptions) {
       const opts = requestOptions || {};
       const idempotencyKey = opts.idempotent ? (opts.idempotencyKey || createIdempotencyKey()) : null;
       const headers = {
-        ...(clientId ? { 'X-Client-Id': clientId } : {}),
+        ...(await ownerHeaders(opts)),
         ...(global.GuanchaProductAnalytics ? { 'X-Analytics-Session-Id': global.GuanchaProductAnalytics.getSessionId() } : {}),
         ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
         ...(opts.headers || {}),
@@ -58,29 +71,31 @@
       isConfigured: transport !== unconfiguredTransport,
       getHealth: () => request('GET', publicRoutes.health),
       getPublicConfig: () => request('GET', `${API_BASE}${publicRoutes.publicConfig}`),
-      createSelectionSession: (need, idempotencyKey, recentPreferenceEvidence = []) => request('POST', `${API_BASE}/selection-sessions`, JSON.stringify({ need, recent_preference_evidence: recentPreferenceEvidence }), { idempotent: true, idempotencyKey, headers: { 'Content-Type': 'application/json' } }),
-      getSelectionSession: (sessionId) => request('GET', `${API_BASE}/selection-sessions/${sessionId}`),
-      updateSelectionSession: (sessionId, need, recentPreferenceEvidence = []) => request('PATCH', `${API_BASE}/selection-sessions/${sessionId}`, JSON.stringify({ need, recent_preference_evidence: recentPreferenceEvidence }), { headers: { 'Content-Type': 'application/json' } }),
-      createCandidate: (sessionId, candidate, idempotencyKey) => request('POST', `${API_BASE}/selection-sessions/${sessionId}/candidates`, JSON.stringify(candidate), { idempotent: true, idempotencyKey, headers: { 'Content-Type': 'application/json' } }),
-      listCandidates: (sessionId) => request('GET', `${API_BASE}/selection-sessions/${sessionId}/candidates`),
-      getSelectionSnapshot: (sessionId) => request('GET', `${API_BASE}/selection-sessions/${sessionId}/snapshot`),
-      deleteCandidate: (candidateId) => request('DELETE', `${API_BASE}/candidates/${candidateId}`),
-      uploadCandidateImage: (candidateId, file, idempotencyKey) => { const form = new FormData(); form.append('file', file, file.name || 'product-image'); return request('POST', `${API_BASE}/candidates/${candidateId}/images`, form, { idempotent: true, idempotencyKey }); },
-      deleteCandidateImage: (imageId) => request('DELETE', `${API_BASE}/candidate-images/${imageId}`),
-      getJob: (jobId) => request('GET', `${API_BASE}/jobs/${jobId}`),
-      getCurrentExtraction: (candidateId) => request('GET', `${API_BASE}/candidates/${candidateId}/current-extraction`),
-      analyzeSelectionSession: (sessionId, idempotencyKey) => request('POST', `${API_BASE}/selection-sessions/${sessionId}/analyze`, null, { idempotent: true, idempotencyKey }),
-      getDecisionVersion: (versionId) => request('GET', `${API_BASE}/decision-versions/${versionId}`),
-      generateDecisionQuestions: (versionId, idempotencyKey) => request('POST', `${API_BASE}/decision-versions/${versionId}/questions`, null, { idempotent: true, idempotencyKey }),
-      getDecisionQuestions: (versionId) => request('GET', `${API_BASE}/decision-versions/${versionId}/questions`),
-      createMerchantReply: (sessionId, reply, idempotencyKey) => request('POST', `${API_BASE}/selection-sessions/${sessionId}/merchant-replies`, JSON.stringify(reply), { idempotent: true, idempotencyKey, headers: { 'Content-Type': 'application/json' } }),
-      getMerchantReply: (replyId) => request('GET', `${API_BASE}/merchant-replies/${replyId}`),
-      rejudgeMerchantReply: (sessionId, idempotencyKey) => request('POST', `${API_BASE}/selection-sessions/${sessionId}/rejudge`, '{}', { idempotent: true, idempotencyKey, headers: { 'Content-Type': 'application/json' } }),
-      getDecisionDelta: (deltaId) => request('GET', `${API_BASE}/decision-deltas/${deltaId}`),
+      getMe: () => request('GET', `${API_BASE}/me`, null, { bearerRequired: true }),
+      createSelectionSession: (need, idempotencyKey, recentPreferenceEvidence = []) => request('POST', `${API_BASE}/selection-sessions`, JSON.stringify({ need, recent_preference_evidence: recentPreferenceEvidence }), { ownerScoped: true, idempotent: true, idempotencyKey, headers: { 'Content-Type': 'application/json' } }),
+      getSelectionSession: (sessionId) => request('GET', `${API_BASE}/selection-sessions/${sessionId}`, null, { ownerScoped: true }),
+      updateSelectionSession: (sessionId, need, recentPreferenceEvidence = []) => request('PATCH', `${API_BASE}/selection-sessions/${sessionId}`, JSON.stringify({ need, recent_preference_evidence: recentPreferenceEvidence }), { ownerScoped: true, headers: { 'Content-Type': 'application/json' } }),
+      createCandidate: (sessionId, candidate, idempotencyKey) => request('POST', `${API_BASE}/selection-sessions/${sessionId}/candidates`, JSON.stringify(candidate), { ownerScoped: true, idempotent: true, idempotencyKey, headers: { 'Content-Type': 'application/json' } }),
+      listCandidates: (sessionId) => request('GET', `${API_BASE}/selection-sessions/${sessionId}/candidates`, null, { ownerScoped: true }),
+      getSelectionSnapshot: (sessionId) => request('GET', `${API_BASE}/selection-sessions/${sessionId}/snapshot`, null, { ownerScoped: true }),
+      deleteCandidate: (candidateId) => request('DELETE', `${API_BASE}/candidates/${candidateId}`, null, { ownerScoped: true }),
+      uploadCandidateImage: (candidateId, file, idempotencyKey) => { const form = new FormData(); form.append('file', file, file.name || 'product-image'); return request('POST', `${API_BASE}/candidates/${candidateId}/images`, form, { ownerScoped: true, idempotent: true, idempotencyKey }); },
+      deleteCandidateImage: (imageId) => request('DELETE', `${API_BASE}/candidate-images/${imageId}`, null, { ownerScoped: true }),
+      getJob: (jobId) => request('GET', `${API_BASE}/jobs/${jobId}`, null, { ownerScoped: true }),
+      getExtractionVersion: (versionId) => request('GET', `${API_BASE}/extraction-versions/${versionId}`, null, { ownerScoped: true }),
+      getCurrentExtraction: (candidateId) => request('GET', `${API_BASE}/candidates/${candidateId}/current-extraction`, null, { ownerScoped: true }),
+      analyzeSelectionSession: (sessionId, idempotencyKey) => request('POST', `${API_BASE}/selection-sessions/${sessionId}/analyze`, null, { ownerScoped: true, idempotent: true, idempotencyKey }),
+      getDecisionVersion: (versionId) => request('GET', `${API_BASE}/decision-versions/${versionId}`, null, { ownerScoped: true }),
+      generateDecisionQuestions: (versionId, idempotencyKey) => request('POST', `${API_BASE}/decision-versions/${versionId}/questions`, null, { ownerScoped: true, idempotent: true, idempotencyKey }),
+      getDecisionQuestions: (versionId) => request('GET', `${API_BASE}/decision-versions/${versionId}/questions`, null, { ownerScoped: true }),
+      createMerchantReply: (sessionId, reply, idempotencyKey) => request('POST', `${API_BASE}/selection-sessions/${sessionId}/merchant-replies`, JSON.stringify(reply), { ownerScoped: true, idempotent: true, idempotencyKey, headers: { 'Content-Type': 'application/json' } }),
+      getMerchantReply: (replyId) => request('GET', `${API_BASE}/merchant-replies/${replyId}`, null, { ownerScoped: true }),
+      rejudgeMerchantReply: (sessionId, idempotencyKey) => request('POST', `${API_BASE}/selection-sessions/${sessionId}/rejudge`, '{}', { ownerScoped: true, idempotent: true, idempotencyKey, headers: { 'Content-Type': 'application/json' } }),
+      getDecisionDelta: (deltaId) => request('GET', `${API_BASE}/decision-deltas/${deltaId}`, null, { ownerScoped: true }),
       analyzeBrewFeedback: (payload, idempotencyKey) => request('POST', `${API_BASE}/brew-feedback/analyze`, JSON.stringify(payload), { idempotent: true, idempotencyKey, headers: { 'Content-Type': 'application/json' } }),
-      getCurrentDecision: (sessionId) => request('GET', `${API_BASE}/selection-sessions/${sessionId}/current-decision`),
-      getSelectionAnswer: (sessionId) => request('GET', `${API_BASE}/selection-sessions/${sessionId}/answer`),
-      retryExtraction: (candidateId, idempotencyKey) => request('POST', `${API_BASE}/candidates/${candidateId}/extraction-jobs`, null, { idempotent: true, idempotencyKey }),
+      getCurrentDecision: (sessionId) => request('GET', `${API_BASE}/selection-sessions/${sessionId}/current-decision`, null, { ownerScoped: true }),
+      getSelectionAnswer: (sessionId) => request('GET', `${API_BASE}/selection-sessions/${sessionId}/answer`, null, { ownerScoped: true }),
+      retryExtraction: (candidateId, idempotencyKey) => request('POST', `${API_BASE}/candidates/${candidateId}/extraction-jobs`, null, { ownerScoped: true, idempotent: true, idempotencyKey }),
       _request: request,
     });
   }

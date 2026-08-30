@@ -28,6 +28,49 @@ def test_public_config_is_the_approved_minimum_contract() -> None:
     response = client.get("/api/v1/config/public")
     assert response.status_code == 200
     assert response.json() == PublicConfig().model_dump(mode="json")
+    assert response.json()["auth"] == {
+        "required": False,
+        "configured": False,
+        "provider": "cloudbase",
+        "env_id": None,
+        "region": "ap-shanghai",
+        "publishable_key": None,
+    }
+
+
+def test_public_config_exposes_only_browser_safe_cloudbase_auth_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GUANCHA_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("CLOUDBASE_ENV_ID", "env-test")
+    monkeypatch.setenv("CLOUDBASE_REGION", "ap-shanghai")
+    monkeypatch.setenv("CLOUDBASE_PUBLISHABLE_KEY", "public-test-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
+    monkeypatch.setenv("ADMIN_API_TOKEN", "must-not-leak")
+    monkeypatch.setenv("GUANCHA_DATABASE_URL", "postgresql://must-not-leak")
+    response = client.get("/api/v1/config/public")
+    assert response.status_code == 200
+    assert response.json()["auth"] == {
+        "required": True,
+        "configured": True,
+        "provider": "cloudbase",
+        "env_id": "env-test",
+        "region": "ap-shanghai",
+        "publishable_key": "public-test-key",
+    }
+    assert "must-not-leak" not in response.text
+
+
+def test_required_auth_without_publishable_key_is_not_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GUANCHA_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("CLOUDBASE_ENV_ID", "env-test")
+    monkeypatch.delenv("CLOUDBASE_PUBLISHABLE_KEY", raising=False)
+    assert client.get("/api/v1/config/public").json()["auth"] == {
+        "required": True,
+        "configured": False,
+        "provider": "cloudbase",
+        "env_id": "env-test",
+        "region": "ap-shanghai",
+        "publishable_key": None,
+    }
 
 
 def test_openapi_contains_frozen_phase2_contract_paths() -> None:

@@ -786,3 +786,23 @@ body {
 .infusion-page h1 {
   font-size: 27px;
 }
+
+.auth-page {
+  display: grid;
+  min-height: 100%;
+  padding: 28px 20px;
+  place-items: center;
+  background: #f7f7f7;
+}
+
+.auth-card {
+  width: min(100%, 360px);
+  padding: 28px 22px;
+}
+
+.auth-card h1 { margin: 0 0 10px; font-size: 27px; }
+.auth-card p { margin: 0 0 24px; color: #696969; line-height: 1.6; }
+.auth-card form { display: grid; gap: 14px; margin-bottom: 14px; }
+.auth-card label { display: grid; gap: 7px; color: #2a2a2a; font-size: 14px; }
+.auth-card input { width: 100%; box-sizing: border-box; border: 1px solid #dedede; border-radius: 10px; padding: 12px; background: #fff; color: #171717; font: inherit; }
+.auth-card .text-link { display: block; width: 100%; margin-top: 12px; }

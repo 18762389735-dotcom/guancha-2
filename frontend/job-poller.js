@@ -34,5 +34,5 @@
     tick();
     return cancel;
   }
-  global.GuanchaJobPoller = { start, cancel: (resourceId) => activeByResource.get(resourceId)?.cancel(), activeCount: () => activeByResource.size };
+  global.GuanchaJobPoller = { start, cancel: (resourceId) => activeByResource.get(resourceId)?.cancel(), cancelAll: () => [...activeByResource.values()].forEach(item => item.cancel()), activeCount: () => activeByResource.size };
 }(window));

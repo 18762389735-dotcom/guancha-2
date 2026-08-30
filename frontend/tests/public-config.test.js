@@ -28,3 +28,17 @@ test('public product bounds retain five candidates and two screenshots', () => {
   assert.equal(applied.maxCandidates, 5);
   assert.equal(applied.maxImagesPerCandidate, 2);
 });
+
+test('public auth config fails closed when CloudBase browser configuration is malformed', () => {
+  const config = loadConfig();
+  let applied = config.apply({ auth: { required: false, configured: false, provider: 'cloudbase', region: 'ap-shanghai' } });
+  assert.equal(applied.auth.required, false);
+  assert.equal(applied.auth.configured, false);
+
+  applied = config.apply({ auth: { required: true, configured: true, provider: 'cloudbase', env_id: 'env-test', region: 'ap-shanghai', publishable_key: 'public-key' } });
+  assert.deepEqual(JSON.parse(JSON.stringify(applied.auth)), { required: true, configured: true, provider: 'cloudbase', envId: 'env-test', region: 'ap-shanghai', publishableKey: 'public-key' });
+
+  applied = config.apply({ auth: { required: true, configured: true, provider: 'other', env_id: 'env-test', region: '<script>', publishable_key: 'public-key' } });
+  assert.equal(applied.auth.configured, false);
+  assert.equal(applied.auth.region, 'ap-shanghai');
+});
