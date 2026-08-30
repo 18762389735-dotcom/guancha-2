@@ -94,4 +94,13 @@ class CloudBaseTokenVerifier:
         subject = payload.get("sub")
         if not isinstance(subject, str) or not subject.strip():
             raise InvalidAccessToken
+
+        if "scope" in payload:
+            scope = payload["scope"]
+            if not isinstance(scope, str):
+                raise InvalidAccessToken
+            scope_tokens = scope.split()
+            if not scope_tokens or "anonymous" in scope_tokens:
+                raise InvalidAccessToken
+
         return VerifiedIdentity(external_subject=subject.strip())

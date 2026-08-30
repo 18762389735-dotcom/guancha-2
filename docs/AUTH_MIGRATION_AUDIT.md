@@ -161,6 +161,9 @@ Authorization: Bearer <incoming access token>
 
 - 响应中必须存在非空 `sub`；
 - `sub` 作为 CloudBase external subject；
+- 如果响应提供 `scope`，它必须是非空字符串，并按空白分隔为 token；其中包含精确 token `anonymous` 时必须视为 invalid credentials；
+- 缺少 `scope` 时保留当前兼容行为；其他 scope token（例如 `user sso`）不写入 `VerifiedIdentity`，只允许可信 `sub` 继续进入后续映射；
+- CloudBase identity with explicit anonymous scope must not become `app_users` in the current registered-account product；
 - 服务端通过 `sub` 幂等 resolve / create `app_users`；
 - 前端不得提供 internal `user_id`。
 

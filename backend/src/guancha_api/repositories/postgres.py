@@ -182,15 +182,24 @@ class PostgresPhase2Repository:
                     """
                     insert into app_users (id, cloudbase_user_id)
                     values (%s, %s)
-                    on conflict (cloudbase_user_id) do update
-                      set updated_at = app_users.updated_at
+                    on conflict (cloudbase_user_id) do nothing
                     returning id, cloudbase_user_id, created_at, updated_at
                     """,
                     (app_user_id, normalized_subject),
                 )
                 row = await cursor.fetchone()
+                if row is None:
+                    await cursor.execute(
+                        """
+                        select id, cloudbase_user_id, created_at, updated_at
+                        from app_users
+                        where cloudbase_user_id = %s
+                        """,
+                        (normalized_subject,),
+                    )
+                    row = await cursor.fetchone()
         if row is None:
-            raise RepositoryError("App user could not be resolved")
+            raise RepositoryError("App user conflict was not visible after insert")
         return AppUser(
             id=row["id"],
             cloudbase_user_id=row["cloudbase_user_id"],

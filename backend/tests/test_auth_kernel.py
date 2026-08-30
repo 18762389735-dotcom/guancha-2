@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -81,6 +82,33 @@ async def test_cloudbase_verifier_returns_verified_subject_and_sends_bearer() ->
         "url": "https://test-env.api.tcloudbasegateway.com/auth/v1/token/introspect",
         "authorization": "Bearer incoming-access-token",
     }
+
+
+@pytest.mark.parametrize("scope", ["anonymous", "anonymous other"])
+@pytest.mark.asyncio
+async def test_cloudbase_verifier_rejects_explicit_anonymous_scope(scope: str) -> None:
+    verifier, _ = _mock_verifier(payload={"sub": "cloudbase-subject-a", "scope": scope})
+
+    with pytest.raises(InvalidAccessToken):
+        await verifier.verify("incoming-access-token")
+
+
+@pytest.mark.asyncio
+async def test_cloudbase_verifier_allows_non_anonymous_scope() -> None:
+    verifier, _ = _mock_verifier(payload={"sub": "cloudbase-subject-a", "scope": "user sso"})
+
+    assert await verifier.verify("incoming-access-token") == VerifiedIdentity(
+        external_subject="cloudbase-subject-a"
+    )
+
+
+@pytest.mark.parametrize("scope", [None, [], {}, ""])
+@pytest.mark.asyncio
+async def test_cloudbase_verifier_fails_closed_for_malformed_scope(scope: object) -> None:
+    verifier, _ = _mock_verifier(payload={"sub": "cloudbase-subject-a", "scope": scope})
+
+    with pytest.raises(InvalidAccessToken):
+        await verifier.verify("incoming-access-token")
 
 
 @pytest.mark.parametrize(
@@ -271,6 +299,64 @@ async def test_app_user_repository_mapping_is_stable(postgres_repository: Postgr
     assert first.id == second.id
     assert first.cloudbase_user_id == second.cloudbase_user_id == "cloudbase-subject-a"
     assert first.id != other.id
+
+
+@pytest.mark.asyncio
+async def test_app_user_resolution_does_not_update_existing_row(
+    postgres_repository: PostgresPhase2Repository,
+) -> None:
+    first = await postgres_repository.resolve_or_create_app_user("cloudbase-subject-a")
+    expected_updated_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    async with postgres_repository._connection.cursor() as cursor:
+        await cursor.execute(
+            "update app_users set updated_at = %s where id = %s",
+            (expected_updated_at, first.id),
+        )
+        await cursor.execute(
+            "select updated_at from app_users where id = %s",
+            (first.id,),
+        )
+        before_resolve = await cursor.fetchone()
+
+    resolved = await postgres_repository.resolve_or_create_app_user("cloudbase-subject-a")
+
+    async with postgres_repository._connection.cursor() as cursor:
+        await cursor.execute(
+            "select updated_at from app_users where id = %s",
+            (first.id,),
+        )
+        after_resolve = await cursor.fetchone()
+
+    assert before_resolve["updated_at"] == expected_updated_at
+    assert after_resolve["updated_at"] == expected_updated_at
+    assert resolved.id == first.id
+
+
+@pytest.mark.asyncio
+async def test_concurrent_app_user_first_use_keeps_one_identity(
+    postgres_repository: PostgresPhase2Repository,
+) -> None:
+    assert DATABASE_URL is not None
+    first_repository = await PostgresPhase2Repository.connect(DATABASE_URL)
+    second_repository = await PostgresPhase2Repository.connect(DATABASE_URL)
+    try:
+        first, second = await asyncio.gather(
+            first_repository.resolve_or_create_app_user("concurrent-subject"),
+            second_repository.resolve_or_create_app_user("concurrent-subject"),
+        )
+    finally:
+        await first_repository.close()
+        await second_repository.close()
+
+    async with postgres_repository._connection.cursor() as cursor:
+        await cursor.execute(
+            "select count(*) as count from app_users where cloudbase_user_id = %s",
+            ("concurrent-subject",),
+        )
+        count_row = await cursor.fetchone()
+
+    assert first.id == second.id
+    assert count_row["count"] == 1
 
 
 @pytest.mark.asyncio
