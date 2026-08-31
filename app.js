@@ -824,6 +824,7 @@ function authMessage() {
   if (code === 'auth_not_configured') return ['登录服务暂未配置', '请联系管理员完成登录服务配置后再试。'];
   if (code === 'authentication_service_unavailable') return ['登录服务暂不可用', '请稍后重试，当前不会进入匿名选茶。'];
   if (code === 'backend_unavailable' || code === 'database_not_configured' || code === 'service_unavailable') return ['后端服务暂不可用', '请稍后重试。'];
+  if (code === 'post_purchase_sync_failed' || code === 'network_unavailable') return ['茶仓与日记暂不可用', '云端资料尚未恢复，请重试后再进入产品。'];
   return ['登录暂时不可用', '请稍后重试。'];
 }
 function renderAuthGate() {
@@ -1113,7 +1114,7 @@ function renderStub() {
   return `<section class="stub-page"><img src="${asset(image)}" alt="" /><h1>${title}</h1><p>${copy}</p>${state.stubTab === 'settings' ? '<button class="primary-btn" data-action="open-preferences">编辑口味偏好</button>' : ''}${tabbar()}</section>`;
 }
 
-/* 茶仓库与泡茶日记：比赛版仅使用本地模拟数据，不依赖后端。 */
+/* 茶仓库与泡茶日记：匿名模式保留本地能力，登录后由云端资源提供事实。 */
 function getTea(id = state.selectedTeaId) { return state.warehouse.find(item => item.id === id) || state.warehouse[0]; }
 function artElement(art = 'can', className = 'tea-art') {
   const file = ART[art] || ART.can;
@@ -1479,34 +1480,14 @@ document.addEventListener('click', event => {
   if (action === 'confirm-choice') { productAnalytics.track('candidate_selected', { candidate_id: currentCandidate()?.serverCandidateId, decision_version_id: state.decisionVersionId || undefined, metadata: { action_bucket: currentCandidate()?.decision?.action_bucket || 'unknown', screen: state.screen } }); return setScreen('ownership'); }
   if (action === 'back-from-ownership') return setScreen('candidates');
   if (action === 'set-ownership') { state.ownershipChoice = target.dataset.value; saveState(); return render(); }
-  if (action === 'confirm-warehouse') {
-    const candidate = currentCandidate() || { name:'春日乌龙', type:'乌龙茶 · 清香型' };
-    const existing = state.warehouse.find(item => item.name === candidate.name);
-    if (!existing) {
-      const extracted = evidenceByField(candidate.extraction);
-      state.warehouse.unshift({
-        id:`tea-${Date.now()}`, name:candidate.name, product_name:candidate.name,
-        type:extracted.tea_category || candidate.type.split('·')[0].trim(), tea_category:extracted.tea_category || null,
-        tea_subtype:extracted.tea_subtype || null, origin:extracted.origin || null,
-        roast_or_style:extracted.roast_or_style || null, aroma:extracted.aroma_claims || candidate.type.split('·')[1]?.trim() || '不确定',
-        risk_flags:candidate.riskFlags || [], extraction_version_id:candidate.extractionVersionId || null,
-        candidate_id:candidate.serverCandidateId || null, sourceDecisionId:state.decisionVersionId || null,
-        joined_at:new Date().toISOString(), status:'drinking', source:state.ownershipChoice === 'bought' ? '本次购入' : '已有茶叶', lastBrew:'还未泡过', records:0, art:'can', facts:['来自本次截图提取'], risks:candidate.riskFlags?.length ? candidate.riskFlags : ['产地与年份待补']
-      });
-    }
-    state.selectedTeaId = (existing || state.warehouse[0]).id;
-    productAnalytics.track('tea_stock_added', { candidate_id: candidate.serverCandidateId || undefined, decision_version_id: state.decisionVersionId || undefined, metadata: { source: 'selection', screen: 'ownership' } });
-    addSelectionHistory(candidate);
-    completeSelectionFlow();
-    showToast('已加入茶仓库'); return setScreen('warehouse');
-  }
+  if (action === 'confirm-warehouse') return confirmWarehouseFromSelection();
   if (action === 'save-choice-only') { addSelectionHistory(currentCandidate()); completeSelectionFlow(); showToast('已保存选茶结果'); return setScreen('home'); }
   if (action === 'go-warehouse') return setScreen('warehouse');
   if (action === 'open-warehouse-add') return setScreen('warehouse-add');
   if (action === 'open-tea') { state.selectedTeaId=target.dataset.id; return setScreen('warehouse-detail'); }
   if (action === 'brew-this') { state.selectedTeaId=target.dataset.id; state.brew=null; return setScreen('prepare'); }
-  if (action === 'resume-tea') { const tea=getTea(target.dataset.id); if (tea) tea.status='drinking'; saveState(); return render(); }
-  if (action === 'set-tea-status') { const tea=getTea(); if (tea) tea.status=target.dataset.status; saveState(); return render(); }
+  if (action === 'resume-tea') return updateWarehouseStatus('drinking', target.dataset.id);
+  if (action === 'set-tea-status') return updateWarehouseStatus(target.dataset.status);
   if (action === 'go-journal') return setScreen('journal');
   if (action === 'open-day') { state.journalDate=target.dataset.date || journalDate(); return setScreen('journal-day'); }
   if (action === 'select-date') { const date=target.dataset.date; if (date > TODAY) return showToast('还未到这一天'); state.journalDate=date; return render(); }
@@ -1525,11 +1506,11 @@ document.addEventListener('click', event => {
   if (action === 'exit-brew') { if (state.brew && !window.confirm('要结束这次泡茶吗？未保存的记录会丢失。')) return; state.brew=null; return setScreen('journal-day'); }
   if (action === 'set-feedback') { setFeedback(target.dataset.field,target.dataset.value); saveState(); return render(); }
   if (action === 'go-advanced') { const f=ensureBrew().feedback; if (!f.taste || !f.strength) return showToast('请先完成两项基础感受'); return setScreen('advanced'); }
-  if (action === 'save-record') { const f=ensureBrew().feedback; if (!f.taste || !f.strength) return showToast('请先完成两项基础感受'); saveBrewRecord(); return setScreen('brew-result'); }
+  if (action === 'save-record') { const f=ensureBrew().feedback; if (!f.taste || !f.strength) return showToast('请先完成两项基础感受'); return saveBrewRecord().then(saved => { if (saved) setScreen('brew-result'); }); }
   if (action === 'analyze-brew-feedback') { const record=state.journalRecords.find(item=>item.id===target.dataset.id); const tea=record && getTea(record.teaId); if (record && tea) analyzeBrewRecord(record, tea); return; }
   if (action === 'open-record') { state.activeRecordId=target.dataset.id; return setScreen('record-detail'); }
   if (action === 'open-latest-record') { state.activeRecordId=state.journalRecords.at(-1)?.id; return setScreen('record-detail'); }
-  if (action === 'delete-record') { if (!window.confirm('确定删除这次泡茶记录吗？')) return; const recordId=state.activeRecordId; state.journalRecords=state.journalRecords.filter(item=>item.id!==recordId); GuanchaStores.preferenceEvidence.save({items:readPreferenceEvidence().filter(item=>item.source_brew_session_id!==recordId)}); saveState(); return setScreen('journal-day'); }
+  if (action === 'delete-record') { if (authenticatedPostPurchaseSyncAvailable()) return showToast('云端泡茶记录删除将在后续版本支持'); if (!window.confirm('确定删除这次泡茶记录吗？')) return; const recordId=state.activeRecordId; state.journalRecords=state.journalRecords.filter(item=>item.id!==recordId); GuanchaStores.preferenceEvidence.save({items:readPreferenceEvidence().filter(item=>item.source_brew_session_id!==recordId)}); saveState(); return setScreen('journal-day'); }
   if (action === 'show-evidence') return showToast('近期饮用证据：清爽花香、兰花与茉莉花偏好。');
   if (action === 'reset-demo') { if (!window.confirm('清除本地演示数据并恢复初始状态？')) return; stopRuntimeBusinessState(); GuanchaStores.clearAll(); state=authConfig.required ? freshAuthenticatedState() : structuredClone(defaultState); return setScreen('home'); }
   if (action === 'open-history') return showToast('选茶记录详情将在后续版本补齐');
@@ -1559,7 +1540,7 @@ document.addEventListener('submit', event => {
     const nextNeed = { taste:data.get('taste').trim()||'清爽花香', purpose:data.get('purpose').trim()||'送礼', budget:data.get('budget').trim()||'150–300 元' };
     saveSelectionNeed(nextNeed); return;
   }
-  if (form.dataset.action === 'save-stock') { const name=String(data.get('name')).trim(); if(!name) return showToast('请填写茶名'); state.warehouse.unshift({ id:`tea-${Date.now()}`, name, type:String(data.get('type'))||'不确定', aroma:String(data.get('aroma')).trim()||'不确定', status:'drinking', source:'手动入库', lastBrew:'还未泡过', records:0, art:'can', facts:['待补充'], risks:['产地与年份未记录'] }); saveState(); showToast('已加入茶仓库'); return setScreen('warehouse'); }
+  if (form.dataset.action === 'save-stock') { const name=String(data.get('name')).trim(); if(!name) return showToast('请填写茶名'); return addManualWarehouseTea(name, String(data.get('type')) || '不确定', String(data.get('aroma')).trim() || '不确定'); }
   if (form.dataset.action === 'save-plan') { const p=ensureBrew().plan; ['ware','water','grams','temp'].forEach(key=>p[key]=String(data.get(key)).trim()||p[key]); p.seconds=Math.min(60,Math.max(3,Number(data.get('seconds'))||10)); state.overlay=null; saveState(); render(); showToast('冲泡参数已更新'); }
 });
 document.addEventListener('input', event => {
@@ -1604,15 +1585,113 @@ function setFeedback(field, value) {
   if (field?.startsWith('advanced-')) { feedback.advanced[field.slice(9)]=value; return; }
   feedback[field] = field === 'score' ? Number(value) : value;
 }
-function saveBrewRecord() {
+function serverResourceId() { return GuanchaApi.createIdempotencyKey(); }
+function serverUuid(value) { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value) ? value : null; }
+function persistWarehouseTea(tea, expectedRevision = 0) {
+  if (!authenticatedPostPurchaseSyncAvailable()) return Promise.resolve(tea);
+  return GuanchaPostPurchaseSync.persistWarehouseTea({
+    api: apiClient, state, tea, expectedRevision,
+    saveLocal: () => saveState(),
+    notify: message => showToast(message),
+    onConflict: () => showToast('这款茶已在其他设备更新，请重新确认后再保存。'),
+  });
+}
+function persistJournalEntry(record, expectedRevision = 0) {
+  if (!authenticatedPostPurchaseSyncAvailable()) return Promise.resolve(record);
+  return GuanchaPostPurchaseSync.persistJournalEntry({
+    api: apiClient, state, record, expectedRevision,
+    saveLocal: () => saveState(),
+    notify: message => showToast(message),
+    onConflict: () => showToast('这份记录已在其他设备更新，请重新确认后再保存。'),
+  });
+}
+function warehouseTeaFromCandidate(candidate) {
+  const extracted = evidenceByField(candidate.extraction);
+  return {
+    id: serverResourceId(), name: candidate.name, product_name: candidate.name,
+    type: extracted.tea_category || candidate.type.split('·')[0].trim(),
+    tea_category: extracted.tea_category || null, tea_subtype: extracted.tea_subtype || null,
+    origin: extracted.origin || null, roast_or_style: extracted.roast_or_style || null,
+    aroma: extracted.aroma_claims || candidate.type.split('·')[1]?.trim() || '不确定',
+    risk_flags: candidate.riskFlags || [], extraction_version_id: serverUuid(candidate.extractionVersionId),
+    candidate_id: serverUuid(candidate.serverCandidateId), selection_session_id: serverUuid(state.sessionId),
+    decision_version_id: serverUuid(state.decisionVersionId),
+    joined_at: new Date().toISOString(), status: 'drinking', source_type: 'selection',
+    source: state.ownershipChoice === 'bought' ? '本次购入' : '已有茶叶',
+    lastBrew: '还未泡过', records: 0, art: 'can', facts: ['来自本次截图提取'],
+    risks: candidate.riskFlags?.length ? candidate.riskFlags : ['产地与年份待补'],
+  };
+}
+async function confirmWarehouseFromSelection() {
+  const candidate = currentCandidate() || { name: '春日乌龙', type: '乌龙茶 · 清香型' };
+  let existing = state.warehouse.find(item => item.name === candidate.name);
+  if (authenticatedPostPurchaseSyncAvailable() && !serverUuid(existing?.id)) existing = null;
+  if (!existing) {
+    const persisted = await persistWarehouseTea(warehouseTeaFromCandidate(candidate), 0);
+    if (!persisted) return;
+    existing = persisted;
+  }
+  state.selectedTeaId = existing.id;
+  productAnalytics.track('tea_stock_added', { candidate_id: candidate.serverCandidateId || undefined, decision_version_id: state.decisionVersionId || undefined, metadata: { source: 'selection', screen: 'ownership' } });
+  addSelectionHistory(candidate);
+  completeSelectionFlow();
+  showToast('已加入茶仓库');
+  return setScreen('warehouse');
+}
+async function addManualWarehouseTea(name, type, aroma) {
+  const tea = {
+    id: authenticatedPostPurchaseSyncAvailable() ? serverResourceId() : `tea-${Date.now()}`,
+    name, type: type || '不确定', tea_category: type || '不确定', aroma: aroma || '不确定',
+    status: 'drinking', source: '手动入库', source_type: 'manual', lastBrew: '还未泡过', records: 0,
+    art: 'can', facts: ['待补充'], risks: ['产地与年份未记录'], risk_flags: [],
+  };
+  const persisted = await persistWarehouseTea(tea, 0);
+  if (!persisted) return false;
+  if (!authenticatedPostPurchaseSyncAvailable()) {
+    state.warehouse.unshift(tea);
+    saveState();
+  }
+  showToast('已加入茶仓库');
+  setScreen('warehouse');
+  return true;
+}
+async function updateWarehouseStatus(status, teaId = state.selectedTeaId) {
+  const tea = getTea(teaId);
+  if (!tea) return;
+  if (authenticatedPostPurchaseSyncAvailable()) {
+    const persisted = await persistWarehouseTea({ ...tea, status }, tea.revision || 1);
+    if (!persisted) return;
+  } else {
+    tea.status = status;
+    saveState();
+  }
+  render();
+}
+async function saveBrewRecord() {
   const brew=ensureBrew(); const tea=getTea(brew.teaId); const actuals=brew.completed.length ? brew.completed : [{number:1,suggested:brew.plan.seconds,actual:brew.plan.seconds}];
   const suggestion=brew.feedback.strength==='偏淡'?'下次首泡可以延长约 2 秒':brew.feedback.strength==='偏浓'?'下次首泡可以缩短约 2 秒':'暂时保持本次参数';
-  const record={ id:`record-${Date.now()}`, date:journalDate(), teaId:tea.id, infusions:structuredClone(actuals), plan:structuredClone(brew.plan), feedback:structuredClone(brew.feedback), suggestion, createdAt:'现在' };
-  state.journalRecords.push(record); state.activeRecordId=record.id; tea.records=(tea.records||0)+1; tea.lastBrew='今天'; state.brew=null; saveState(); analyzeBrewRecord(record, tea);
+  const record={ id:authenticatedPostPurchaseSyncAvailable() ? serverResourceId() : `record-${Date.now()}`, date:journalDate(), teaId:tea.id, infusions:structuredClone(actuals), plan:structuredClone(brew.plan), feedback:structuredClone(brew.feedback), suggestion, createdAt:'现在' };
+  if (authenticatedPostPurchaseSyncAvailable()) {
+    const persisted = await persistJournalEntry(record, 0);
+    if (!persisted) return false;
+    record.id = persisted.id;
+  } else {
+    state.journalRecords.push(record);
+    saveState();
+  }
+  if (!authenticatedPostPurchaseSyncAvailable()) {
+    tea.records=(tea.records||0)+1;
+    tea.lastBrew=record.date;
+  }
+  state.activeRecordId=record.id; state.brew=null; saveState(); analyzeBrewRecord(record, tea);
+  return true;
 }
 function readPreferenceEvidence() { return GuanchaStores.preferenceEvidence.load({items:[]}).items; }
 function authenticatedPreferenceSyncAvailable() {
   return Boolean(apiClient.isConfigured && authClient && authClient.getState().status === 'authenticated');
+}
+function authenticatedPostPurchaseSyncAvailable() {
+  return Boolean(authenticatedPreferenceSyncAvailable() && window.GuanchaPostPurchaseSync);
 }
 async function hydrateAuthenticatedPreferences() {
   if (!authenticatedPreferenceSyncAvailable() || !window.GuanchaPreferenceSync) return { preferenceLoaded: false, evidenceLoaded: false };
@@ -1636,6 +1715,22 @@ function persistAuthenticatedPreferences() {
     notify: message => showToast(message),
     onConflict: () => showToast('其他设备已修改偏好，请确认后再编辑。'),
   });
+}
+async function hydrateAuthenticatedPostPurchase() {
+  if (!authenticatedPostPurchaseSyncAvailable()) return { warehouseLoaded: false, journalLoaded: false };
+  let syncErrorCode = null;
+  const result = await GuanchaPostPurchaseSync.hydrate({
+    api: apiClient,
+    state,
+    saveLocal: () => saveState(),
+    onError: code => { syncErrorCode = code; },
+  });
+  if (syncErrorCode || !result.warehouseLoaded || !result.journalLoaded) {
+    const error = new Error(syncErrorCode || 'post_purchase_sync_failed');
+    error.code = syncErrorCode || 'post_purchase_sync_failed';
+    throw error;
+  }
+  return result;
 }
 function savePreferenceEvidence(items) {
   const current = readPreferenceEvidence();
@@ -1696,6 +1791,7 @@ function authErrorCode(error) {
   if (error?.code === 'authentication_service_unavailable') return 'authentication_service_unavailable';
   if (error?.code === 'service_unavailable' || error?.code === 'database_not_configured') return 'database_not_configured';
   if (error?.code === 'invalid_access_token' || error?.code === 'authentication_required') return 'invalid_session';
+  if (error?.code === 'post_purchase_sync_failed' || error?.code === 'network_unavailable') return 'post_purchase_sync_failed';
   return 'authentication_service_unavailable';
 }
 function rebuildApiClient() {
@@ -1721,11 +1817,12 @@ async function enterAuthenticatedProduct() {
       state = freshAuthenticatedState();
     }
     const preferenceSync = await hydrateAuthenticatedPreferences();
+    const postPurchaseSync = await hydrateAuthenticatedPostPurchase();
     state.authView = null;
     authBootState = { status: 'authenticated', errorCode: null };
     appReady = true;
     render();
-    if (!preferenceSync.preferenceLoaded || !preferenceSync.evidenceLoaded) {
+    if (!preferenceSync.preferenceLoaded || !preferenceSync.evidenceLoaded || !postPurchaseSync.warehouseLoaded || !postPurchaseSync.journalLoaded) {
       showToast('偏好暂未从云端同步，已保留当前设置。');
     }
     resumeLiveBackendState();

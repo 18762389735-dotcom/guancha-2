@@ -146,8 +146,9 @@
   }
   function boundedString(value, limit = 160) { return typeof value === 'string' && value.length <= limit ? value : null; }
   function boundedNumber(value, minimum, maximum) { return typeof value === 'number' && Number.isFinite(value) && value >= minimum && value <= maximum ? value : null; }
-  const teaIdPattern = /^(?:tea-\d{1,16}|spring|peony|puer)$/;
-  const recordIdPattern = /^(?:record-\d{1,16}|demo-\d{4})$/;
+  const uuidIdPattern = '[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
+  const teaIdPattern = new RegExp(`^(?:${uuidIdPattern}|tea-\\d{1,16}|spring|peony|puer)$`, 'i');
+  const recordIdPattern = new RegExp(`^(?:${uuidIdPattern}|record-\\d{1,16}|demo-\\d{4})$`, 'i');
   const brewSourcePattern = /^(?:(?:record|brew)-[a-z0-9-]{1,40}|[0-9a-f]{8}-[0-9a-f-]{27})$/i;
   const preferenceTargetTypes = new Set(['tea-style','aroma','roast','bitterness','astringency','sweetness','mouthfeel','aftertaste','salivation','finish']);
   const preferencePolarities = new Set(['positive','negative']);
@@ -169,8 +170,11 @@
     if (['drinking','paused','finished'].includes(value.status)) result.status = value.status;
     if (['can','gaiwan','cup','bag'].includes(value.art)) result.art = value.art;
     if (Number.isInteger(value.records) && value.records >= 0 && value.records <= 10000) result.records = value.records;
-    for (const field of ['extraction_version_id','candidate_id','sourceDecisionId']) { const safe = safeUuid(value[field]); if (safe) result[field] = safe; }
+    for (const field of ['selection_session_id','extraction_version_id','candidate_id','decision_version_id','sourceDecisionId']) { const safe = safeUuid(value[field]); if (safe) result[field] = safe; }
     if (isIsoTimestamp(value.joined_at)) result.joined_at = value.joined_at;
+    if (isIsoTimestamp(value.created_at)) result.created_at = value.created_at;
+    if (isIsoTimestamp(value.updated_at)) result.updated_at = value.updated_at;
+    if (Number.isInteger(value.revision) && value.revision >= 1) result.revision = value.revision;
     result.facts = safeStringArray(value.facts, 8, 200).filter(item => warehouseFactTokens.has(item));
     result.risks = safeStringArray(value.risks, 8, 200).filter(item => warehouseRiskTokens.has(item) || decisionRiskTokens.has(item));
     result.risk_flags = safeStringArray(value.risk_flags, 8, 80).filter(item => decisionRiskTokens.has(item));
@@ -196,6 +200,8 @@
     const advanced = feedback.advanced && typeof feedback.advanced === 'object' && !Array.isArray(feedback.advanced) ? feedback.advanced : {};
     result.feedback.advanced = Object.fromEntries(['回甘','生津','余韵'].flatMap(field => { const safe = boundedString(advanced[field], 80); return safe === null ? [] : [[field, safe]]; }));
     for (const field of ['suggestion','createdAt']) { const safe = boundedString(value[field], 200); if (safe !== null) result[field] = safe; }
+    for (const field of ['created_at','updated_at']) if (isIsoTimestamp(value[field])) result[field] = value[field];
+    if (Number.isInteger(value.revision) && value.revision >= 1) result.revision = value.revision;
     return result;
   }
   function historyAnchor(value) {

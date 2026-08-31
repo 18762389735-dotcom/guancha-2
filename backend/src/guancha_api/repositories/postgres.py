@@ -50,6 +50,14 @@ class PreferenceRevisionConflict(RepositoryError):
     """A preference write was based on an out-of-date server revision."""
 
 
+class WarehouseRevisionConflict(RepositoryError):
+    """A warehouse write was based on an out-of-date server revision."""
+
+
+class BrewJournalRevisionConflict(RepositoryError):
+    """A Journal write was based on an out-of-date server revision."""
+
+
 class ImmutableVersionError(RepositoryError):
     pass
 
@@ -213,6 +221,46 @@ class StoredSelectionSessionSummary:
     updated_at: datetime
 
 
+@dataclass(frozen=True)
+class StoredWarehouseTea:
+    id: UUID
+    user_id: UUID
+    name: str
+    tea_category: str | None
+    tea_subtype: str | None
+    origin: str | None
+    roast_or_style: str | None
+    aroma: str | None
+    status: str
+    source_type: str
+    selection_session_id: UUID | None
+    candidate_id: UUID | None
+    extraction_version_id: UUID | None
+    decision_version_id: UUID | None
+    facts: list[object]
+    risks: list[object]
+    risk_flags: list[object]
+    joined_at: datetime
+    revision: int
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class StoredBrewJournalEntry:
+    id: UUID
+    user_id: UUID
+    tea_id: UUID
+    brewed_on: object
+    infusions: list[object]
+    plan: dict[str, object]
+    feedback: dict[str, object]
+    suggestion: str | None
+    revision: int
+    created_at: datetime
+    updated_at: datetime
+
+
 class PostgresPhase2Repository:
     """A connection-scoped repository; callers control connection lifetime."""
 
@@ -309,6 +357,163 @@ class PostgresPhase2Repository:
         if row is None:
             raise PreferenceRevisionConflict("Preference revision does not match")
         return self._stored_user_preferences(row)
+
+    async def list_user_warehouse_teas(
+        self, *, user_id: UUID, limit: int = 100
+    ) -> tuple[StoredWarehouseTea, ...]:
+        async with self._connection.cursor() as cursor:
+            await cursor.execute(
+                """select id, user_id, name, tea_category, tea_subtype, origin,
+                          roast_or_style, aroma, status, source_type,
+                          selection_session_id, candidate_id, extraction_version_id,
+                          decision_version_id, facts, risks, risk_flags, joined_at,
+                          revision, created_at, updated_at
+                   from user_warehouse_teas
+                   where user_id=%s
+                   order by updated_at desc, id desc
+                   limit %s""",
+                (user_id, min(limit, 100)),
+            )
+            rows = await cursor.fetchall()
+        return tuple(self._stored_warehouse_tea(row) for row in rows)
+
+    async def put_user_warehouse_tea(
+        self,
+        *,
+        user_id: UUID,
+        tea_id: UUID,
+        tea: dict[str, object],
+        expected_revision: int,
+    ) -> StoredWarehouseTea:
+        """Atomically create or CAS-update one authenticated warehouse tea."""
+        columns = (
+            tea["name"], tea.get("tea_category"), tea.get("tea_subtype"), tea.get("origin"),
+            tea.get("roast_or_style"), tea.get("aroma"), tea["status"], tea["source_type"],
+            tea.get("selection_session_id"), tea.get("candidate_id"),
+            tea.get("extraction_version_id"), tea.get("decision_version_id"),
+            psycopg.types.json.Jsonb(list(tea.get("facts") or [])),
+            psycopg.types.json.Jsonb(list(tea.get("risks") or [])),
+            psycopg.types.json.Jsonb(list(tea.get("risk_flags") or [])),
+        )
+        async with self._connection.transaction():
+            async with self._connection.cursor() as cursor:
+                if expected_revision == 0:
+                    await cursor.execute(
+                        """insert into user_warehouse_teas
+                           (id, user_id, name, tea_category, tea_subtype, origin,
+                            roast_or_style, aroma, status, source_type,
+                            selection_session_id, candidate_id, extraction_version_id,
+                            decision_version_id, facts, risks, risk_flags)
+                           values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           on conflict (id) do nothing
+                           returning id, user_id, name, tea_category, tea_subtype, origin,
+                                     roast_or_style, aroma, status, source_type,
+                                     selection_session_id, candidate_id, extraction_version_id,
+                                     decision_version_id, facts, risks, risk_flags, joined_at,
+                                     revision, created_at, updated_at""",
+                        (tea_id, user_id, *columns),
+                    )
+                else:
+                    await cursor.execute(
+                        """update user_warehouse_teas
+                           set name=%s, tea_category=%s, tea_subtype=%s, origin=%s,
+                               roast_or_style=%s, aroma=%s, status=%s, source_type=%s,
+                               selection_session_id=%s, candidate_id=%s,
+                               extraction_version_id=%s, decision_version_id=%s,
+                               facts=%s, risks=%s, risk_flags=%s,
+                               revision=revision+1, updated_at=now()
+                           where id=%s and user_id=%s and revision=%s
+                           returning id, user_id, name, tea_category, tea_subtype, origin,
+                                     roast_or_style, aroma, status, source_type,
+                                     selection_session_id, candidate_id, extraction_version_id,
+                                     decision_version_id, facts, risks, risk_flags, joined_at,
+                                     revision, created_at, updated_at""",
+                        (*columns, tea_id, user_id, expected_revision),
+                    )
+                row = await cursor.fetchone()
+                if row is None:
+                    await cursor.execute(
+                        "select user_id, revision from user_warehouse_teas where id=%s",
+                        (tea_id,),
+                    )
+                    existing = await cursor.fetchone()
+                    if existing is None:
+                        raise ResourceNotFound("Warehouse tea not found")
+                    if existing["user_id"] != user_id:
+                        raise OwnershipDenied("Warehouse tea belongs to another owner")
+                    raise WarehouseRevisionConflict("Warehouse tea revision does not match")
+        return self._stored_warehouse_tea(row)
+
+    async def list_user_brew_journal_entries(
+        self, *, user_id: UUID, limit: int = 365
+    ) -> tuple[StoredBrewJournalEntry, ...]:
+        async with self._connection.cursor() as cursor:
+            await cursor.execute(
+                """select id, user_id, tea_id, brewed_on, infusions, plan, feedback,
+                          suggestion, revision, created_at, updated_at
+                   from user_brew_journal_entries
+                   where user_id=%s
+                   order by brewed_on desc, created_at desc, id desc
+                   limit %s""",
+                (user_id, min(limit, 365)),
+            )
+            rows = await cursor.fetchall()
+        return tuple(self._stored_brew_journal_entry(row) for row in rows)
+
+    async def put_user_brew_journal_entry(
+        self,
+        *,
+        user_id: UUID,
+        entry_id: UUID,
+        entry: dict[str, object],
+        expected_revision: int,
+    ) -> StoredBrewJournalEntry:
+        """Atomically create or CAS-update one authenticated Journal entry."""
+        tea_id = entry["tea_id"]
+        infusions = psycopg.types.json.Jsonb(list(entry.get("infusions") or []))
+        plan = psycopg.types.json.Jsonb(dict(entry.get("plan") or {}))
+        feedback = psycopg.types.json.Jsonb(dict(entry.get("feedback") or {}))
+        async with self._connection.transaction():
+            async with self._connection.cursor() as cursor:
+                await cursor.execute(
+                    "select id from user_warehouse_teas where id=%s and user_id=%s",
+                    (tea_id, user_id),
+                )
+                if await cursor.fetchone() is None:
+                    raise OwnershipDenied("Journal tea belongs to another owner")
+                if expected_revision == 0:
+                    await cursor.execute(
+                        """insert into user_brew_journal_entries
+                           (id, user_id, tea_id, brewed_on, infusions, plan, feedback, suggestion)
+                           values (%s,%s,%s,%s,%s,%s,%s,%s)
+                           on conflict (id) do nothing
+                           returning id, user_id, tea_id, brewed_on, infusions, plan, feedback,
+                                     suggestion, revision, created_at, updated_at""",
+                        (entry_id, user_id, tea_id, entry["brewed_on"], infusions, plan, feedback, entry.get("suggestion")),
+                    )
+                else:
+                    await cursor.execute(
+                        """update user_brew_journal_entries
+                           set tea_id=%s, brewed_on=%s, infusions=%s, plan=%s, feedback=%s,
+                               suggestion=%s, revision=revision+1, updated_at=now()
+                           where id=%s and user_id=%s and revision=%s
+                           returning id, user_id, tea_id, brewed_on, infusions, plan, feedback,
+                                     suggestion, revision, created_at, updated_at""",
+                        (tea_id, entry["brewed_on"], infusions, plan, feedback, entry.get("suggestion"), entry_id, user_id, expected_revision),
+                    )
+                row = await cursor.fetchone()
+                if row is None:
+                    await cursor.execute(
+                        "select user_id, revision from user_brew_journal_entries where id=%s",
+                        (entry_id,),
+                    )
+                    existing = await cursor.fetchone()
+                    if existing is None:
+                        raise ResourceNotFound("Brew Journal entry not found")
+                    if existing["user_id"] != user_id:
+                        raise OwnershipDenied("Brew Journal entry belongs to another owner")
+                    raise BrewJournalRevisionConflict("Brew Journal revision does not match")
+        return self._stored_brew_journal_entry(row)
 
     async def list_user_preference_evidence(
         self, *, user_id: UUID, limit: int = 12
@@ -2142,4 +2347,27 @@ class PostgresPhase2Repository:
             issue_source=row["issue_source"],
             source_brew_session_id=row["source_brew_session_id"],
             created_at=row["created_at"],
+        )  # type: ignore[arg-type]
+
+    @staticmethod
+    def _stored_warehouse_tea(row: dict[str, object]) -> StoredWarehouseTea:
+        return StoredWarehouseTea(
+            id=row["id"], user_id=row["user_id"], name=row["name"],
+            tea_category=row["tea_category"], tea_subtype=row["tea_subtype"],
+            origin=row["origin"], roast_or_style=row["roast_or_style"], aroma=row["aroma"],
+            status=row["status"], source_type=row["source_type"],
+            selection_session_id=row["selection_session_id"], candidate_id=row["candidate_id"],
+            extraction_version_id=row["extraction_version_id"], decision_version_id=row["decision_version_id"],
+            facts=list(row["facts"] or []), risks=list(row["risks"] or []),
+            risk_flags=list(row["risk_flags"] or []), joined_at=row["joined_at"],
+            revision=int(row["revision"]), created_at=row["created_at"], updated_at=row["updated_at"],
+        )  # type: ignore[arg-type]
+
+    @staticmethod
+    def _stored_brew_journal_entry(row: dict[str, object]) -> StoredBrewJournalEntry:
+        return StoredBrewJournalEntry(
+            id=row["id"], user_id=row["user_id"], tea_id=row["tea_id"], brewed_on=row["brewed_on"],
+            infusions=list(row["infusions"] or []), plan=dict(row["plan"] or {}),
+            feedback=dict(row["feedback"] or {}), suggestion=row["suggestion"],
+            revision=int(row["revision"]), created_at=row["created_at"], updated_at=row["updated_at"],
         )  # type: ignore[arg-type]

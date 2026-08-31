@@ -43,6 +43,8 @@ from guancha_api.repositories.postgres import (
     IdempotencyConflict,
     OwnershipDenied,
     PreferenceRevisionConflict,
+    WarehouseRevisionConflict,
+    BrewJournalRevisionConflict,
     PostgresPhase2Repository,
     RepositoryError,
     ResourceNotFound,
@@ -339,6 +341,18 @@ def _register_exception_handlers(application: FastAPI) -> None:
             return error_response(status_code=503, code="ai_provider_error", message="Question generation failed; retry is safe.", retryable=True)
         if isinstance(exc, MerchantReplyNotAvailable):
             return error_response(status_code=409, code="question_not_available", message="The referenced follow-up question is not current.")
+        if isinstance(exc, WarehouseRevisionConflict):
+            return error_response(
+                status_code=409,
+                code="warehouse_revision_conflict",
+                message="Warehouse tea changed on another device. Refresh and edit again.",
+            )
+        if isinstance(exc, BrewJournalRevisionConflict):
+            return error_response(
+                status_code=409,
+                code="brew_journal_revision_conflict",
+                message="Brew Journal entry changed on another device. Refresh and edit again.",
+            )
         return error_response(status_code=500, code="internal_error", message="Persistence operation failed.")
 
     @application.exception_handler(psycopg.Error)
