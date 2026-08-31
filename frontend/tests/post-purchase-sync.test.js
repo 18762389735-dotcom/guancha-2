@@ -82,6 +82,20 @@ test('authenticated post-purchase API methods use bearer-only transport', async 
   }
 });
 
+test('journal payload keeps only server plan fields', () => {
+  const sync = loadSync();
+  const payload = sync.toJournalPayload({
+    id: journalId,
+    teaId,
+    date: '2026-08-31',
+    infusions: [],
+    plan: { ware: '盖碗', water: '110 ml', grams: '5 g', temp: '95℃', seconds: 10, unexpected: 'x' },
+    feedback: {},
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(payload.plan)), { ware: '盖碗', water: '110 ml', grams: '5 g', temp: '95℃' });
+  assert.deepEqual(Object.keys(payload.plan).sort(), ['grams', 'temp', 'ware', 'water']);
+});
+
 test('server-empty warehouse and journal replace old local cache without import', async () => {
   const sync = loadSync();
   const state = { warehouse: [{ id: 'tea-1', name: '旧本地茶' }], journalRecords: [{ id: 'record-1', teaId: 'tea-1', date: '2026-08-01' }], selectedTeaId: 'tea-1' };
