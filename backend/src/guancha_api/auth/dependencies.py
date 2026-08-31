@@ -1,6 +1,7 @@
 """FastAPI authentication dependencies for protected user-owned routes."""
 
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Annotated
 from uuid import UUID
 
@@ -74,13 +75,31 @@ async def get_authenticated_request_repository(
     request: Request,
     _: CurrentUser,
 ) -> AsyncIterator[object]:
-    """Yield a fresh repository for a protected `/me` operation when possible.
+    """Yield a fresh repository for a protected operation when possible.
 
     The production fix in P9-3.5D established that authenticated user work
     must not rely on the app-lifetime repository connection.  Retain injected
     repositories only for deterministic isolated tests, and never close them.
     """
 
+    async with _request_repository(request) as repository:
+        yield repository
+
+
+async def get_request_repository(request: Request) -> AsyncIterator[object]:
+    """Yield a request-scoped repository when the application provides one.
+
+    The worker factory is the production path for both authenticated and
+    anonymous request reads.  The injected application repository remains a
+    test-compatible fallback and is owned by the caller that injected it.
+    """
+
+    async with _request_repository(request) as repository:
+        yield repository
+
+
+@asynccontextmanager
+async def _request_repository(request: Request) -> AsyncIterator[object]:
     worker_repository_factory = getattr(request.app.state, "worker_repository_factory", None)
     if worker_repository_factory is not None:
         repository = await worker_repository_factory()
@@ -99,6 +118,7 @@ async def get_authenticated_request_repository(
 AuthenticatedRequestRepository = Annotated[
     object, Depends(get_authenticated_request_repository)
 ]
+RequestRepository = Annotated[object, Depends(get_request_repository)]
 
 
 async def get_owner_context(
