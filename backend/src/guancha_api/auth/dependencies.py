@@ -50,10 +50,19 @@ async def _resolve_authenticated_user(
             detail="authentication_service_unavailable",
         ) from None
 
-    repository = getattr(request.app.state, "repository", None)
-    if repository is None:
-        raise HTTPException(status_code=503, detail="database_not_configured")
-    app_user = await repository.resolve_or_create_app_user(identity.external_subject)
+    worker_repository_factory = getattr(request.app.state, "worker_repository_factory", None)
+    if worker_repository_factory is not None:
+        repository = await worker_repository_factory()
+        try:
+            app_user = await repository.resolve_or_create_app_user(identity.external_subject)
+            return CurrentUserInfo(id=app_user.id, created_at=app_user.created_at)
+        finally:
+            await repository.close()
+    else:
+        repository = getattr(request.app.state, "repository", None)
+        if repository is None:
+            raise HTTPException(status_code=503, detail="database_not_configured")
+        app_user = await repository.resolve_or_create_app_user(identity.external_subject)
     return CurrentUserInfo(id=app_user.id, created_at=app_user.created_at)
 
 

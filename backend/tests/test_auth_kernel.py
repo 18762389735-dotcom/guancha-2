@@ -4,6 +4,7 @@ import asyncio
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import httpx
@@ -15,6 +16,7 @@ from psycopg.rows import dict_row
 from guancha_api.auth.cloudbase import CloudBaseTokenVerifier, cloudbase_gateway_origin
 from guancha_api.auth.errors import AuthenticationServiceUnavailable, InvalidAccessToken
 from guancha_api.auth.fake import FakeTokenVerifier, UnconfiguredTokenVerifier
+from guancha_api.auth.dependencies import get_owner_context
 from guancha_api.auth.models import AppUser, VerifiedIdentity
 from guancha_api.main import create_app
 from guancha_api.repositories.postgres import PostgresPhase2Repository
@@ -37,6 +39,29 @@ class InMemoryAppUserRepository:
                 updated_at=now,
             )
         return self.users[cloudbase_user_id]
+
+
+class TrackingAppUserRepository:
+    def __init__(self, *, fail: bool = False) -> None:
+        now = datetime.now(timezone.utc)
+        self.user = AppUser(
+            id=uuid4(),
+            cloudbase_user_id="cloudbase-subject-a",
+            created_at=now,
+            updated_at=now,
+        )
+        self.fail = fail
+        self.resolve_calls: list[str] = []
+        self.close_calls = 0
+
+    async def resolve_or_create_app_user(self, cloudbase_user_id: str) -> AppUser:
+        self.resolve_calls.append(cloudbase_user_id)
+        if self.fail:
+            raise RuntimeError("synthetic repository failure")
+        return self.user
+
+    async def close(self) -> None:
+        self.close_calls += 1
 
 
 async def _request_client(app) -> httpx.AsyncClient:
@@ -265,6 +290,113 @@ async def test_me_resolves_stable_app_user_and_ignores_client_user_id() -> None:
     assert "cloudbase_user_id" not in first_body
     assert "access_token" not in first_body
     assert "refresh_token" not in first_body
+
+
+@pytest.mark.asyncio
+async def test_me_prefers_worker_repository_factory_and_closes_it_on_success() -> None:
+    fallback = TrackingAppUserRepository()
+    worker_repository = TrackingAppUserRepository()
+    factory_calls = 0
+
+    async def factory() -> TrackingAppUserRepository:
+        nonlocal factory_calls
+        factory_calls += 1
+        return worker_repository
+
+    app = create_app(
+        repository=fallback,
+        worker_repository_factory=factory,
+        token_verifier=FakeTokenVerifier(),
+    )
+    async with await _request_client(app) as client:
+        response = await client.get("/api/v1/me", headers={"Authorization": "Bearer valid-token-a"})
+
+    assert response.status_code == 200
+    assert factory_calls == 1
+    assert worker_repository.resolve_calls == ["cloudbase-user-a"]
+    assert worker_repository.close_calls == 1
+    assert fallback.resolve_calls == []
+    assert fallback.close_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_repository_factory_closes_repository_when_resolution_fails() -> None:
+    worker_repository = TrackingAppUserRepository(fail=True)
+
+    async def factory() -> TrackingAppUserRepository:
+        return worker_repository
+
+    app = create_app(worker_repository_factory=factory, token_verifier=FakeTokenVerifier())
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/v1/me", headers={"Authorization": "Bearer valid-token-a"})
+
+    assert response.status_code == 500
+    assert worker_repository.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_injected_repository_fallback_remains_available_without_worker_factory() -> None:
+    repository = TrackingAppUserRepository()
+    app = create_app(repository=repository, worker_repository_factory=None, token_verifier=FakeTokenVerifier())
+    async with await _request_client(app) as client:
+        response = await client.get("/api/v1/me", headers={"Authorization": "Bearer valid-token-a"})
+
+    assert response.status_code == 200
+    assert repository.resolve_calls == ["cloudbase-user-a"]
+    assert repository.close_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_authenticated_owner_uses_factory_user_and_has_no_anonymous_owner() -> None:
+    worker_repository = TrackingAppUserRepository()
+
+    async def factory() -> TrackingAppUserRepository:
+        return worker_repository
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                token_verifier=FakeTokenVerifier(),
+                worker_repository_factory=factory,
+            )
+        )
+    )
+    owner = await get_owner_context(request, "Bearer valid-token-a", str(uuid4()))
+
+    assert owner.user_id == worker_repository.user.id
+    assert owner.anonymous_client_id is None
+    assert worker_repository.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_missing_repositories_preserves_database_not_configured_contract() -> None:
+    app = create_app(repository=None, worker_repository_factory=None, token_verifier=FakeTokenVerifier())
+    async with await _request_client(app) as client:
+        response = await client.get("/api/v1/me", headers={"Authorization": "Bearer valid-token-a"})
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "service_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_two_authenticated_resolutions_get_and_close_independent_repositories() -> None:
+    repositories: list[TrackingAppUserRepository] = []
+
+    async def factory() -> TrackingAppUserRepository:
+        repository = TrackingAppUserRepository()
+        repositories.append(repository)
+        return repository
+
+    app = create_app(worker_repository_factory=factory, token_verifier=FakeTokenVerifier())
+    async with await _request_client(app) as client:
+        first = await client.get("/api/v1/me", headers={"Authorization": "Bearer valid-token-a"})
+        second = await client.get("/api/v1/me", headers={"Authorization": "Bearer valid-token-a"})
+
+    assert first.status_code == second.status_code == 200
+    assert len(repositories) == 2
+    assert repositories[0] is not repositories[1]
+    assert [repository.close_calls for repository in repositories] == [1, 1]
 
 
 @pytest_asyncio.fixture
