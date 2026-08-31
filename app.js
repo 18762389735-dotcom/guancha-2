@@ -852,7 +852,7 @@ function renderAuthGate() {
     return;
   }
   if (state?.authView === 'verify') {
-    app.innerHTML = '<section class="page auth-page"><article class="auth-card card"><h1>验证邮箱</h1><p>请输入邮件中的验证码。</p><form data-action="auth-verify"><label>验证码<input name="code" inputmode="numeric" autocomplete="one-time-code" required /></label><button class="primary-btn" type="submit">完成验证</button></form><button class="text-link" data-action="show-login">返回登录</button></article></section>';
+    app.innerHTML = '<section class="page auth-page"><article class="auth-card card"><h1>验证邮箱</h1><p>请输入邮件中的验证码，并再次输入密码完成注册。</p><form data-action="auth-verify"><label>验证码<input name="code" inputmode="numeric" autocomplete="one-time-code" required /></label><label>密码<input name="password" type="password" autocomplete="new-password" required /></label><label>确认密码<input name="confirm-password" type="password" autocomplete="new-password" required /></label><button class="primary-btn" type="submit">完成验证</button></form><button class="text-link" data-action="show-login">返回登录</button></article></section>';
     return;
   }
   app.innerHTML = '<section class="page auth-page"><article class="auth-card card"><h1>登录观茶</h1><p>登录后，你的选茶数据会按账号隔离。</p><form data-action="auth-login"><label>邮箱<input name="email" type="email" autocomplete="email" required /></label><label>密码<input name="password" type="password" autocomplete="current-password" required /></label><button class="primary-btn" type="submit">登录</button></form><button class="text-link" data-action="show-register">创建账号</button></article></section>';
@@ -1528,12 +1528,15 @@ document.addEventListener('submit', event => {
     if (!/^\S+@\S+\.\S+$/.test(email)) return showToast('请输入有效邮箱');
     if (!/^(?=.*[A-Za-z])(?=.*\d).{8,32}$/.test(password)) return showToast('密码需为 8–32 位，并包含字母和数字');
     if (password !== confirmation) return showToast('两次输入的密码不一致');
-    return authClient.startSignUp(email, password).then(() => { state.authView = 'verify'; render(); }).catch(() => showToast('注册暂时不可用，请稍后重试。'));
+    return authClient.startSignUp(email).then(() => { state.authView = 'verify'; render(); }).catch((error) => showToast(error?.message || '注册暂时不可用，请稍后重试。'));
   }
   if (form.dataset.action === 'auth-verify') {
     const code = String(data.get('code') || '').trim();
+    const password = String(data.get('password') || ''); const confirmation = String(data.get('confirm-password') || '');
     if (!code) return showToast('请输入验证码');
-    return authClient.verifySignUp(code).then(completeAuthLogin).catch(() => showToast('验证码无效或已过期，请重试。'));
+    if (!/^(?=.*[A-Za-z])(?=.*\d).{8,32}$/.test(password)) return showToast('密码需为 8–32 位，并包含字母和数字');
+    if (password !== confirmation) return showToast('两次输入的密码不一致');
+    return authClient.verifySignUp(code, password).then(completeAuthLogin).catch((error) => showToast(error?.message || '验证码无效或已过期，请重试。'));
   }
   if (form.dataset.action === 'submit-merchant-reply') { const reply=String(data.get('merchant-reply') || '').trim(); if (reply) { productAnalytics.track('merchant_reply_started', { candidate_id: currentCandidate()?.serverCandidateId, decision_version_id: state.decisionVersionId || undefined, metadata: { screen: state.screen } }); submitMerchantReply(reply); } return; }
   if (form.dataset.action === 'save-needs') {

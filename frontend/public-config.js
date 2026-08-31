@@ -36,7 +36,7 @@
     const validProvider = input.provider === 'cloudbase';
     return {
       required,
-      configured: input.configured === true && validProvider && validRegion && Boolean(envId && publishableKey),
+      configured: input.configured === true && validProvider && validRegion && Boolean(envId),
       provider: 'cloudbase',
       envId,
       region: validRegion ? region : DEFAULT.auth.region,

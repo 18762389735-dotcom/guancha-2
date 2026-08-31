@@ -29,7 +29,7 @@
       const controller = global.AbortController ? new global.AbortController() : null;
       const timer = controller ? global.setTimeout(() => controller.abort(), timeoutMs) : null;
       return global.fetch(`${baseUrl}${path}`, {
-        method, headers: { Accept: 'application/json', ...headers }, body: payload === null ? undefined : payload,
+        method, credentials: 'same-origin', headers: { Accept: 'application/json', ...headers }, body: payload === null ? undefined : payload,
         ...(controller ? { signal: controller.signal } : {}),
       }).then(async (response) => ({ ok: response.ok, body: await response.json().catch(() => null) }))
         .catch(() => ({ ok: false, body: { error: { code: 'network_unavailable', message: 'Network request failed.' } } }))
