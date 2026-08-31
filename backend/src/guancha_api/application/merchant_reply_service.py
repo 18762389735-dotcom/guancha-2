@@ -63,6 +63,10 @@ class MerchantReplyService:
             )
             if accepted and self.event_sink:
                 safe_emit_server(self.event_sink, event_name="rejudge_started", resource_id=job.id, anonymous_session_id=analytics_session_id, stage="queued", metadata={"processing_mode": job.processing_mode.value if job.processing_mode else "test-fixture"})
+            if accepted and isinstance(task_runner, InProcessTaskRunner):
+                job = await self.repository.get_job_for_client(
+                    job_id=job.id, client_id=repo_owner
+                )
         return job
 
     async def run_rejudge(

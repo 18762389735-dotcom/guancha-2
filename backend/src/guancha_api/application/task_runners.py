@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-import asyncio
-import logging
 from collections.abc import Awaitable, Callable
-
-
-logger = logging.getLogger(__name__)
 
 
 class TaskEnqueueError(RuntimeError):
@@ -13,48 +8,27 @@ class TaskEnqueueError(RuntimeError):
 
 
 class InProcessTaskRunner:
-    """Schedule background work without holding the request coroutine open."""
+    """Run accepted work to completion before returning to the request."""
 
     def __init__(self) -> None:
-        self._active_tasks: set[asyncio.Task[None]] = set()
         self._active_job_ids: set[object] = set()
 
     @property
     def active_count(self) -> int:
-        return len(self._active_tasks)
+        return len(self._active_job_ids)
 
     async def enqueue(self, *, job_id: object, task: Callable[[], Awaitable[None]]) -> bool:
         if job_id in self._active_job_ids:
             return False
-        scheduled = asyncio.create_task(task(), name=f"guancha-job-{job_id}")
         self._active_job_ids.add(job_id)
-        self._active_tasks.add(scheduled)
-        scheduled.add_done_callback(lambda completed: self._on_done(job_id, completed))
+        try:
+            await task()
+        finally:
+            self._active_job_ids.discard(job_id)
         return True
 
-    def _on_done(self, job_id: object, task: asyncio.Task[None]) -> None:
-        self._active_tasks.discard(task)
-        self._active_job_ids.discard(job_id)
-        if task.cancelled():
-            logger.info("background_task_cancelled", extra={"job_id": str(job_id)})
-            return
-        exception = task.exception()
-        if exception is not None:
-            logger.error(
-                "background_task_failed",
-                extra={"job_id": str(job_id), "exception_type": type(exception).__name__},
-                exc_info=exception,
-            )
-
     async def shutdown(self) -> None:
-        """Cancel and await remaining work during application shutdown."""
-        tasks = tuple(self._active_tasks)
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._active_tasks.difference_update(tasks)
-        self._active_job_ids.clear()
+        """Request-bound work is already complete when shutdown is reached."""
 
 
 class ManualTaskRunner:

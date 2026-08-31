@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
@@ -18,7 +17,7 @@ from guancha_api.schemas.contracts import ErrorCode, JobState, ProcessingMode
 pytestmark = pytest.mark.asyncio
 
 
-async def test_in_process_runner_enqueues_without_blocking_and_shutdowns() -> None:
+async def test_in_process_runner_waits_for_request_bound_work_and_shutdowns() -> None:
     started = asyncio.Event()
     release = asyncio.Event()
 
@@ -27,25 +26,23 @@ async def test_in_process_runner_enqueues_without_blocking_and_shutdowns() -> No
         await release.wait()
 
     runner = InProcessTaskRunner()
-    await runner.enqueue(job_id=uuid4(), task=task)
+    running = asyncio.create_task(runner.enqueue(job_id=uuid4(), task=task))
     await asyncio.wait_for(started.wait(), timeout=0.1)
     assert runner.active_count == 1
     release.set()
-    await asyncio.sleep(0)
+    assert await running is True
+    assert runner.active_count == 0
     await runner.shutdown()
     assert runner.active_count == 0
 
 
-async def test_in_process_runner_logs_background_exception(caplog: pytest.LogCaptureFixture) -> None:
+async def test_in_process_runner_propagates_request_bound_exception() -> None:
     async def task() -> None:
         raise RuntimeError("expected")
 
     runner = InProcessTaskRunner()
-    with caplog.at_level(logging.ERROR):
+    with pytest.raises(RuntimeError, match="expected"):
         await runner.enqueue(job_id="job-1", task=task)
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-    assert any(record.message == "background_task_failed" for record in caplog.records)
     assert runner.active_count == 0
 
 
@@ -82,9 +79,11 @@ async def test_runners_reject_same_pending_job_and_release_identity_after_comple
     release = asyncio.Event()
     async def blocked() -> None: await release.wait()
     active = InProcessTaskRunner()
-    assert await active.enqueue(job_id="same", task=blocked) is True
+    running = asyncio.create_task(active.enqueue(job_id="same", task=blocked))
+    await asyncio.sleep(0)
     assert await active.enqueue(job_id="same", task=blocked) is False
-    release.set(); await asyncio.sleep(0); await asyncio.sleep(0)
+    release.set()
+    assert await running is True
     assert await active.enqueue(job_id="same", task=work) is True
     await active.shutdown()
 
