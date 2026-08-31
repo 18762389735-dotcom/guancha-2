@@ -80,4 +80,5 @@ jobs:
           backend/tests/test_auth_kernel.py
           backend/tests/test_phase9_user_ownership.py
           backend/tests/test_phase9_4a_preferences.py
+          backend/tests/test_phase9_4b_post_purchase.py
           -q

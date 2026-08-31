@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 import re
 from uuid import UUID
@@ -183,6 +183,8 @@ class ErrorCode(StrEnum):
     AUTHENTICATION_SERVICE_UNAVAILABLE = "authentication_service_unavailable"
     AUTH_NOT_CONFIGURED = "auth_not_configured"
     PREFERENCES_REVISION_CONFLICT = "preferences_revision_conflict"
+    WAREHOUSE_REVISION_CONFLICT = "warehouse_revision_conflict"
+    BREW_JOURNAL_REVISION_CONFLICT = "brew_journal_revision_conflict"
     CONTRACT_NOT_IMPLEMENTED = "contract_not_implemented"
     INTERNAL_ERROR = "internal_error"
 
@@ -286,6 +288,104 @@ class UserPreferencesResponse(ContractModel):
 
 class PutUserPreferencesRequest(ContractModel):
     profile: PreferenceProfile
+    expected_revision: int = Field(ge=0)
+
+
+class WarehouseTeaInput(ContractModel):
+    name: str = Field(min_length=1, max_length=120)
+    tea_category: str | None = Field(default=None, max_length=80)
+    tea_subtype: str | None = Field(default=None, max_length=120)
+    origin: str | None = Field(default=None, max_length=200)
+    roast_or_style: str | None = Field(default=None, max_length=120)
+    aroma: str | None = Field(default=None, max_length=120)
+    status: str = Field(pattern=r"^(drinking|paused|finished)$")
+    source_type: str = Field(pattern=r"^(manual|selection)$")
+    selection_session_id: UUID | None = None
+    candidate_id: UUID | None = None
+    extraction_version_id: UUID | None = None
+    decision_version_id: UUID | None = None
+    facts: tuple[str, ...] = Field(default=(), max_length=8)
+    risks: tuple[str, ...] = Field(default=(), max_length=8)
+    risk_flags: tuple[str, ...] = Field(default=(), max_length=8)
+
+    @model_validator(mode="after")
+    def validate_bounded_arrays(self) -> "WarehouseTeaInput":
+        for field_name, limit in (("facts", 200), ("risks", 200), ("risk_flags", 80)):
+            if any(len(value) > limit for value in getattr(self, field_name)):
+                raise ValueError(f"{field_name} item is too long")
+        return self
+
+
+class WarehouseTea(WarehouseTeaInput):
+    id: UUID
+    joined_at: datetime
+    revision: int = Field(ge=1)
+    created_at: datetime
+    updated_at: datetime
+
+
+class PutWarehouseTeaRequest(ContractModel):
+    tea: WarehouseTeaInput
+    expected_revision: int = Field(ge=0)
+
+
+class BrewInfusion(ContractModel):
+    number: int = Field(ge=1, le=20)
+    suggested: float = Field(ge=0, le=600)
+    actual: float = Field(ge=0, le=600)
+
+
+class BrewPlan(ContractModel):
+    ware: str | None = Field(default=None, max_length=40)
+    water: str | None = Field(default=None, max_length=40)
+    grams: str | None = Field(default=None, max_length=40)
+    temp: str | None = Field(default=None, max_length=40)
+
+
+class BrewFeedback(ContractModel):
+    taste: str | None = Field(default=None, max_length=80)
+    strength: str | None = Field(default=None, max_length=80)
+    tags: tuple[str, ...] = Field(default=(), max_length=3)
+    aroma: tuple[str, ...] = Field(default=(), max_length=3)
+    impression: str | None = Field(default=None, max_length=500)
+    score: int | None = Field(default=None, ge=1, le=5)
+    repurchase: str | None = Field(default=None, max_length=80)
+    advanced: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("advanced")
+    @classmethod
+    def validate_advanced(cls, value: dict[str, str]) -> dict[str, str]:
+        allowed = {"回甘", "生津", "余韵"}
+        if any(key not in allowed or len(item) > 80 for key, item in value.items()):
+            raise ValueError("unsupported advanced feedback")
+        return value
+
+    @field_validator("tags", "aroma")
+    @classmethod
+    def validate_feedback_tokens(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(len(item) > 40 for item in value):
+            raise ValueError("feedback item is too long")
+        return value
+
+
+class BrewJournalEntryInput(ContractModel):
+    tea_id: UUID
+    brewed_on: date
+    infusions: tuple[BrewInfusion, ...] = Field(default=(), max_length=20)
+    plan: BrewPlan = Field(default_factory=BrewPlan)
+    feedback: BrewFeedback = Field(default_factory=BrewFeedback)
+    suggestion: str | None = Field(default=None, max_length=500)
+
+
+class BrewJournalEntry(BrewJournalEntryInput):
+    id: UUID
+    revision: int = Field(ge=1)
+    created_at: datetime
+    updated_at: datetime
+
+
+class PutBrewJournalEntryRequest(ContractModel):
+    entry: BrewJournalEntryInput
     expected_revision: int = Field(ge=0)
 
 

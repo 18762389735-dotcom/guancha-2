@@ -43,6 +43,10 @@ from guancha_api.schemas.contracts import (
     SelectionSessionSummary,
     UploadCandidateImageResponse,
     UserPreferencesResponse,
+    BrewJournalEntry,
+    PutBrewJournalEntryRequest,
+    PutWarehouseTeaRequest,
+    WarehouseTea,
     canonical_empty_preference_profile,
 )
 
@@ -254,6 +258,78 @@ async def list_my_selection_sessions(
         )
         for session in sessions
     )
+
+
+def _warehouse_tea(value: object) -> WarehouseTea:
+    return WarehouseTea(
+        id=value.id, name=value.name, tea_category=value.tea_category, tea_subtype=value.tea_subtype,
+        origin=value.origin, roast_or_style=value.roast_or_style, aroma=value.aroma,
+        status=value.status, source_type=value.source_type,
+        selection_session_id=value.selection_session_id, candidate_id=value.candidate_id,
+        extraction_version_id=value.extraction_version_id, decision_version_id=value.decision_version_id,
+        facts=tuple(value.facts), risks=tuple(value.risks), risk_flags=tuple(value.risk_flags),
+        joined_at=value.joined_at, revision=value.revision, created_at=value.created_at, updated_at=value.updated_at,
+    )
+
+
+def _brew_journal_entry(value: object) -> BrewJournalEntry:
+    return BrewJournalEntry(
+        id=value.id, tea_id=value.tea_id, brewed_on=value.brewed_on,
+        infusions=tuple(value.infusions), plan=value.plan, feedback=value.feedback,
+        suggestion=value.suggestion, revision=value.revision,
+        created_at=value.created_at, updated_at=value.updated_at,
+    )
+
+
+@router.get("/me/warehouse", response_model=tuple[WarehouseTea, ...], tags=["auth"])
+async def get_my_warehouse(
+    current_user: CurrentUser,
+    repository: AuthenticatedRequestRepository,
+) -> tuple[WarehouseTea, ...]:
+    teas = await repository.list_user_warehouse_teas(user_id=current_user.id, limit=100)
+    return tuple(_warehouse_tea(tea) for tea in teas)
+
+
+@router.put("/me/warehouse/{tea_id}", response_model=WarehouseTea, tags=["auth"])
+async def put_my_warehouse(
+    tea_id: UUID,
+    request: PutWarehouseTeaRequest,
+    current_user: CurrentUser,
+    repository: AuthenticatedRequestRepository,
+) -> WarehouseTea:
+    stored = await repository.put_user_warehouse_tea(
+        user_id=current_user.id,
+        tea_id=tea_id,
+        tea=request.tea.model_dump(mode="python"),
+        expected_revision=request.expected_revision,
+    )
+    return _warehouse_tea(stored)
+
+
+@router.get("/me/brew-journal", response_model=tuple[BrewJournalEntry, ...], tags=["auth"])
+async def get_my_brew_journal(
+    current_user: CurrentUser,
+    repository: AuthenticatedRequestRepository,
+) -> tuple[BrewJournalEntry, ...]:
+    entries = await repository.list_user_brew_journal_entries(user_id=current_user.id, limit=365)
+    return tuple(_brew_journal_entry(entry) for entry in entries)
+
+
+@router.put("/me/brew-journal/{entry_id}", response_model=BrewJournalEntry, tags=["auth"])
+async def put_my_brew_journal(
+    entry_id: UUID,
+    request: PutBrewJournalEntryRequest,
+    current_user: CurrentUser,
+    repository: AuthenticatedRequestRepository,
+) -> BrewJournalEntry:
+    stored = await repository.put_user_brew_journal_entry(
+        user_id=current_user.id,
+        entry_id=entry_id,
+        entry=request.entry.model_dump(mode="python"),
+        expected_revision=request.expected_revision,
+    )
+    return _brew_journal_entry(stored)
+
 
 @router.post("/brew-feedback/analyze", response_model=BrewFeedbackAnalysisResponse)
 async def analyze_brew_feedback(
