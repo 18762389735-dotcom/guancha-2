@@ -250,13 +250,13 @@ class RegisterStartRequest(ContractModel):
 
 
 class RegisterStartResponse(ContractModel):
-    verification_id: str = Field(min_length=1, max_length=256)
+    verification_id: str = Field(min_length=1, max_length=8192)
     expires_in: int = Field(gt=0)
 
 
 class RegisterCompleteRequest(ContractModel):
     email: str = Field(min_length=3, max_length=320)
-    verification_id: str = Field(min_length=1, max_length=256)
+    verification_id: str = Field(min_length=1, max_length=8192)
     verification_code: str = Field(min_length=4, max_length=12, pattern=r"^\d+$")
     password: str = Field(min_length=8, max_length=32)
 

@@ -11,6 +11,8 @@ from guancha_api.schemas.contracts import (
     InformationStatus,
     JobState,
     PublicConfig,
+    RegisterCompleteRequest,
+    RegisterStartResponse,
     VerificationStatus,
 )
 
@@ -88,6 +90,20 @@ def test_public_auth_config_rejects_unknown_cloudbase_region(monkeypatch: pytest
     monkeypatch.setenv("CLOUDBASE_PUBLISHABLE_KEY", "public-test-key")
     monkeypatch.setenv("CLOUDBASE_REGION", "ap-unknown")
     assert client.get("/api/v1/config/public").json()["auth"]["configured"] is False
+
+
+def test_cloudbase_verification_id_contract_accepts_long_opaque_tokens() -> None:
+    verification_id = "v_" + ("opaque-token-" * 100)
+    start = RegisterStartResponse(verification_id=verification_id, expires_in=600)
+    complete = RegisterCompleteRequest(
+        email="new@example.com",
+        verification_id=verification_id,
+        verification_code="123456",
+        password="Password1",
+    )
+    assert len(verification_id) > 256
+    assert start.verification_id == verification_id
+    assert complete.verification_id == verification_id
 
 
 def test_openapi_contains_frozen_phase2_contract_paths() -> None:
