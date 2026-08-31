@@ -5,6 +5,7 @@ const test = require('node:test');
 const vm = require('node:vm');
 
 const source = fs.readFileSync(path.resolve(__dirname, '..', 'auth-client.js'), 'utf8');
+const appSource = fs.readFileSync(path.resolve(__dirname, '..', '..', 'app.js'), 'utf8');
 const userA = '11111111-1111-4111-8111-111111111111';
 const userB = '22222222-2222-4222-8222-222222222222';
 
@@ -36,6 +37,21 @@ function transportFor({ restored = false, failures = {} } = {}) {
   };
   return { transport, calls };
 }
+
+test('registration first step requests only email before verification', () => {
+  const registerStart = appSource.indexOf("if (state?.authView === 'register')");
+  const verifyStart = appSource.indexOf("if (state?.authView === 'verify')", registerStart);
+  const registerView = appSource.slice(registerStart, verifyStart);
+  assert.match(registerView, /name="email"/);
+  assert.match(registerView, /获取验证码/);
+  assert.doesNotMatch(registerView, /name="password"|name="confirm-password"/);
+
+  const submitStart = appSource.indexOf("if (form.dataset.action === 'auth-signup')");
+  const verifySubmitStart = appSource.indexOf("if (form.dataset.action === 'auth-verify')", submitStart);
+  const signupSubmit = appSource.slice(submitStart, verifySubmitStart);
+  assert.match(signupSubmit, /startSignUp\(email\)/);
+  assert.doesNotMatch(signupSubmit, /data\.get\('password'\)|data\.get\('confirm-password'\)/);
+});
 
 test('BFF login, registration verification, transient token and no frontend token persistence', async () => {
   const { auth, values } = load(); const fake = transportFor();

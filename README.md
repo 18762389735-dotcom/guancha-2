@@ -1,60 +1,110 @@
-# 观茶比赛版原型
+# 观茶 Guancha
 
-这是一个本地优先的比赛演示原型：匿名用户可建立一次选茶会话，添加 1–5 个候选茶、每个候选上传 1–2 张 JPEG/PNG 商品截图，并分别生成可追溯的提取任务与证据结果。
+观茶是一个 AI 辅助的选茶决策与冲泡记录产品：把个人口味、商品证据和真实饮用反馈连接起来，帮助用户更有依据地买茶、泡茶和回看结果。
 
-当前实现使用 FastAPI、PostgreSQL、私有临时图片存储边界和 FakeProvider。自动测试不会访问外部模型；真实 `openai` 或 `mimo` Provider 只能由服务端环境变量显式启用。
+## What it does
 
-当前能力、运行方式、前端基线和已知限制见 [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md)。旧阶段文档保留作历史对照，不应覆盖当前代码事实。
+观茶形成一条完整的产品闭环：
 
-## 当前能力
+```text
+口味偏好 → 购买需求 → 候选商品截图 → 结构化提取 / 证据
+→ 多候选决策 → 未知项 / 商家提问 → 商家回复
+→ 复判 / 差异 → 茶仓 → 泡茶日记 → 偏好证据
+```
 
-- 候选数量：每个会话最多 5 个；每个候选最多 2 张截图。
-- 第二张同候选截图会生成新的联合提取任务；旧 ExtractionVersion 保留，新版本才是当前结果。
-- 多候选相互隔离；证据始终绑定到本次任务输入图片，并强制标记为 `product-claim` / `unverified`。
-- 已删除图片或候选不会继续作为当前提取结果。
-- 候选提取完成后可生成当前比较结果、最小追问、商家回复与一次聚合复判；复判结果以 Delta 形式保留，不覆盖原始证据。
-- 前端保留既有界面，只接通候选、图片、状态与结果数据；茶仓仍是本地优先功能。
+## Product highlights
 
-## 本地运行
+- 基于证据的 AI 选茶决策，而不是只给出一个无解释的推荐。
+- 明确展示不确定性与未知项，允许用户向商家补充求证。
+- 商家回复可触发复判，并保留前后判断差异。
+- 偏好、偏好证据、选茶记录、茶仓和泡茶日记按账号归属并可跨设备恢复。
+- 泡茶反馈可以回流为后续偏好的低置信度证据。
 
-先建立后端虚拟环境并安装项目声明的开发依赖：
+## Architecture
+
+```text
+Browser / Vanilla JS
+          |
+          v
+       FastAPI
+       |      |
+       |      +--> CloudBase HTTP Auth
+       |
+       +--> PostgreSQL user-owned business data
+       |
+       +--> configured AI provider
+```
+
+- CloudBase：身份提供方。
+- FastAPI：认证、授权与应用边界。
+- PostgreSQL：持久化的用户业务数据。
+- 浏览器 localStorage / IndexedDB：缓存、恢复和 UI 状态，不是账号授权依据。
+
+## Authentication
+
+当前浏览器使用同源 Auth BFF：
+
+```text
+Browser → Guancha FastAPI → CloudBase HTTP Auth
+```
+
+支持邮箱验证码注册、邮箱密码登录、HttpOnly refresh cookie、页面刷新后的会话恢复和显式登出。access token 只在浏览器内存中使用，不写入浏览器持久化存储。FastAPI 通过 `app_users` 和 `CurrentUser` 解析账号归属；前端不能通过提交 `user_id` 取得授权。
+
+## User data currently persisted
+
+认证账号的服务端数据是权威来源，包括：
+
+- 偏好与偏好证据；
+- Selection sessions 及其 snapshot、候选、提取、决策、追问和商家回复链路；
+- 茶仓；
+- 泡茶日记。
+
+浏览器数据仍可作为同浏览器缓存、恢复和导航状态使用，但认证后的服务端数据会覆盖这些业务缓存。旧匿名数据不会自动认领。
+
+## Tech stack
+
+- Vanilla JS / HTML / CSS
+- FastAPI / Python
+- PostgreSQL
+- Tencent CloudBase Authentication
+- 外部 AI provider adapter（Fake / OpenAI / MiMo）
+- GitHub Actions
+
+## Local development
+
+创建后端环境并安装声明的开发依赖：
 
 ```powershell
 py -3.14 -m venv backend/.venv
 backend/.venv/Scripts/python -m pip install -e "./backend[dev]"
 ```
 
-设置本地测试或开发数据库 URL 后，以 FakeProvider 启动：
+本地运行需要一个可安全使用的 PostgreSQL，并显式选择 Fake provider：
 
 ```powershell
-$env:GUANCHA_DATABASE_URL="postgresql://<user>:<password>@127.0.0.1:5432/<database>"
+$env:GUANCHA_DATABASE_URL="<local-postgresql-url>"
 $env:GUANCHA_PROVIDER="fake"
 backend/.venv/Scripts/python -m uvicorn guancha_api.main:app --app-dir backend/src --host 127.0.0.1 --port 8000
 ```
 
-浏览器访问 `http://127.0.0.1:8000/`；健康检查与 OpenAPI 分别位于 `/health`、`/openapi.json`。
-
-运行测试时，`TEST_DATABASE_URL` 必须指向一个可安全重建 schema 的独立 PostgreSQL 测试数据库：
+浏览器访问 `http://127.0.0.1:8000/`。测试数据库必须是独立、可重建的非生产数据库：
 
 ```powershell
-$env:TEST_DATABASE_URL="postgresql://<user>:<password>@127.0.0.1:5432/<test_database>"
-$env:GUANCHA_DATABASE_URL=$env:TEST_DATABASE_URL
+$env:TEST_DATABASE_URL="<isolated-test-postgresql-url>"
 backend/.venv/Scripts/python -m pytest backend/tests -q
 node --check app.js
-node --test frontend/tests/mvp-client.test.js
+node --check frontend/auth-client.js
+node --check frontend/api-client.js
+node --test frontend/tests/*.test.js
 ```
 
-## 目录
+代码实际读取的配置变量包括：`GUANCHA_DATABASE_URL`、`TEST_DATABASE_URL`、`GUANCHA_PROVIDER`、`PORT`、`GUANCHA_AUTH_REQUIRED`、`CLOUDBASE_ENV_ID`、`CLOUDBASE_REGION`、`CLOUDBASE_PUBLISHABLE_KEY`、`GUANCHA_AUTH_COOKIE_SECURE`、`GUANCHA_OPENAI_MODEL`、`OPENAI_API_KEY`、`GUANCHA_MIMO_MODEL`、`MIMO_API_KEY`、`MIMO_BASE_URL`、`ADMIN_API_TOKEN` 和 `GUANCHA_PRODUCT_EVENT_LOG_PATH`。密钥类变量只应通过本地环境或部署平台的 secret store 提供，不应写入 Git、前端或日志。
 
-- `app.js`、`index.html`、`styles.css`：现有比赛版界面。
-- `frontend/`：API Client、Adapter、状态与本地存储边界。
-- `backend/src/guancha_api/`：FastAPI、应用服务、Repository、Provider、任务执行器与图片存储接口。
-- `supabase/migrations/`：仅用于本地 PostgreSQL 测试和未来迁移的 SQL；当前不连接真实 Supabase。
-- `backend/tests/`：合同、Repository、图片管线、任务与多候选/双图回归测试。
+## Known limitations
 
-## 已知限制
-
-- 当前仅覆盖铁观音比赛范围；不做登录、云端茶仓、独立 OCR、第三张以上图片、跨会话长期账号数据、泡茶日记或买后分析。
-- 自动测试只使用 FakeProvider，不会读取或请求 OpenAI Key。
-- 私有规范化图片会保留到用户删除对应图片或候选，以便第二张图能与第一张图联合提取；没有生产级过期清理器。
-- 尚未连接真实 Supabase、云对象存储或生产队列。
+- 原始候选截图目前是短生命周期的私有临时对象；跨重启、跨设备的持久图片展示尚未完成，属于 P9-4C。
+- 忘记密码 / 账号恢复尚未实现。
+- CAPTCHA 仅有可识别的错误边界，尚未实现交互式 CAPTCHA UI；只有真实 CloudBase 流程触发时才需要单独处理。
+- 旧匿名浏览器数据不会自动认领或导入到新账号。
+- 泡茶日记云端删除尚未纳入当前产品流程。
+- 自动化测试使用 Fake provider，不会调用真实 AI provider。

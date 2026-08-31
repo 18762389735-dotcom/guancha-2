@@ -848,7 +848,7 @@ function renderAuthGate() {
     return;
   }
   if (state?.authView === 'register') {
-    app.innerHTML = '<section class="page auth-page"><article class="auth-card card"><h1>创建账号</h1><p>注册后可在不同设备继续使用选茶记录。</p><form data-action="auth-signup"><label>邮箱<input name="email" type="email" autocomplete="email" required /></label><label>密码<input name="password" type="password" autocomplete="new-password" required /></label><label>确认密码<input name="confirm-password" type="password" autocomplete="new-password" required /></label><button class="primary-btn" type="submit">注册</button></form><button class="text-link" data-action="show-login">已有账号？去登录</button></article></section>';
+    app.innerHTML = '<section class="page auth-page"><article class="auth-card card"><h1>创建账号</h1><p>注册后可在不同设备继续使用选茶记录。</p><form data-action="auth-signup"><label>邮箱<input name="email" type="email" autocomplete="email" required /></label><button class="primary-btn" type="submit">获取验证码</button></form><button class="text-link" data-action="show-login">已有账号？去登录</button></article></section>';
     return;
   }
   if (state?.authView === 'verify') {
@@ -1524,10 +1524,8 @@ document.addEventListener('submit', event => {
     return authClient.signIn(email, password).then(completeAuthLogin).catch(() => showToast('邮箱或密码不正确，请重试。'));
   }
   if (form.dataset.action === 'auth-signup') {
-    const email = String(data.get('email') || '').trim(); const password = String(data.get('password') || ''); const confirmation = String(data.get('confirm-password') || '');
+    const email = String(data.get('email') || '').trim();
     if (!/^\S+@\S+\.\S+$/.test(email)) return showToast('请输入有效邮箱');
-    if (!/^(?=.*[A-Za-z])(?=.*\d).{8,32}$/.test(password)) return showToast('密码需为 8–32 位，并包含字母和数字');
-    if (password !== confirmation) return showToast('两次输入的密码不一致');
     return authClient.startSignUp(email).then(() => { state.authView = 'verify'; render(); }).catch((error) => showToast(error?.message || '注册暂时不可用，请稍后重试。'));
   }
   if (form.dataset.action === 'auth-verify') {

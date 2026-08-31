@@ -1,54 +1,74 @@
-# 观茶 Beta 产品当前状态
+# 观茶当前产品状态
 
-更新日期：2026-08-31。本文记录 Phase 9-3 完成后的真实能力边界、运行方式和当前产品化状态；历史阶段文档仅作对照，不覆盖本文。
+更新日期：2026-08-31。
 
-## 当前定位
+## 状态
 
-观茶已进入 Beta 产品化阶段。目标是形成真实可注册、可登录、数据按用户隔离、可跨设备恢复的 AI 茶叶购买决策与冲泡记录产品。认证服务确定为 Tencent CloudBase Authentication。backend 已完成 Phase 9-1 token verification kernel 与 Phase 9-2 Selection ownership；Phase 9-3 已增加前端 `@cloudbase/js-sdk` v3.8.2 auth boundary、账号 UI 与 authenticated Selection transport，但尚未用真实 CloudBase console/runtime 配置验证。
+Interview-ready release candidate after P9-5A。当前文档描述正式集成分支上的实际代码能力；最终发布仍需要按发布清单完成目标环境验证。
 
-## 已完成
+## 当前能力
 
-- anonymous client ownership（当前以 `X-Client-Id` 实现的匿名会话 ownership）。
-- Selection Session。
-- Candidate。
-- 图片上传、私有临时图片处理和图片读取/删除边界。
-- Extraction。
-- Evidence。
-- Decision。
-- Followup。
-- Merchant Reply。
-- Rejudge / Delta。
-- Brew Feedback bridge：后端 `/brew-feedback/analyze`、匿名 replay/idempotency，以及前端低置信偏好证据的本地桥接；这不是云端 Journal 持久化。
-- PostgreSQL 数据持久化与当前 Repository / Application / Domain 分层。
-- Fake / OpenAI / MiMo Provider。
-- 当前 Vanilla JS SPA 中的 Tea Warehouse / Journal UI；目前是浏览器本地用户数据与演示初始状态，不是用户级云端持久化。
-- `OwnerContext` 以及以 `selection_sessions.user_id` 为根的 authenticated Selection ownership；匿名 `X-Client-Id` 路径继续兼容。
-- authenticated / anonymous Selection idempotency scope、派生资源 root-session authorization，以及 A/B IDOR 测试（数据库测试需 `TEST_DATABASE_URL`）。
-- 前端 CloudBase Auth boundary：受限于精确固定的官方 v3.8.2 CDN、public runtime config、邮箱密码注册/验证码/登录/登出 UI、SDK session restore 与 `/api/v1/me` gate；自动化测试只使用 Fake SDK。
-- owner-scoped Selection API 的 transient Bearer transport：required-auth 模式没有 token 时拒绝本地请求，不会退回 `X-Client-Id`；Brew Feedback 和 events 保持既有匿名边界。
-- 浏览器账号边界：首次认证登录、账号切换和显式登出清理 `GuanchaStores`、pending IndexedDB image path、runtime object URL 与 `guancha.auth-user-id.v1` marker；旧 anonymous 本地数据不会自动认领。
+### 1. Account
 
-## 尚未完成
+- 邮箱验证码注册。
+- 邮箱密码登录。
+- 同源 FastAPI Auth BFF。
+- HttpOnly refresh cookie。
+- 页面刷新后的会话恢复。
+- 显式登出。
+- 账号边界清理，避免浏览器本地状态串号。
 
-- account recovery。
-- user-scoped warehouse persistence。
-- user-scoped journal persistence。
-- user preference cloud persistence。
-- authenticated Selection 的跨设备产品界面恢复与本地状态同步（当前后端可按用户读取，但尚无 session list / restore UI）。
+### 2. Selection
 
-当前已有 `app_users`、CloudBase token verifier、`/api/v1/me`、authenticated Selection ownership 和前端 Auth UI；这不代表 account recovery、用户级茶仓/Journal/偏好云端数据、跨设备本地状态同步或 legacy anonymous history claim 已实现。
+- 用户归属的 Selection session。
+- 候选与候选截图元数据。
+- 提取与证据。
+- 多候选决策。
+- 追问与商家回复。
+- 复判 / delta。
+- Selection discovery 与 snapshot restore。
 
-## 当前数据边界
+### 3. Long-term user state
 
-- 服务端选茶链路以 `selection_session` 为根：authenticated session 使用 `user_id`，legacy anonymous session 使用 `anonymous_client_id`；候选、图片、提取、决策、追问、商家回复和复判均通过 root session 授权。
-- O1 / O2 偏好、茶仓、Journal 和部分 UI session 仍保存在浏览器 localStorage；IndexedDB 只缓存待上传图片 Blob，用于本地上传恢复。认证账号切换/退出会清理这些浏览器状态，而不是上传或认领它们。
-- `recent_preference_evidence` 会作为当前选茶会话快照提交到服务端，但还不是用户偏好档案。
-- Brew Feedback replay 当前按匿名 client 与 feedback id 做幂等保存，不等同于用户级 Journal 或 Brew Record。
-- authenticated Selection 已具备服务端账号级隔离和跨设备读取；浏览器本地 Warehouse / Journal / Preferences 仍未账号化，也没有跨设备本地状态同步。
+- 用户偏好。
+- 偏好证据。
+- 茶仓。
+- 泡茶日记。
+- 对认证账号，服务端数据是权威来源，可跨设备恢复。
 
-## 运行方式
+### 4. Ownership model
 
-本地 Fake 演示：
+- CloudBase verified subject。
+- `app_users` 内部 UUID。
+- 服务端解析的 `user_id`。
+- 前端不能选择 `user_id`。
+- 出现 Bearer 时不会降级到匿名 owner。
+
+### 5. Cross-device behavior
+
+- 认证账号的持久业务状态从服务端恢复。
+- 浏览器 stores 只承担缓存、UI 和恢复辅助作用。
+- 账号切换与登出会清理账号相关的浏览器状态。
+- 旧匿名数据不会自动认领。
+
+### 6. Deferred items
+
+- P9-4C：跨重启、跨设备的原始截图持久化与展示。
+- 忘记密码 / 账号恢复。
+- 只有真实 provider 要求时才实现的交互式 CAPTCHA 流程。
+- 泡茶日记云端删除流程尚未纳入当前范围。
+
+## 数据边界
+
+- Selection 以 `selection_sessions` 为授权根；认证会话使用 `user_id`，历史匿名会话使用 `anonymous_client_id`。候选、图片、提取、决策、追问、商家回复和复判通过根会话授权。
+- 偏好与偏好证据分别持久化到用户资源；茶仓与泡茶日记分别持久化到用户资源，不放进通用 JSON 文档。
+- 认证账号的茶仓和泡茶日记由 PostgreSQL 提供跨设备持久化；`guancha.local-post-purchase.v1` 仅保留为缓存 / 恢复边界。
+- IndexedDB 只保存待上传图片 Blob。短生命周期临时图片由后端私有临时存储处理，不是 P9-4C 的持久图片方案。
+- `recent_preference_evidence` 作为当前选茶请求的输入快照提交；它与用户偏好证据资源相关，但不替代账号级偏好档案。
+
+## 运行与验证
+
+本地 Fake 演示需要：
 
 ```powershell
 $env:GUANCHA_DATABASE_URL = '<local-postgresql-url>'
@@ -56,29 +76,30 @@ $env:GUANCHA_PROVIDER = 'fake'
 backend\.venv\Scripts\python.exe backend\scripts\run_local.py
 ```
 
-浏览器访问 `http://127.0.0.1:8000/`。真实 MiMo 或 OpenAI Provider 只能在服务端通过环境变量显式启用；变量值不得写入文件、Git、前端或日志。
-
-## 验证命令
+验证命令：
 
 ```powershell
 backend\.venv\Scripts\python.exe -m pytest backend\tests -q
 node --check app.js
+node --check frontend/auth-client.js
+node --check frontend/api-client.js
 node --test frontend/tests/*.test.js
 ```
 
-后端测试如使用数据库，必须通过 `TEST_DATABASE_URL` 指向独立测试库；本轮不连接真实 CloudBase，也不使用真实 API Key。
+数据库测试必须将 `TEST_DATABASE_URL` 指向独立测试数据库；不得使用生产数据库。真实 provider 的密钥不得写入文件、Git、前端或日志。
 
-## 当前 Beta 保护边界
+## 保护边界
 
-- 认证接入必须保护已验收视觉基调、核心选茶链路、Evidence 边界、Candidate identity、Merchant reply identity、Rejudge / Delta、Provider contract 和当前测试体系。
-- 允许为确有产品需求新增 auth 页面、account 状态、必要的身份相关导航，以及 loading / unauthenticated 状态；不得借认证改造重设计整个产品，也不得迁移 React、Vue 或 Next.js。
-- 当前仍保留 `X-Client-Id` 匿名路径；后续 authenticated ownership 必须由服务端验证后的用户身份决定，不得由前端传入 `user_id`。
-- 第一版不得自动认领任意历史 anonymous data；如需迁移，必须另行设计显式、可审计的 migration/import 流程。
+- 认证、账号隔离、Selection ownership、Evidence 边界、Candidate identity、Merchant reply identity、Rejudge / Delta、Provider contract 和现有测试体系保持不变。
+- 保留 `X-Client-Id` 匿名路径；认证 ownership 必须来自服务端验证后的用户身份。
+- 不自动认领历史 anonymous data；如未来需要迁移，必须另行设计显式、可审计的流程。
 
-## 已知限制
+## 当前已知限制
 
-- 临时图片存储为进程内实现；服务重启会影响尚未完成或仍可重试的 Job。
-- 当前 Selection Session 有过期策略；authenticated restore 的保留期尚未确定。
-- Tea Warehouse / Journal 当前含浏览器本地状态和演示 seed，尚未形成账号级云端数据边界。
-- 尚无真实 CloudBase console/runtime smoke、账号恢复、Warehouse / Journal / Preferences 云端 CRUD，以及 legacy anonymous history claim/import；这些属于后续阶段。
-- Phase 9-0/9-2 的身份与 ownership 审计见 `docs/AUTH_MIGRATION_AUDIT.md`。
+- 临时图片存储不是跨设备的持久对象存储，服务重启会影响尚未完成或仍可重试的 Job。
+- Selection session 仍有既定过期策略，长期保留策略未在本阶段扩展。
+- 原始截图的持久化展示属于 P9-4C，当前不宣称已完成。
+- 忘记密码 / 账号恢复、交互式 CAPTCHA（除非真实 provider 触发）和泡茶日记云端删除不在当前阶段。
+- 旧匿名浏览器数据不会自动认领或导入认证账号。
+
+历史 Phase 9 身份与 ownership 审计见 [`docs/AUTH_MIGRATION_AUDIT.md`](AUTH_MIGRATION_AUDIT.md)；该文件是历史证据，不是当前状态的唯一说明。
