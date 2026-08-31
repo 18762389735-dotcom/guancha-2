@@ -4,7 +4,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Request, Response, UploadFile, status
 
-from guancha_api.auth.dependencies import AuthenticatedRequestRepository, CurrentUser, Owner
+from guancha_api.auth.dependencies import AuthenticatedRequestRepository, CurrentUser, Owner, RequestRepository
 from guancha_api.application.phase2_service import Phase2ExtractionService
 from guancha_api.application.decision_service import SessionDecisionService
 from guancha_api.application.question_service import QuestionGenerationService
@@ -345,8 +345,8 @@ async def list_candidates(session_id: UUID, owner: Owner, raw: Request) -> tuple
     return await _service(raw).list_candidates(owner=owner, session_id=session_id)
 
 @router.get("/selection-sessions/{session_id}/snapshot")
-async def get_selection_snapshot(session_id: UUID, owner: Owner, raw: Request) -> dict[str, object]:
-    return await _repo(raw).selection_snapshot_for_client(session_id=session_id, client_id=owner)
+async def get_selection_snapshot(session_id: UUID, owner: Owner, repository: RequestRepository) -> dict[str, object]:
+    return await repository.selection_snapshot_for_client(session_id=session_id, client_id=owner)
 
 @router.delete("/candidates/{candidate_id}", status_code=204)
 async def delete_candidate(candidate_id: UUID, owner: Owner, raw: Request, x_analytics_session_id: AnalyticsSession = None) -> None:
