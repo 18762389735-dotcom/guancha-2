@@ -21,6 +21,46 @@ function renderAnalysisFor(state) {
   return context.renderAnalysis();
 }
 
+function loadAnalysisLifecycle(context) {
+  const start = appSource.indexOf('async function reconcilePersistedCandidateJobs');
+  const end = appSource.indexOf('function startCandidatePolling', start);
+  assert.ok(start >= 0 && end > start);
+  vm.runInNewContext(
+    `${appSource.slice(start, end)}; globalThis.reconcilePersistedCandidateJobs = reconcilePersistedCandidateJobs; globalThis.startMvpAnalysis = startMvpAnalysis;`,
+    context,
+    { filename: 'app.js' },
+  );
+  return context;
+}
+
+function analysisContext(state, apiClient, overrides = {}) {
+  const context = {
+    state,
+    apiClient,
+    pendingImageRestore: Promise.resolve(),
+    validateAnalysisCandidates: () => true,
+    apiNeed: () => ({ need: 'test' }),
+    readPreferenceEvidence: () => [],
+    runtimeImages: new Map(),
+    saveState: () => {},
+    render: () => {},
+    showToast: message => { overrides.toast = message; },
+    applyExtraction: (candidate, extraction) => { candidate.extraction = extraction; },
+    maybeStartSessionDecision: async () => {},
+    clearStaleRemoteSelection: () => {},
+    ...overrides,
+  };
+  context.startCandidatePolling = candidate => { (context.polled || (context.polled = [])).push(candidate.id); };
+  context.showToast = message => { context.toast = message; };
+  return context;
+}
+
+async function runAnalysis(state, apiClient, overrides = {}) {
+  const context = loadAnalysisLifecycle(analysisContext(state, apiClient, overrides));
+  await context.startMvpAnalysis();
+  return context;
+}
+
 test('mixed candidate failures render a failure summary instead of perpetual loading', () => {
   const completedExtraction = { id: 'extraction-b', evidence_items: [] };
   const state = {
@@ -90,4 +130,133 @@ test('retrying one failed candidate preserves the completed candidate state', as
   assert.equal(state.candidates[0].extraction, null);
   assert.strictEqual(state.candidates[1].extraction, completedExtraction);
   assert.equal(state.candidates[1].extractionStatus, 'completed');
+});
+
+test('shared analyze failure reconciles persisted jobs instead of failing every candidate', async () => {
+  const state = {
+    sessionId: 'session-1',
+    candidates: [
+      { id: 'candidate-a', serverCandidateId: 'server-a', jobId: 'job-a', extractionStatus: 'queued', jobError: null, images: [] },
+      { id: 'candidate-b', serverCandidateId: 'server-b', jobId: 'job-b', extractionStatus: 'queued', jobError: null, images: [] },
+    ],
+  };
+  const apiClient = {
+    isConfigured: true,
+    updateSelectionSession: async () => ({ id: 'session-1' }),
+    analyzeSelectionSession: async () => { throw Object.assign(new Error('gateway failed'), { code: 'request_failed' }); },
+    getJob: async jobId => ({ id: jobId, status: 'processing', error_code: null }),
+  };
+
+  const context = await runAnalysis(state, apiClient);
+
+  assert.equal(state.candidates[0].extractionStatus, 'processing');
+  assert.equal(state.candidates[1].extractionStatus, 'processing');
+  assert.equal(state.candidates[0].jobError, null);
+  assert.equal(state.candidates[1].jobError, null);
+  assert.deepEqual(context.polled.sort(), ['candidate-a', 'candidate-b']);
+  assert.equal(context.toast, '连接暂时中断，正在继续确认分析状态');
+});
+
+test('shared analyze failure applies mixed authoritative completed and failed job states', async () => {
+  const state = {
+    sessionId: 'session-1',
+    candidates: [
+      { id: 'candidate-a', serverCandidateId: 'server-a', jobId: 'job-a', extractionStatus: 'queued', jobError: null, images: [] },
+      { id: 'candidate-b', serverCandidateId: 'server-b', jobId: 'job-b', extractionStatus: 'queued', jobError: null, images: [] },
+    ],
+  };
+  const extraction = { id: 'extraction-a', evidence_items: [] };
+  const apiClient = {
+    isConfigured: true,
+    updateSelectionSession: async () => ({ id: 'session-1' }),
+    analyzeSelectionSession: async () => { throw Object.assign(new Error('gateway failed'), { code: 'request_failed' }); },
+    getJob: async jobId => jobId === 'job-a'
+      ? { id: jobId, status: 'completed', extraction_version_id: 'version-a', error_code: null }
+      : { id: jobId, status: 'failed', extraction_version_id: null, error_code: 'ai_schema_invalid' },
+    getCurrentExtraction: async () => extraction,
+  };
+
+  await runAnalysis(state, apiClient);
+
+  assert.equal(state.candidates[0].extractionStatus, 'completed');
+  assert.strictEqual(state.candidates[0].extraction, extraction);
+  assert.equal(state.candidates[1].extractionStatus, 'failed');
+  assert.equal(state.candidates[1].jobError, 'ai_schema_invalid');
+});
+
+test('temporary Job reconciliation failure keeps persisted candidate recoverable', async () => {
+  const state = {
+    sessionId: 'session-1',
+    candidates: [
+      { id: 'candidate-a', serverCandidateId: 'server-a', jobId: 'job-a', extractionStatus: 'queued', jobError: null, images: [] },
+    ],
+  };
+  const apiClient = {
+    isConfigured: true,
+    updateSelectionSession: async () => ({ id: 'session-1' }),
+    analyzeSelectionSession: async () => { throw Object.assign(new Error('gateway failed'), { code: 'request_failed' }); },
+    getJob: async () => { throw Object.assign(new Error('temporary status failure'), { code: 'network_unavailable' }); },
+  };
+
+  const context = await runAnalysis(state, apiClient);
+
+  assert.equal(state.candidates[0].extractionStatus, 'queued');
+  assert.equal(state.candidates[0].jobError, null);
+  assert.deepEqual(context.polled, ['candidate-a']);
+});
+
+test('candidate-specific upload failure does not affect another candidate Job', async () => {
+  const state = {
+    sessionId: null,
+    candidates: [
+      { id: 'candidate-a', letter: 'A', name: 'A', extractionStatus: 'queued', images: [{ id: 'local-a', localOnly: true }] },
+      { id: 'candidate-b', letter: 'B', name: 'B', extractionStatus: 'queued', images: [{ id: 'local-b', localOnly: true }] },
+    ],
+  };
+  const overrides = { polled: [] };
+  const apiClient = {
+    isConfigured: true,
+    createSelectionSession: async () => ({ id: 'session-1' }),
+    createCandidate: async (_sessionId, payload) => ({ id: `server-${payload.display_label.toLowerCase()}` }),
+    uploadCandidateImage: async candidateId => {
+      if (candidateId === 'server-a') throw Object.assign(new Error('upload failed'), { code: 'upload_failed' });
+      return {
+        image: { id: 'image-b', status: 'queued' },
+        extraction_job: { id: 'job-b', status: 'queued' },
+      };
+    },
+    analyzeSelectionSession: async () => ({ id: 'dispatch-1' }),
+  };
+  const context = analysisContext(state, apiClient, overrides);
+  context.runtimeImages.set('local-a', { file: { name: 'a.png' } });
+  context.runtimeImages.set('local-b', { file: { name: 'b.png' } });
+  loadAnalysisLifecycle(context);
+  await context.startMvpAnalysis();
+
+  assert.equal(state.candidates[0].extractionStatus, 'failed');
+  assert.equal(state.candidates[0].jobError, 'upload_failed');
+  assert.equal(state.candidates[1].extractionStatus, 'queued');
+  assert.equal(state.candidates[1].jobId, 'job-b');
+  assert.deepEqual(context.polled, ['candidate-b']);
+});
+
+test('authoritative Job failure remains a candidate-specific failure', async () => {
+  const state = {
+    sessionId: 'session-1',
+    candidates: [
+      { id: 'candidate-a', serverCandidateId: 'server-a', jobId: 'job-a', extractionStatus: 'queued', jobError: null, images: [] },
+    ],
+  };
+  const apiClient = {
+    isConfigured: true,
+    updateSelectionSession: async () => ({ id: 'session-1' }),
+    analyzeSelectionSession: async () => { throw Object.assign(new Error('gateway failed'), { code: 'request_failed' }); },
+    getJob: async () => ({ id: 'job-a', status: 'failed', error_code: 'ai_timeout' }),
+  };
+
+  const context = await runAnalysis(state, apiClient);
+
+  assert.equal(state.candidates[0].extractionStatus, 'failed');
+  assert.equal(state.candidates[0].jobError, 'ai_timeout');
+  assert.deepEqual(context.polled || [], []);
 });
