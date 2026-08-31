@@ -3,6 +3,8 @@
 
   const API_BASE = '/api/v1';
   const publicRoutes = Object.freeze({ health: '/health', publicConfig: '/config/public' });
+  const DEFAULT_TIMEOUT_MS = 15000;
+  const REQUEST_BOUND_AI_TIMEOUT_MS = 58000;
 
   function createIdempotencyKey() {
     const bytes = new Uint8Array(16);
@@ -24,10 +26,11 @@
     return new ApiContractError((error && error.code) || 'request_failed', (error && error.message) || fallbackMessage || '请求暂时无法完成', error || null);
   }
   function unconfiguredTransport() { return Promise.reject(new ApiContractError('api_not_configured', '服务端接口尚未配置；未执行识别、判断或复判。')); }
-  function fetchTransport(baseUrl, timeoutMs) {
-    return ({ method, path, payload, headers }) => {
+  function fetchTransport(baseUrl, defaultTimeoutMs) {
+    return ({ method, path, payload, headers, timeoutMs }) => {
+      const effectiveTimeoutMs = Number.isFinite(timeoutMs) ? timeoutMs : defaultTimeoutMs;
       const controller = global.AbortController ? new global.AbortController() : null;
-      const timer = controller ? global.setTimeout(() => controller.abort(), timeoutMs) : null;
+      const timer = controller ? global.setTimeout(() => controller.abort(), effectiveTimeoutMs) : null;
       return global.fetch(`${baseUrl}${path}`, {
         method, credentials: 'same-origin', headers: { Accept: 'application/json', ...headers }, body: payload === null ? undefined : payload,
         ...(controller ? { signal: controller.signal } : {}),
@@ -40,7 +43,7 @@
   function createApiClient(options) {
     const baseUrl = options && options.baseUrl;
     const clientId = options && options.clientId;
-    const timeoutMs = Number.isFinite(options && options.timeoutMs) ? options.timeoutMs : 15000;
+    const timeoutMs = Number.isFinite(options && options.timeoutMs) ? options.timeoutMs : DEFAULT_TIMEOUT_MS;
     const getAccessToken = options && options.getAccessToken;
     const authRequired = options && options.authRequired === true;
     const transport = (options && options.transport) || (baseUrl ? fetchTransport(baseUrl.replace(/\/$/, ''), timeoutMs) : unconfiguredTransport);
@@ -64,7 +67,8 @@
         ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
         ...(opts.headers || {}),
       };
-      return transport({ method, path, payload: payload === undefined ? null : payload, headers })
+      const effectiveTimeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : timeoutMs;
+      return transport({ method, path, payload: payload === undefined ? null : payload, headers, timeoutMs: effectiveTimeoutMs })
         .then((response) => { if (!response || response.ok === false) throw normalizeError(response); return response.body; });
     }
     return Object.freeze({
@@ -93,7 +97,7 @@
       getJob: (jobId) => request('GET', `${API_BASE}/jobs/${jobId}`, null, { ownerScoped: true }),
       getExtractionVersion: (versionId) => request('GET', `${API_BASE}/extraction-versions/${versionId}`, null, { ownerScoped: true }),
       getCurrentExtraction: (candidateId) => request('GET', `${API_BASE}/candidates/${candidateId}/current-extraction`, null, { ownerScoped: true }),
-      analyzeSelectionSession: (sessionId, idempotencyKey) => request('POST', `${API_BASE}/selection-sessions/${sessionId}/analyze`, null, { ownerScoped: true, idempotent: true, idempotencyKey }),
+      analyzeSelectionSession: (sessionId, idempotencyKey) => request('POST', `${API_BASE}/selection-sessions/${sessionId}/analyze`, null, { ownerScoped: true, idempotent: true, idempotencyKey, timeoutMs: REQUEST_BOUND_AI_TIMEOUT_MS }),
       getDecisionVersion: (versionId) => request('GET', `${API_BASE}/decision-versions/${versionId}`, null, { ownerScoped: true }),
       generateDecisionQuestions: (versionId, idempotencyKey) => request('POST', `${API_BASE}/decision-versions/${versionId}/questions`, null, { ownerScoped: true, idempotent: true, idempotencyKey }),
       getDecisionQuestions: (versionId) => request('GET', `${API_BASE}/decision-versions/${versionId}/questions`, null, { ownerScoped: true }),
@@ -104,7 +108,7 @@
       analyzeBrewFeedback: (payload, idempotencyKey) => request('POST', `${API_BASE}/brew-feedback/analyze`, JSON.stringify(payload), { idempotent: true, idempotencyKey, headers: { 'Content-Type': 'application/json' } }),
       getCurrentDecision: (sessionId) => request('GET', `${API_BASE}/selection-sessions/${sessionId}/current-decision`, null, { ownerScoped: true }),
       getSelectionAnswer: (sessionId) => request('GET', `${API_BASE}/selection-sessions/${sessionId}/answer`, null, { ownerScoped: true }),
-      retryExtraction: (candidateId, idempotencyKey) => request('POST', `${API_BASE}/candidates/${candidateId}/extraction-jobs`, null, { ownerScoped: true, idempotent: true, idempotencyKey }),
+      retryExtraction: (candidateId, idempotencyKey) => request('POST', `${API_BASE}/candidates/${candidateId}/extraction-jobs`, null, { ownerScoped: true, idempotent: true, idempotencyKey, timeoutMs: REQUEST_BOUND_AI_TIMEOUT_MS }),
       _request: request,
     });
   }
@@ -118,5 +122,5 @@
     return created;
   }
 
-  global.GuanchaApi = { API_BASE, publicRoutes, ApiContractError, createApiClient, createIdempotencyKey, getOrCreateClientId, normalizeError };
+  global.GuanchaApi = { API_BASE, publicRoutes, DEFAULT_TIMEOUT_MS, REQUEST_BOUND_AI_TIMEOUT_MS, ApiContractError, createApiClient, createIdempotencyKey, getOrCreateClientId, normalizeError };
 }(window));
