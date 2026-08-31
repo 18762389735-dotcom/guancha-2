@@ -269,6 +269,7 @@ async def test_postgres_p9_4b_fk_cas_and_list_order(postgres_repository) -> None
         await postgres_repository.put_user_warehouse_tea(user_id=user.id, tea_id=TEA_ID, tea=warehouse_input(), expected_revision=0)
     second = await postgres_repository.put_user_warehouse_tea(user_id=user.id, tea_id=TEA_ID, tea={**warehouse_input(name="更新后的茶"), "status": "paused"}, expected_revision=1)
     entry = await postgres_repository.put_user_brew_journal_entry(user_id=user.id, entry_id=JOURNAL_ID, entry=journal_input(), expected_revision=0)
+    updated_entry = await postgres_repository.put_user_brew_journal_entry(user_id=user.id, entry_id=JOURNAL_ID, entry=journal_input(brewed_on="2026-08-31"), expected_revision=1)
     with pytest.raises(BrewJournalRevisionConflict):
         await postgres_repository.put_user_brew_journal_entry(user_id=user.id, entry_id=JOURNAL_ID, entry=journal_input(), expected_revision=1)
     with pytest.raises(OwnershipDenied):
@@ -276,6 +277,6 @@ async def test_postgres_p9_4b_fk_cas_and_list_order(postgres_repository) -> None
     teas = await postgres_repository.list_user_warehouse_teas(user_id=user.id)
     entries = await postgres_repository.list_user_brew_journal_entries(user_id=user.id)
     assert first.revision == 1 and second.revision == 2
-    assert entry.revision == 1
+    assert entry.revision == 1 and updated_entry.revision == 2
     assert [tea.id for tea in teas] == [TEA_ID]
     assert [item.id for item in entries] == [JOURNAL_ID]
