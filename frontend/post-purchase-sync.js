@@ -114,11 +114,17 @@
 
   function toJournalPayload(record) {
     if (!record || typeof record !== 'object' || !isUuid(record.id) || !isUuid(record.teaId)) throw syncError('journal_invalid');
+    const plan = record.plan && typeof record.plan === 'object' && !Array.isArray(record.plan) ? record.plan : {};
     return {
       tea_id: record.teaId,
       brewed_on: record.date,
       infusions: Array.isArray(record.infusions) ? record.infusions.slice(0, 20) : [],
-      plan: record.plan && typeof record.plan === 'object' ? record.plan : {},
+      plan: {
+        ware: plan.ware || null,
+        water: plan.water || null,
+        grams: plan.grams || null,
+        temp: plan.temp || null,
+      },
       feedback: record.feedback && typeof record.feedback === 'object' ? record.feedback : {},
       suggestion: record.suggestion || null,
     };
