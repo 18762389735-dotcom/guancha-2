@@ -21,16 +21,17 @@ def token_payload(access_token: str = "access-token-a", refresh_token: str = "re
 
 
 class FakeAuthGateway:
-    def __init__(self) -> None:
+    def __init__(self, *, verification_id: str = "verification-id-a") -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.refresh_calls = 0
         self.failure: CloudBaseAuthError | None = None
+        self.verification_id = verification_id
 
     async def send_verification(self, email: str) -> dict[str, Any]:
         self.calls.append(("verification", {"email": email}))
         if self.failure:
             raise self.failure
-        return {"verification_id": "verification-id-a", "expires_in": 600}
+        return {"verification_id": self.verification_id, "expires_in": 600}
 
     async def verify_verification(self, verification_id: str, verification_code: str) -> dict[str, Any]:
         self.calls.append(("verify", {"verification_id": verification_id, "verification_code": verification_code}))
@@ -96,6 +97,29 @@ async def test_register_start_and_complete_forward_verification_then_signup_with
     assert [name for name, _ in gateway.calls] == ["verification", "verify", "signup"]
     assert gateway.calls[1][1]["verification_code"] == "123456"
     assert gateway.calls[2][1]["verification_token"] == "verification-token-a"
+
+
+@pytest.mark.asyncio
+async def test_register_flow_accepts_and_forwards_long_cloudbase_verification_id_unchanged() -> None:
+    verification_id = "v_" + ("opaque-token-" * 100)
+    gateway = FakeAuthGateway(verification_id=verification_id)
+    app = make_app(gateway)
+    async with await client_for(app) as client:
+        start = await client.post("/api/v1/auth/register/start", json={"email": "new@example.com"})
+        complete = await client.post(
+            "/api/v1/auth/register/complete",
+            json={
+                "email": "new@example.com",
+                "verification_id": verification_id,
+                "verification_code": "123456",
+                "password": "Password1",
+            },
+        )
+    assert len(verification_id) > 256
+    assert start.status_code == 200
+    assert start.json()["verification_id"] == verification_id
+    assert complete.status_code == 200
+    assert gateway.calls[1][1]["verification_id"] == verification_id
 
 
 @pytest.mark.asyncio
