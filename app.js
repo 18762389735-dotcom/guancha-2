@@ -348,6 +348,37 @@ function mvpDecision(candidate) {
   return { action: hasRisk ? '建议补充信息' : '可以考虑', reasons: reasons.slice(0, 3) };
   */
 }
+async function reconcilePersistedCandidateJobs() {
+  const persistedCandidates = state.candidates.filter(candidate => candidate?.jobId);
+  await Promise.all(persistedCandidates.map(async candidate => {
+    let job;
+    try {
+      job = await apiClient.getJob(candidate.jobId);
+    } catch {
+      // A status read failure is not evidence that the persisted Job failed.
+      // Keep the last known state and let the existing poller retry it.
+      if (['queued', 'processing'].includes(candidate.extractionStatus)) startCandidatePolling(candidate);
+      return;
+    }
+    if (!job || typeof job.status !== 'string') return;
+    candidate.extractionStatus = job.status;
+    candidate.jobError = job.status === 'failed' ? job.error_code || null : null;
+    if (job.status === 'completed' && job.extraction_version_id && candidate.serverCandidateId) {
+      try {
+        applyExtraction(candidate, await apiClient.getCurrentExtraction(candidate.serverCandidateId));
+      } catch {
+        // The Job is already terminal-completed. A secondary extraction read
+        // failure must not fabricate a candidate Job failure.
+        candidate.extractionStatus = 'completed';
+        candidate.jobError = null;
+      }
+      return;
+    }
+    if (['queued', 'processing'].includes(job.status)) startCandidatePolling(candidate);
+  }));
+  saveState();
+  render();
+}
 async function startMvpAnalysis({ recoveredMissingSession = false } = {}) {
   await pendingImageRestore;
   if (!validateAnalysisCandidates()) return;
@@ -355,7 +386,7 @@ async function startMvpAnalysis({ recoveredMissingSession = false } = {}) {
   try {
     state.screen = 'analysis';
     state.decisionStatus = 'not_requested';
-    state.candidates.forEach(candidate => { if (candidate.extractionStatus !== 'completed') candidate.extractionStatus = 'uploading'; });
+    state.candidates.forEach(candidate => { if (candidate.extractionStatus !== 'completed' && !candidate.jobId) candidate.extractionStatus = 'uploading'; });
     render();
     const session = state.sessionId
       ? await apiClient.updateSelectionSession(state.sessionId, apiNeed(), readPreferenceEvidence())
@@ -395,7 +426,12 @@ async function startMvpAnalysis({ recoveredMissingSession = false } = {}) {
     // then invoke the same endpoint again only after all extractions finish,
     // which preserves the existing Decision API contract.
     if (state.candidates.some(candidate => candidate.jobId && candidate.extractionStatus === 'queued')) {
-      await apiClient.analyzeSelectionSession(state.sessionId);
+      try {
+        await apiClient.analyzeSelectionSession(state.sessionId);
+      } catch (error) {
+        await reconcilePersistedCandidateJobs();
+        showToast('连接暂时中断，正在继续确认分析状态');
+      }
     } else if (state.candidates.length && state.candidates.every(candidate => candidate.extractionStatus === 'completed')) {
       // A hard refresh can restore completed candidate extractions without an
       // active candidate poller. Reattach the existing decision flow instead
@@ -408,7 +444,16 @@ async function startMvpAnalysis({ recoveredMissingSession = false } = {}) {
       saveState();
       return startMvpAnalysis({ recoveredMissingSession: true });
     }
-    state.candidates.forEach(candidate => { if (candidate.extractionStatus !== 'completed') { candidate.extractionStatus = 'failed'; candidate.jobError = error.code || 'network_error'; } });
+    state.candidates.forEach(candidate => {
+      if (candidate.jobId) {
+        if (['queued', 'processing'].includes(candidate.extractionStatus)) startCandidatePolling(candidate);
+        return;
+      }
+      if (candidate.extractionStatus !== 'completed') {
+        candidate.extractionStatus = 'failed';
+        candidate.jobError = error.code || 'network_error';
+      }
+    });
     saveState(); render();
   }
 }
