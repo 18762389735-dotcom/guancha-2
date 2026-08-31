@@ -12,6 +12,7 @@ from guancha_api.application.decision_service import SessionDecisionService
 from guancha_api.application.merchant_reply_service import MerchantReplyService
 from guancha_api.application.phase2_service import Phase2ExtractionService
 from guancha_api.application.task_runners import InProcessTaskRunner, ManualTaskRunner, TaskEnqueueError
+from guancha_api.infrastructure.storage.memory import InMemoryTemporaryPrivateStorage
 from guancha_api.repositories.postgres import StoredJob
 from guancha_api.schemas.contracts import ErrorCode, JobStage, JobState, ProcessingMode
 
@@ -52,6 +53,24 @@ class _ExtractionRepository:
         self.jobs[job_id] = replace(
             self.jobs[job_id], status=JobState.FAILED, stage=JobStage.FAILED, error_code=error_code
         )
+
+
+class _ExtractionWorkerRepository:
+    def __init__(self, request_repository: _ExtractionRepository) -> None:
+        self.request_repository = request_repository
+        self.close_calls = 0
+
+    async def claim_job(self, *, job_id: UUID) -> bool:
+        return job_id in self.request_repository.jobs
+
+    async def get_claimed_job(self, *, job_id: UUID) -> StoredJob:
+        return replace(self.request_repository.jobs[job_id], status=JobState.PROCESSING)
+
+    async def fail_extraction_job(self, *, job_id: UUID, error_code: ErrorCode) -> None:
+        await self.request_repository.fail_extraction_job(job_id=job_id, error_code=error_code)
+
+    async def close(self) -> None:
+        self.close_calls += 1
 
 
 async def test_staged_inprocess_extractions_run_concurrently_and_return_terminal_jobs() -> None:
@@ -113,6 +132,49 @@ async def test_worker_repository_factory_failure_marks_staged_job_terminal() -> 
     assert repository.jobs[job.id].status is JobState.FAILED
 
 
+async def test_staged_timeout_returns_terminal_ai_timeout_instead_of_queued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _job()
+    repository = _ExtractionRepository((job,))
+    worker_repositories: list[_ExtractionWorkerRepository] = []
+
+    async def factory() -> _ExtractionWorkerRepository:
+        worker = _ExtractionWorkerRepository(repository)
+        worker_repositories.append(worker)
+        return worker
+
+    class SlowProvider:
+        async def extract(self, *, image_object_key: str) -> dict[str, object]:
+            del image_object_key
+            await asyncio.sleep(0.02)
+            return {}
+
+        async def repair_structure(self, *, invalid_response: dict[str, object]) -> dict[str, object]:
+            return invalid_response
+
+    storage = InMemoryTemporaryPrivateStorage()
+    await storage.put_private(
+        object_key=f"temporary/{job.id}", content_type="image/png", data=b"image"
+    )
+    monkeypatch.setattr(phase2_module, "REQUEST_BOUND_EXTRACTION_TIMEOUT_SECONDS", 0.001)
+    service = Phase2ExtractionService(repository, worker_repository_factory=factory)  # type: ignore[arg-type]
+
+    result = await service.start_staged_extractions(
+        session_id=uuid4(),
+        storage=storage,
+        task_runner=InProcessTaskRunner(),
+        provider=SlowProvider(),  # type: ignore[arg-type]
+        client_id=uuid4(),
+    )
+
+    assert result[0].status is JobState.FAILED
+    assert result[0].error_code is ErrorCode.AI_TIMEOUT
+    assert repository.jobs[job.id].status is JobState.FAILED
+    assert len(worker_repositories) == 1
+    assert worker_repositories[0].close_calls == 1
+
+
 async def test_worker_repository_is_closed_once_on_success_and_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     class WorkerRepository:
         def __init__(self) -> None:
@@ -124,9 +186,18 @@ async def test_worker_repository_is_closed_once_on_success_and_failure(monkeypat
     class WorkerRunner:
         should_fail = False
 
-        def __init__(self, repository: WorkerRepository, provider: object, storage: object) -> None:
+        def __init__(
+            self,
+            repository: WorkerRepository,
+            provider: object,
+            storage: object,
+            *,
+            timeout_seconds: float,
+        ) -> None:
             del provider, storage
             self.repository = repository
+            self.timeout_seconds = timeout_seconds
+            repository.timeout_seconds = timeout_seconds
 
         async def run(self, *, job_id: UUID) -> None:
             del job_id
@@ -141,6 +212,7 @@ async def test_worker_repository_is_closed_once_on_success_and_failure(monkeypat
     )  # type: ignore[arg-type]
     await success_service._run_extraction_job(job_id=uuid4(), provider=object(), storage=object())
     assert success_repository.close_calls == 1
+    assert success_repository.timeout_seconds == 50
 
     failed_repository = WorkerRepository()
     WorkerRunner.should_fail = True
@@ -150,6 +222,7 @@ async def test_worker_repository_is_closed_once_on_success_and_failure(monkeypat
     with pytest.raises(RuntimeError, match="worker failed"):
         await failed_service._run_extraction_job(job_id=uuid4(), provider=object(), storage=object())
     assert failed_repository.close_calls == 1
+    assert failed_repository.timeout_seconds == 50
 
 
 async def _ready(value: object) -> object:
