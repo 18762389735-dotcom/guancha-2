@@ -23,6 +23,9 @@ from guancha_api.providers.mimo import MiMoVisionProvider
 from guancha_api.providers.openai import OpenAIResponsesProvider
 
 
+REQUEST_BOUND_EXTRACTION_TIMEOUT_SECONDS = 50
+
+
 class Phase2ExtractionService:
     def __init__(
         self,
@@ -52,7 +55,12 @@ class Phase2ExtractionService:
             if self.worker_repository_factory is not None:
                 worker_repository = await self.worker_repository_factory()
                 owns_worker_repository = True
-            await FakeExtractionJobRunner(worker_repository, provider, storage).run(job_id=job_id)
+            await FakeExtractionJobRunner(
+                worker_repository,
+                provider,
+                storage,
+                timeout_seconds=REQUEST_BOUND_EXTRACTION_TIMEOUT_SECONDS,
+            ).run(job_id=job_id)
         finally:
             if owns_worker_repository:
                 await worker_repository.close()
