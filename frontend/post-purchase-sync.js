@@ -112,20 +112,64 @@
     };
   }
 
+  const JOURNAL_ADVANCED_KEYS = Object.freeze(['回甘', '生津', '余韵']);
+
+  function toJournalString(value) {
+    return typeof value === 'string' && value.length > 0 ? value : null;
+  }
+
+  function toJournalStringList(value, limit) {
+    if (!Array.isArray(value)) return [];
+    return value.filter(item => typeof item === 'string').slice(0, limit);
+  }
+
+  function toJournalInfusion(infusion) {
+    const value = infusion && typeof infusion === 'object' && !Array.isArray(infusion) ? infusion : {};
+    return {
+      number: value.number,
+      suggested: value.suggested,
+      actual: value.actual,
+    };
+  }
+
+  function toJournalFeedback(value) {
+    const feedback = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    const advancedSource = feedback.advanced && typeof feedback.advanced === 'object' && !Array.isArray(feedback.advanced)
+      ? feedback.advanced
+      : {};
+    const advanced = {};
+    JOURNAL_ADVANCED_KEYS.forEach(key => {
+      if (typeof advancedSource[key] === 'string') advanced[key] = advancedSource[key];
+    });
+    const score = Number.isInteger(feedback.score) && feedback.score >= 1 && feedback.score <= 5
+      ? feedback.score
+      : null;
+    return {
+      taste: toJournalString(feedback.taste),
+      strength: toJournalString(feedback.strength),
+      tags: toJournalStringList(feedback.tags, 3),
+      aroma: toJournalStringList(feedback.aroma, 3),
+      impression: toJournalString(feedback.impression),
+      score,
+      repurchase: toJournalString(feedback.repurchase),
+      advanced,
+    };
+  }
+
   function toJournalPayload(record) {
     if (!record || typeof record !== 'object' || !isUuid(record.id) || !isUuid(record.teaId)) throw syncError('journal_invalid');
     const plan = record.plan && typeof record.plan === 'object' && !Array.isArray(record.plan) ? record.plan : {};
     return {
       tea_id: record.teaId,
       brewed_on: record.date,
-      infusions: Array.isArray(record.infusions) ? record.infusions.slice(0, 20) : [],
+      infusions: Array.isArray(record.infusions) ? record.infusions.slice(0, 20).map(toJournalInfusion) : [],
       plan: {
         ware: plan.ware || null,
         water: plan.water || null,
         grams: plan.grams || null,
         temp: plan.temp || null,
       },
-      feedback: record.feedback && typeof record.feedback === 'object' ? record.feedback : {},
+      feedback: toJournalFeedback(record.feedback),
       suggestion: record.suggestion || null,
     };
   }

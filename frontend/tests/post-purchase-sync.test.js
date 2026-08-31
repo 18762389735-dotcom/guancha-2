@@ -96,6 +96,77 @@ test('journal payload keeps only server plan fields', () => {
   assert.deepEqual(Object.keys(payload.plan).sort(), ['grams', 'temp', 'ware', 'water']);
 });
 
+test('journal payload canonicalizes runtime feedback, plan, and infusions', () => {
+  const sync = loadSync();
+  const payload = sync.toJournalPayload({
+    id: journalId,
+    teaId,
+    date: '2026-08-31',
+    plan: {
+      ware: '盖碗',
+      water: '110 ml',
+      grams: '5 g',
+      temp: '95℃',
+      seconds: 10,
+      unexpected: 'x',
+    },
+    feedback: {
+      taste: '喜欢',
+      strength: '刚好',
+      source: '',
+      tags: ['清爽'],
+      impression: '',
+      repurchase: '',
+      aroma: ['兰花'],
+      advanced: {
+        回甘: '明显',
+        unknown: 'x',
+      },
+      score: 0,
+      unexpected: 'x',
+    },
+    infusions: [{ number: 1, suggested: 10, actual: 11, runtime: 'x' }],
+  });
+  const serialized = JSON.parse(JSON.stringify(payload));
+
+  assert.deepEqual(serialized.plan, {
+    ware: '盖碗',
+    water: '110 ml',
+    grams: '5 g',
+    temp: '95℃',
+  });
+  assert.deepEqual(serialized.feedback, {
+    taste: '喜欢',
+    strength: '刚好',
+    tags: ['清爽'],
+    aroma: ['兰花'],
+    impression: null,
+    score: null,
+    repurchase: null,
+    advanced: { 回甘: '明显' },
+  });
+  assert.deepEqual(serialized.infusions, [{ number: 1, suggested: 10, actual: 11 }]);
+  assert.equal(Object.prototype.hasOwnProperty.call(serialized.feedback, 'source'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(serialized.feedback, 'unexpected'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(serialized.feedback.advanced, 'unknown'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(serialized.plan, 'seconds'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(serialized.infusions[0], 'runtime'), false);
+});
+
+test('journal payload preserves integer scores from 1 through 5', () => {
+  const sync = loadSync();
+  for (const score of [1, 2, 3, 4, 5]) {
+    const payload = sync.toJournalPayload({
+      id: journalId,
+      teaId,
+      date: '2026-08-31',
+      plan: {},
+      feedback: { score },
+    });
+    assert.equal(JSON.parse(JSON.stringify(payload)).feedback.score, score);
+  }
+});
+
 test('server-empty warehouse and journal replace old local cache without import', async () => {
   const sync = loadSync();
   const state = { warehouse: [{ id: 'tea-1', name: '旧本地茶' }], journalRecords: [{ id: 'record-1', teaId: 'tea-1', date: '2026-08-01' }], selectedTeaId: 'tea-1' };
