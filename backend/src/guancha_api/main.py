@@ -42,6 +42,7 @@ from guancha_api.repositories.postgres import (
     MerchantReplyNotAvailable,
     IdempotencyConflict,
     OwnershipDenied,
+    PreferenceRevisionConflict,
     PostgresPhase2Repository,
     RepositoryError,
     ResourceNotFound,
@@ -314,6 +315,12 @@ def _register_exception_handlers(application: FastAPI) -> None:
             return error_response(status_code=404, code=code, message="Requested resource was not found.")
         if isinstance(exc, IdempotencyConflict):
             return error_response(status_code=409, code="idempotency_conflict", message="Idempotency key belongs to a different request.")
+        if isinstance(exc, PreferenceRevisionConflict):
+            return error_response(
+                status_code=409,
+                code="preferences_revision_conflict",
+                message="Preferences changed on another device. Refresh and edit again.",
+            )
         if isinstance(exc, CandidateLimitExceeded):
             return error_response(status_code=409, code="candidate_limit_exceeded", message="A selection session permits at most five candidates.")
         if isinstance(exc, CandidateImageLimitExceeded):

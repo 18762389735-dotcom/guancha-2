@@ -46,6 +46,10 @@ class IdempotencyConflict(RepositoryError):
     pass
 
 
+class PreferenceRevisionConflict(RepositoryError):
+    """A preference write was based on an out-of-date server revision."""
+
+
 class ImmutableVersionError(RepositoryError):
     pass
 
@@ -177,6 +181,38 @@ class AiCallLog:
     request_metadata: dict[str, object] | None = None
 
 
+@dataclass(frozen=True)
+class StoredUserPreferences:
+    user_id: UUID
+    profile: dict[str, object]
+    schema_version: int
+    revision: int
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class StoredPreferenceEvidence:
+    id: UUID
+    user_id: UUID
+    target_type: str
+    target_value: str
+    polarity: str
+    confidence: str
+    issue_source: str
+    source_brew_session_id: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class StoredSelectionSessionSummary:
+    id: UUID
+    user_id: UUID
+    need: dict[str, object]
+    created_at: datetime
+    updated_at: datetime
+
+
 class PostgresPhase2Repository:
     """A connection-scoped repository; callers control connection lifetime."""
 
@@ -234,6 +270,127 @@ class PostgresPhase2Repository:
             cloudbase_user_id=row["cloudbase_user_id"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    async def get_user_preferences(self, *, user_id: UUID) -> StoredUserPreferences | None:
+        async with self._connection.cursor() as cursor:
+            await cursor.execute(
+                """select user_id, profile, schema_version, revision, created_at, updated_at
+                   from user_preferences where user_id=%s""",
+                (user_id,),
+            )
+            row = await cursor.fetchone()
+        return None if row is None else self._stored_user_preferences(row)
+
+    async def put_user_preferences(
+        self, *, user_id: UUID, profile: dict[str, object], expected_revision: int
+    ) -> StoredUserPreferences:
+        """Create or replace one user's profile with compare-and-swap semantics."""
+
+        async with self._connection.transaction():
+            async with self._connection.cursor() as cursor:
+                if expected_revision == 0:
+                    await cursor.execute(
+                        """insert into user_preferences (user_id, profile, revision)
+                           values (%s, %s, 1)
+                           on conflict (user_id) do nothing
+                           returning user_id, profile, schema_version, revision, created_at, updated_at""",
+                        (user_id, psycopg.types.json.Jsonb(profile)),
+                    )
+                else:
+                    await cursor.execute(
+                        """update user_preferences
+                           set profile=%s, revision=revision+1, updated_at=now()
+                           where user_id=%s and revision=%s
+                           returning user_id, profile, schema_version, revision, created_at, updated_at""",
+                        (psycopg.types.json.Jsonb(profile), user_id, expected_revision),
+                    )
+                row = await cursor.fetchone()
+        if row is None:
+            raise PreferenceRevisionConflict("Preference revision does not match")
+        return self._stored_user_preferences(row)
+
+    async def list_user_preference_evidence(
+        self, *, user_id: UUID, limit: int = 12
+    ) -> tuple[StoredPreferenceEvidence, ...]:
+        async with self._connection.cursor() as cursor:
+            await cursor.execute(
+                """select id, user_id, target_type, target_value, polarity, confidence,
+                          issue_source, source_brew_session_id, created_at
+                   from user_preference_evidence
+                   where user_id=%s and created_at >= now() - interval '90 days'
+                   order by created_at desc, id desc
+                   limit %s""",
+                (user_id, limit),
+            )
+            rows = await cursor.fetchall()
+        return tuple(self._stored_preference_evidence(row) for row in rows)
+
+    async def put_user_preference_evidence(
+        self, *, user_id: UUID, evidence: tuple[dict[str, object], ...]
+    ) -> tuple[StoredPreferenceEvidence, ...]:
+        """Upsert source-deduplicated evidence, retaining only the current product window."""
+
+        async with self._connection.transaction():
+            async with self._connection.cursor() as cursor:
+                for item in evidence:
+                    await cursor.execute(
+                        """insert into user_preference_evidence
+                           (id, user_id, target_type, target_value, polarity, confidence,
+                            issue_source, source_brew_session_id, created_at)
+                           values (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           on conflict (user_id, source_brew_session_id) do update set
+                             target_type=excluded.target_type,
+                             target_value=excluded.target_value,
+                             polarity=excluded.polarity,
+                             confidence=excluded.confidence,
+                             issue_source=excluded.issue_source,
+                             created_at=excluded.created_at""",
+                        (
+                            item["id"], user_id, item["target_type"], item["target_value"],
+                            item["polarity"], item["confidence"], item["issue_source"],
+                            item["source_brew_session_id"], item["created_at"],
+                        ),
+                    )
+                await cursor.execute(
+                    """delete from user_preference_evidence
+                       where user_id=%s and created_at < now() - interval '90 days'""",
+                    (user_id,),
+                )
+                await cursor.execute(
+                    """delete from user_preference_evidence
+                       where user_id=%s and id in (
+                         select id from user_preference_evidence
+                         where user_id=%s
+                         order by created_at desc, id desc
+                         offset 12
+                       )""",
+                    (user_id, user_id),
+                )
+        return await self.list_user_preference_evidence(user_id=user_id)
+
+    async def list_authenticated_selection_sessions(
+        self, *, user_id: UUID, limit: int = 20
+    ) -> tuple[StoredSelectionSessionSummary, ...]:
+        async with self._connection.cursor() as cursor:
+            await cursor.execute(
+                """select id, user_id, need, created_at, updated_at
+                   from selection_sessions
+                   where user_id=%s
+                   order by created_at desc, id desc
+                   limit %s""",
+                (user_id, limit),
+            )
+            rows = await cursor.fetchall()
+        return tuple(
+            StoredSelectionSessionSummary(
+                id=row["id"],
+                user_id=row["user_id"],
+                need=dict(row["need"]),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+            for row in rows
         )
 
     async def get_brew_feedback_replay(self, *, client_id: UUID, client_feedback_id: UUID, idempotency_key: UUID) -> dict[str, object] | None:
@@ -1957,4 +2114,32 @@ class PostgresPhase2Repository:
             input_set_version=int(row.get("input_set_version") or 0),
             processing_mode=ProcessingMode(mode) if mode is not None else None,
             created_at=row["created_at"], updated_at=row["updated_at"],
+        )  # type: ignore[arg-type]
+
+    @staticmethod
+    def _stored_user_preferences(row: dict[str, object]) -> StoredUserPreferences:
+        profile = row["profile"]
+        if not isinstance(profile, dict):
+            raise RepositoryError("Persisted preference profile is malformed")
+        return StoredUserPreferences(
+            user_id=row["user_id"],
+            profile=dict(profile),
+            schema_version=int(row["schema_version"]),
+            revision=int(row["revision"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )  # type: ignore[arg-type]
+
+    @staticmethod
+    def _stored_preference_evidence(row: dict[str, object]) -> StoredPreferenceEvidence:
+        return StoredPreferenceEvidence(
+            id=row["id"],
+            user_id=row["user_id"],
+            target_type=row["target_type"],
+            target_value=row["target_value"],
+            polarity=row["polarity"],
+            confidence=row["confidence"],
+            issue_source=row["issue_source"],
+            source_brew_session_id=row["source_brew_session_id"],
+            created_at=row["created_at"],
         )  # type: ignore[arg-type]
