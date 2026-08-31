@@ -1,5 +1,6 @@
-"""FastAPI authentication dependency for the protected auth kernel route."""
+"""FastAPI authentication dependencies for protected user-owned routes."""
 
+from collections.abc import AsyncIterator
 from typing import Annotated
 from uuid import UUID
 
@@ -67,6 +68,37 @@ async def _resolve_authenticated_user(
 
 
 CurrentUser = Annotated[CurrentUserInfo, Depends(get_current_user)]
+
+
+async def get_authenticated_request_repository(
+    request: Request,
+    _: CurrentUser,
+) -> AsyncIterator[object]:
+    """Yield a fresh repository for a protected `/me` operation when possible.
+
+    The production fix in P9-3.5D established that authenticated user work
+    must not rely on the app-lifetime repository connection.  Retain injected
+    repositories only for deterministic isolated tests, and never close them.
+    """
+
+    worker_repository_factory = getattr(request.app.state, "worker_repository_factory", None)
+    if worker_repository_factory is not None:
+        repository = await worker_repository_factory()
+        try:
+            yield repository
+        finally:
+            await repository.close()
+        return
+
+    repository = getattr(request.app.state, "repository", None)
+    if repository is None:
+        raise HTTPException(status_code=503, detail="database_not_configured")
+    yield repository
+
+
+AuthenticatedRequestRepository = Annotated[
+    object, Depends(get_authenticated_request_repository)
+]
 
 
 async def get_owner_context(

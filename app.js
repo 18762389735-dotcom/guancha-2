@@ -87,6 +87,7 @@ function freshAuthenticatedState() {
   fresh.journalRecords = [];
   fresh.selectedTeaId = null;
   fresh.brew = null;
+  fresh.preferenceRevision = 0;
   fresh.activeSelectionFlow = false;
   fresh.preferenceFlow = null;
   return fresh;
@@ -1437,6 +1438,7 @@ document.addEventListener('click', event => {
     }
     const next = isFirstOnboarding ? 'candidates' : 'home';
     state.preferenceFlow = null;
+    void persistAuthenticatedPreferences();
     showToast('已跳过口味设置，本次需求仍优先');
     return setScreen(next);
   }
@@ -1445,7 +1447,8 @@ document.addEventListener('click', event => {
     GuanchaOnboarding.markStatus(localStorage, 'completed');
     const next = state.preferenceFlow === 'onboarding' ? 'candidates' : 'home';
     state.preferenceFlow = null;
-    showToast(hasAnyO1() ? '已记作口味参考，选茶时会优先以你这次的需求为准。' : '已保存设置，本次需求仍优先');
+    void persistAuthenticatedPreferences();
+    showToast(hasAnyO1() ? '已记作口味参考，选茶时会优先以你这次的需求为准。' : '已完成设置，本次需求仍优先');
     return setScreen(next);
   }
   if (action === 'tab') { const tab = target.dataset.tab; const screens = { select:'home', journal:'journal', warehouse:'warehouse', settings:'settings' }; return setScreen(screens[tab] || 'home'); }
@@ -1608,11 +1611,46 @@ function saveBrewRecord() {
   state.journalRecords.push(record); state.activeRecordId=record.id; tea.records=(tea.records||0)+1; tea.lastBrew='今天'; state.brew=null; saveState(); analyzeBrewRecord(record, tea);
 }
 function readPreferenceEvidence() { return GuanchaStores.preferenceEvidence.load({items:[]}).items; }
+function authenticatedPreferenceSyncAvailable() {
+  return Boolean(apiClient.isConfigured && authClient && authClient.getState().status === 'authenticated');
+}
+async function hydrateAuthenticatedPreferences() {
+  if (!authenticatedPreferenceSyncAvailable() || !window.GuanchaPreferenceSync) return { preferenceLoaded: false, evidenceLoaded: false };
+  let syncWarning = null;
+  const result = await GuanchaPreferenceSync.hydrate({
+    api: apiClient,
+    state,
+    saveLocal: () => saveState(),
+    saveEvidence: items => GuanchaStores.preferenceEvidence.save({items}),
+    onError: code => { syncWarning = code; },
+  });
+  if (syncWarning) state.preferenceSyncWarning = syncWarning;
+  return result;
+}
+function persistAuthenticatedPreferences() {
+  if (!authenticatedPreferenceSyncAvailable() || !window.GuanchaPreferenceSync) return Promise.resolve(false);
+  return GuanchaPreferenceSync.persistProfile({
+    api: apiClient,
+    state,
+    saveLocal: () => saveState(),
+    notify: message => showToast(message),
+    onConflict: () => showToast('其他设备已修改偏好，请确认后再编辑。'),
+  });
+}
 function savePreferenceEvidence(items) {
   const current = readPreferenceEvidence();
   const incoming = (Array.isArray(items) ? items : []).filter(item => item && item.source_brew_session_id && item.confidence === 'low');
   const existing = current.filter(item => !incoming.some(next => next.source_brew_session_id === item.source_brew_session_id));
-  GuanchaStores.preferenceEvidence.save({items:[...existing, ...incoming]});
+  const merged = [...existing, ...incoming];
+  GuanchaStores.preferenceEvidence.save({items:merged});
+  if (incoming.length && authenticatedPreferenceSyncAvailable()) {
+    void GuanchaPreferenceSync.persistEvidence({
+      api: apiClient,
+      items: incoming,
+      saveEvidence: serverItems => GuanchaStores.preferenceEvidence.save({items: serverItems}),
+      notify: message => showToast(message),
+    });
+  }
 }
 async function analyzeBrewRecord(record, tea) {
   if (!apiClient.isConfigured) return;
@@ -1682,10 +1720,14 @@ async function enterAuthenticatedProduct() {
       stopRuntimeBusinessState();
       state = freshAuthenticatedState();
     }
+    const preferenceSync = await hydrateAuthenticatedPreferences();
     state.authView = null;
     authBootState = { status: 'authenticated', errorCode: null };
     appReady = true;
     render();
+    if (!preferenceSync.preferenceLoaded || !preferenceSync.evidenceLoaded) {
+      showToast('偏好暂未从云端同步，已保留当前设置。');
+    }
     resumeLiveBackendState();
   } catch (error) {
     stopRuntimeBusinessState();

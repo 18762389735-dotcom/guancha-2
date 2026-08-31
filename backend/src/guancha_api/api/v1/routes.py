@@ -2,9 +2,9 @@ import os
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, Header, HTTPException, Request, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Request, Response, UploadFile, status
 
-from guancha_api.auth.dependencies import CurrentUser, Owner
+from guancha_api.auth.dependencies import AuthenticatedRequestRepository, CurrentUser, Owner
 from guancha_api.application.phase2_service import Phase2ExtractionService
 from guancha_api.application.decision_service import SessionDecisionService
 from guancha_api.application.question_service import QuestionGenerationService
@@ -37,7 +37,13 @@ from guancha_api.schemas.contracts import (
     PublicConfig,
     SelectionSession,
     CurrentUserResponse,
+    PreferenceEvidence,
+    PutPreferenceEvidenceRequest,
+    PutUserPreferencesRequest,
+    SelectionSessionSummary,
     UploadCandidateImageResponse,
+    UserPreferencesResponse,
+    canonical_empty_preference_profile,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["public"])
@@ -151,6 +157,102 @@ async def get_current_user_profile(current_user: CurrentUser) -> CurrentUserResp
         id=current_user.id,
         authenticated=True,
         created_at=current_user.created_at,
+    )
+
+
+def _preference_evidence(value: object) -> PreferenceEvidence:
+    return PreferenceEvidence(
+        id=value.id,
+        target_type=value.target_type,
+        target_value=value.target_value,
+        polarity=value.polarity,
+        confidence=value.confidence,
+        issue_source=value.issue_source,
+        source_brew_session_id=value.source_brew_session_id,
+        created_at=value.created_at,
+    )
+
+
+@router.get("/me/preferences", response_model=UserPreferencesResponse, tags=["auth"])
+async def get_my_preferences(
+    current_user: CurrentUser,
+    repository: AuthenticatedRequestRepository,
+) -> UserPreferencesResponse:
+    """Read-only lookup: a first GET intentionally does not create a row."""
+
+    stored = await repository.get_user_preferences(user_id=current_user.id)
+    if stored is None:
+        return UserPreferencesResponse(
+            profile=canonical_empty_preference_profile(), revision=0, updated_at=None
+        )
+    return UserPreferencesResponse(
+        profile=stored.profile,
+        revision=stored.revision,
+        updated_at=stored.updated_at,
+    )
+
+
+@router.put("/me/preferences", response_model=UserPreferencesResponse, tags=["auth"])
+async def put_my_preferences(
+    request: PutUserPreferencesRequest,
+    current_user: CurrentUser,
+    repository: AuthenticatedRequestRepository,
+) -> UserPreferencesResponse:
+    stored = await repository.put_user_preferences(
+        user_id=current_user.id,
+        profile=request.profile.model_dump(mode="json"),
+        expected_revision=request.expected_revision,
+    )
+    return UserPreferencesResponse(
+        profile=stored.profile,
+        revision=stored.revision,
+        updated_at=stored.updated_at,
+    )
+
+
+@router.get("/me/preference-evidence", response_model=tuple[PreferenceEvidence, ...], tags=["auth"])
+async def get_my_preference_evidence(
+    current_user: CurrentUser,
+    repository: AuthenticatedRequestRepository,
+) -> tuple[PreferenceEvidence, ...]:
+    evidence = await repository.list_user_preference_evidence(user_id=current_user.id)
+    return tuple(_preference_evidence(item) for item in evidence)
+
+
+@router.put("/me/preference-evidence", response_model=tuple[PreferenceEvidence, ...], tags=["auth"])
+async def put_my_preference_evidence(
+    request: PutPreferenceEvidenceRequest,
+    current_user: CurrentUser,
+    repository: AuthenticatedRequestRepository,
+) -> tuple[PreferenceEvidence, ...]:
+    """PUT is source-scoped upsert: replaying a brew source is deterministic."""
+
+    evidence = await repository.put_user_preference_evidence(
+        user_id=current_user.id,
+        evidence=tuple(item.model_dump(mode="python") for item in request.items),
+    )
+    return tuple(_preference_evidence(item) for item in evidence)
+
+
+@router.get("/me/selection-sessions", response_model=tuple[SelectionSessionSummary, ...], tags=["auth"])
+async def list_my_selection_sessions(
+    current_user: CurrentUser,
+    repository: AuthenticatedRequestRepository,
+    limit: int = Query(default=20, ge=1, le=50),
+) -> tuple[SelectionSessionSummary, ...]:
+    """Authenticated discovery only; detailed recovery stays on the existing snapshot route."""
+
+    sessions = await repository.list_authenticated_selection_sessions(
+        user_id=current_user.id, limit=limit
+    )
+    return tuple(
+        SelectionSessionSummary(
+            id=session.id,
+            need=session.need,
+            created_at=session.created_at,
+            updated_at=session.updated_at,
+        )
+        for session in sessions
     )
 
 @router.post("/brew-feedback/analyze", response_model=BrewFeedbackAnalysisResponse)

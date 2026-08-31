@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+import re
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ContractModel(BaseModel):
@@ -181,6 +182,7 @@ class ErrorCode(StrEnum):
     INVALID_ACCESS_TOKEN = "invalid_access_token"
     AUTHENTICATION_SERVICE_UNAVAILABLE = "authentication_service_unavailable"
     AUTH_NOT_CONFIGURED = "auth_not_configured"
+    PREFERENCES_REVISION_CONFLICT = "preferences_revision_conflict"
     CONTRACT_NOT_IMPLEMENTED = "contract_not_implemented"
     INTERNAL_ERROR = "internal_error"
 
@@ -218,6 +220,80 @@ class CurrentUserResponse(ContractModel):
     id: UUID
     authenticated: bool = True
     created_at: datetime
+
+
+# These exact values mirror the existing frontend/stores.js whitelist.  The
+# server owns the same boundary so a client cannot smuggle unrelated state into
+# the durable profile JSON document.
+_PREFERENCE_O1_OPTIONS = {
+    "tea": frozenset({"绿茶", "花香茶", "乌龙茶", "红茶", "焙火茶", "陈香茶", "奶茶 / 果茶"}),
+    "coffee": frozenset({"美式 / 黑咖啡", "拿铁", "冷萃", "浅烘手冲", "深烘咖啡"}),
+    "milk": frozenset({"纯牛奶", "酸奶", "豆浆", "燕麦奶", "椰奶"}),
+    "juice": frozenset({"柑橘类果汁", "苹果 / 梨汁", "桃子 / 荔枝饮品", "葡萄 / 莓果汁", "热带水果汁", "蔬菜汁", "椰子水"}),
+}
+_PREFERENCE_FLAVOR_OPTIONS = frozenset({
+    "茉莉花", "兰花", "桂花", "玫瑰", "水蜜桃", "荔枝", "梨", "柑橘", "桂圆", "红枣", "青梅", "葡萄干",
+    "嫩叶", "青草", "竹叶", "青豆", "板栗", "炒黄豆", "烤花生", "烤面包", "蜂蜜", "焦糖", "糯米", "陈皮",
+})
+_PREFERENCE_EVIDENCE_SOURCE = re.compile(
+    r"^(?:(?:record|brew)-[a-z0-9-]{1,40}|[0-9a-f]{8}-[0-9a-f-]{27})$",
+    re.IGNORECASE,
+)
+
+
+class PreferenceO1(ContractModel):
+    tea: tuple[str, ...] = Field(default=(), max_length=8)
+    coffee: tuple[str, ...] = Field(default=(), max_length=8)
+    milk: tuple[str, ...] = Field(default=(), max_length=8)
+    juice: tuple[str, ...] = Field(default=(), max_length=8)
+
+    @model_validator(mode="after")
+    def validate_supported_values(self) -> "PreferenceO1":
+        for category, allowed in _PREFERENCE_O1_OPTIONS.items():
+            values = getattr(self, category)
+            if len(values) != len(set(values)) or any(value not in allowed for value in values):
+                raise ValueError(f"unsupported {category} preference")
+        return self
+
+
+class PreferenceO2(ContractModel):
+    sweetness: int = Field(default=50, ge=0, le=100)
+    flavors: tuple[str, ...] = Field(default=(), max_length=5)
+
+    @model_validator(mode="after")
+    def validate_supported_flavors(self) -> "PreferenceO2":
+        if len(self.flavors) != len(set(self.flavors)) or any(value not in _PREFERENCE_FLAVOR_OPTIONS for value in self.flavors):
+            raise ValueError("unsupported flavor preference")
+        return self
+
+
+class PreferenceProfile(ContractModel):
+    """The only durable P9-4A preference payload; never generic app state."""
+
+    o1: PreferenceO1 = Field(default_factory=PreferenceO1)
+    o2: PreferenceO2 = Field(default_factory=PreferenceO2)
+
+
+def canonical_empty_preference_profile() -> PreferenceProfile:
+    return PreferenceProfile()
+
+
+class UserPreferencesResponse(ContractModel):
+    profile: PreferenceProfile
+    revision: int = Field(ge=0)
+    updated_at: datetime | None = None
+
+
+class PutUserPreferencesRequest(ContractModel):
+    profile: PreferenceProfile
+    expected_revision: int = Field(ge=0)
+
+
+class SelectionSessionSummary(ContractModel):
+    id: UUID
+    need: SelectionNeedInput
+    created_at: datetime
+    updated_at: datetime
 
 
 class SelectionNeedInput(ContractModel):
@@ -553,12 +629,39 @@ class BrewFeedbackAnalysisRequest(ContractModel):
 class PreferenceEvidence(ContractModel):
     id: UUID
     target_type: PreferenceTargetType
-    target_value: str
+    target_value: str = Field(pattern=r"^[a-z0-9-]{1,64}$")
     polarity: PreferencePolarity
     confidence: str = Field(pattern=r"^low$")
     issue_source: str = Field(pattern=r"^(tea|brewing|uncertain)$")
-    source_brew_session_id: str
+    source_brew_session_id: str = Field(min_length=1, max_length=120)
     created_at: datetime
+
+    @field_validator("source_brew_session_id")
+    @classmethod
+    def validate_source_brew_session_id(cls, value: str) -> str:
+        if not _PREFERENCE_EVIDENCE_SOURCE.fullmatch(value):
+            raise ValueError("invalid preference evidence source")
+        return value
+
+    @field_validator("created_at")
+    @classmethod
+    def validate_created_at_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("created_at must include a timezone")
+        return value
+
+
+class PutPreferenceEvidenceRequest(ContractModel):
+    """Idempotent, source-scoped evidence upsert payload for the current user."""
+
+    items: tuple[PreferenceEvidence, ...] = Field(min_length=1, max_length=12)
+
+    @model_validator(mode="after")
+    def validate_unique_sources(self) -> "PutPreferenceEvidenceRequest":
+        sources = tuple(item.source_brew_session_id for item in self.items)
+        if len(sources) != len(set(sources)):
+            raise ValueError("duplicate preference evidence source")
+        return self
 
 
 class BrewAdjustment(ContractModel):
