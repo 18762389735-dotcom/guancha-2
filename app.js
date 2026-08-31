@@ -657,10 +657,9 @@ async function updateMerchantJudgement() {
     }});
   } catch (error) { state.questionStatus = 'failed'; state.rejudgeError = error.code || 'rejudge_failed'; saveState(); render(); }
 }
-async function retryMvpAnalysis() {
-  const candidate = currentCandidate();
+async function retryMvpAnalysis(candidate = currentCandidate()) {
   if (!candidate?.serverCandidateId || !apiClient.isConfigured) return startMvpAnalysis();
-  if (candidate.extractionStatus === 'failed') return reuploadMvpAnalysis();
+  if (candidate.extractionStatus === 'failed') return reuploadMvpAnalysis(candidate);
   try {
     const job = await apiClient.retryExtraction(candidate.serverCandidateId);
     candidate.jobId = job.id; candidate.extractionStatus = job.status; candidate.jobError = null; saveState(); setScreen('analysis');
@@ -671,8 +670,7 @@ async function retryMvpAnalysis() {
     }});
   } catch (error) { candidate.extractionStatus = 'failed'; candidate.jobError = error.code || 'network_error'; saveState(); render(); }
 }
-async function reuploadMvpAnalysis() {
-  const candidate = currentCandidate();
+async function reuploadMvpAnalysis(candidate = currentCandidate()) {
   if (!candidate?.serverCandidateId || !candidate.serverImageId) return startMvpAnalysis();
   try {
     // Keep the session and candidate, but replace its single P0 image only.
@@ -973,10 +971,22 @@ function renderO2() {
 }
 
 function renderAnalysis() {
-  const candidate = currentCandidate();
-  const failed = candidate?.extractionStatus === 'failed';
-  const errorCode = failed && candidate?.jobError ? `<small class="analysis-error-code">错误代码：${escapeHtml(candidate.jobError)}</small>` : '';
-  return `<section class="analysis-page" aria-live="polite"><img src="${asset('AI分析等待插画.svg')}" alt="分析等待插画" /><h1>${failed ? '分析未完成' : '正在分析中'}</h1><p>${failed ? '请检查图片或服务后重新上传分析。' : '正在整理这些茶的商品信息、风格线索和与你这次需求有关的差异。'}</p>${errorCode}${failed ? '<button class="primary-btn" data-action="retry-analysis">重新上传并分析</button>' : '<div class="analysis-dots"><i></i><i></i><i></i></div>'}</section>`;
+  const failedCandidates = state.candidates
+    .map((candidate, index) => ({ candidate, index }))
+    .filter(({ candidate }) => candidate.extractionStatus === 'failed');
+  if (failedCandidates.length) {
+    const failureItems = failedCandidates.map(({ candidate, index }) => {
+      const label = `候选 ${candidate.letter || String.fromCharCode(65 + index)}`;
+      const errorCode = candidate.jobError ? `：错误代码 ${escapeHtml(candidate.jobError)}` : '';
+      return `<li>${escapeHtml(label)}${errorCode}</li>`;
+    }).join('');
+    const retryActions = failedCandidates.map(({ candidate, index }) => {
+      const label = candidate.letter || String.fromCharCode(65 + index);
+      return `<button class="primary-btn" data-action="retry-analysis" data-candidate-id="${escapeHtml(candidateIdentity(candidate))}">重新上传并分析候选 ${escapeHtml(label)}</button>`;
+    }).join('');
+    return `<section class="analysis-page" aria-live="polite"><img src="${asset('AI分析等待插画.svg')}" alt="分析等待插画" /><h1>分析未完成</h1><p>以下候选未能完成分析，请检查图片或服务后重试。</p><ul class="analysis-failures">${failureItems}</ul><p class="soft-note">已完成的候选信息会保留，不会重复分析。</p><div class="analysis-retry-actions">${retryActions}</div></section>`;
+  }
+  return `<section class="analysis-page" aria-live="polite"><img src="${asset('AI分析等待插画.svg')}" alt="分析等待插画" /><h1>正在分析中</h1><p>正在整理这些茶的商品信息、风格线索和与你这次需求有关的差异。</p><div class="analysis-dots"><i></i><i></i><i></i></div></section>`;
 }
 
 function appendMerchantReplyForm() {
@@ -1468,7 +1478,13 @@ document.addEventListener('click', event => {
   if (action === 'choose-album') { stopCamera(); state.overlay=null; render(); albumInput.click(); return; }
   if (action === 'remove-candidate') { const activeId=candidateIdentity(currentCandidate()); const [removed]=state.candidates.splice(Number(target.dataset.index),1); if (removed?.serverCandidateId && apiClient.isConfigured) apiClient.deleteCandidate(removed.serverCandidateId).catch(() => {}); (removed?.images || []).forEach(image=>{ const runtime=runtimeImages.get(image.id); if(runtime) URL.revokeObjectURL(runtime.url); runtimeImages.delete(image.id); pendingImageStore.remove(image.id); }); renumberCandidates(); syncActiveCandidate(activeId); state.decisionVersionId=null; saveState(); return render(); }
   if (action === 'start-analysis') return startMvpAnalysis();
-  if (action === 'retry-analysis') return retryMvpAnalysis();
+  if (action === 'retry-analysis') {
+    const candidateId = target.dataset.candidateId;
+    const candidate = candidateId
+      ? state.candidates.find(item => candidateIdentity(item) === candidateId)
+      : currentCandidate();
+    return retryMvpAnalysis(candidate || currentCandidate());
+  }
   if (action === 'retry-decision') { state.decisionJobId = null; state.decisionStatus = 'not_requested'; saveState(); return maybeStartSessionDecision(); }
   if (action === 'ask') return openFollowupQuestions();
   if (action === 'update-merchant-judgement') return updateMerchantJudgement();

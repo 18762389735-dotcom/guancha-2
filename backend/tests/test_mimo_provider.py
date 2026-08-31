@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from PIL import Image
+from pydantic import ValidationError
 
 from guancha_api.infrastructure.storage.memory import InMemoryTemporaryPrivateStorage
 from guancha_api.infrastructure.temporary_images import temporary_image_object_key
@@ -98,6 +99,9 @@ async def test_mimo_adapter_constructs_one_image_json_mode_request_and_preserves
     assert request["response_format"] == {"type": "json_object"}
     assert request["extra_body"] == {"thinking": {"type": "disabled"}}
     assert "sample_available" in request["messages"][0]["content"]
+    assert 'normalized_value "true"' in request["messages"][0]["content"]
+    assert '"false"' in request["messages"][0]["content"]
+    assert "non-empty string" in request["messages"][0]["content"]
     assert "新茶 alone is not a season" in request["messages"][0]["content"]
     assert "season_claim_conflict" in request["messages"][0]["content"]
     assert "暂无/不支持/售罄" in request["messages"][0]["content"]
@@ -106,6 +110,32 @@ async def test_mimo_adapter_constructs_one_image_json_mode_request_and_preserves
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
     assert request["max_completion_tokens"] == 4096
     assert "source_image_index" in content[0]["text"]
+
+
+def test_provider_schema_matches_non_empty_evidence_contract() -> None:
+    from guancha_api.providers.openai import _EXTRACTION_SCHEMA
+
+    evidence = _EXTRACTION_SCHEMA["schema"]["properties"]["evidence"]
+    assert evidence["minItems"] == 1
+    properties = evidence["items"]["properties"]
+    for field_name in ("field_name", "raw_text", "normalized_value", "source_location"):
+        assert properties[field_name]["minLength"] == 1
+
+
+@pytest.mark.parametrize(("value", "expected"), [(True, "true"), (False, "false")])
+def test_runner_normalizes_only_sample_available_boolean(value: bool, expected: str) -> None:
+    payload = _payload(evidence=[{**_payload()["evidence"][0], "field_name": "sample_available", "normalized_value": value}])
+
+    parsed = FakeExtractionJobRunner._validate_payload(payload, image_count=1)
+
+    assert parsed.evidence[0].normalized_value == expected
+
+
+def test_runner_does_not_stringify_unrelated_normalized_value_object() -> None:
+    payload = _payload(evidence=[{**_payload()["evidence"][0], "normalized_value": {"value": "tea"}}])
+
+    with pytest.raises(ValidationError):
+        FakeExtractionJobRunner._validate_payload(payload, image_count=1)
 
 
 @pytest.mark.asyncio
