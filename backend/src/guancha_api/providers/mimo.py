@@ -34,13 +34,21 @@ _MIMO_MAX_IMAGE_EDGE = 1536
 # single-image evaluation pass, not a change to the frozen shared schema.
 _MIMO_SYSTEM_INSTRUCTIONS = """Extract only visible tea-product claims from one screenshot.
 Return one JSON object and no prose. Do not infer facts that are absent.
+For every evidence item, field_name, raw_text, normalized_value, and
+source_location must be non-empty strings. model_confidence must be a number
+from 0 to 1. source_image_index must be an integer from 1 through the number
+of supplied images. When visible product claims exist, evidence must contain
+at least one item. Use null only for nullable top-level scalar fields; do not
+use null for required evidence fields. Never output a boolean, number, or
+object for normalized_value.
 Use tea_category for a broad class such as 乌龙茶 and tea_subtype for the named tea,
 such as 铁观音; never put 清香型 or 浓香型 into tea_subtype. Preserve explicit
 清香型/浓香型 in roast_or_style or aroma_claims. Preserve only explicitly printed
 春茶 or 秋茶 in season; preserve a printed year or batch in year_or_batch. A year
 or 新茶 alone is not a season. If the
 screenshot explicitly offers 小样、试饮、品鉴或体验装, include an evidence item with
-field_name sample_available and normalized_value true. Do not mark it true for
+field_name sample_available and normalized_value "true". Use the string
+"false" when the visible claim explicitly says it is unavailable. Do not mark it true for
 暂无/不支持/售罄, for a gift included only with a full purchase, for 咨询客服, or
 for a generic 欢迎品鉴 statement; otherwise omit that evidence.
 If visible claims conflict (for example both 春茶 and 秋季采摘), do not choose one

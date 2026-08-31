@@ -44,6 +44,7 @@ _EXTRACTION_SCHEMA: dict[str, Any] = {
             )},
             "evidence": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -53,14 +54,14 @@ _EXTRACTION_SCHEMA: dict[str, Any] = {
                         "source_location", "evidence_strength", "source_image_index",
                     ],
                     "properties": {
-                        "field_name": {"type": "string"},
-                        "raw_text": {"type": "string"},
-                        "normalized_value": {"type": "string"},
+                        "field_name": {"type": "string", "minLength": 1},
+                        "raw_text": {"type": "string", "minLength": 1},
+                        "normalized_value": {"type": "string", "minLength": 1},
                         "model_confidence": {"type": "number", "minimum": 0, "maximum": 1},
                         "information_status": {"type": "string", "enum": ["explicit", "inferred", "unknown", "conflict"]},
                         "source_type": {"type": "string", "enum": ["product-claim", "merchant-claim", "user-input", "system-inference", "brew-feedback"]},
                         "verification_status": {"type": "string", "enum": ["unverified", "user-confirmed", "system-consistent", "conflicting"]},
-                        "source_location": {"type": "string"},
+                        "source_location": {"type": "string", "minLength": 1},
                         "evidence_strength": {"type": "string", "enum": ["low", "medium", "high"]},
                         "source_image_index": {"type": "integer", "minimum": 1, "maximum": 2},
                     },

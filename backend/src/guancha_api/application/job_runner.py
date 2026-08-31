@@ -300,9 +300,33 @@ class FakeExtractionJobRunner:
         return field_name
 
     @staticmethod
+    def _normalize_provider_payload(payload: dict[str, object]) -> dict[str, object]:
+        """Apply only the documented MiMo boolean compatibility conversion."""
+        evidence = payload.get("evidence")
+        if not isinstance(evidence, list):
+            return payload
+        normalized_evidence: list[object] = []
+        changed = False
+        for item in evidence:
+            if (
+                isinstance(item, dict)
+                and item.get("field_name") == "sample_available"
+                and isinstance(item.get("normalized_value"), bool)
+            ):
+                item = {
+                    **item,
+                    "normalized_value": "true" if item["normalized_value"] else "false",
+                }
+                changed = True
+            normalized_evidence.append(item)
+        return {**payload, "evidence": normalized_evidence} if changed else payload
+
+    @staticmethod
     def _validate_payload(payload: dict[str, object], *, image_count: int) -> FakeExtractionPayload:
         """Reject an Evidence image reference that cannot exist in this Job."""
-        parsed = FakeExtractionPayload.model_validate(payload)
+        parsed = FakeExtractionPayload.model_validate(
+            FakeExtractionJobRunner._normalize_provider_payload(payload)
+        )
         if any(item.source_image_index > image_count for item in parsed.evidence):
             raise ValueError("evidence source_image_index is outside the candidate image set")
         return parsed
