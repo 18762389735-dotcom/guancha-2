@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -34,19 +35,23 @@ class Phase2ExtractionService:
     async def _run_extraction_job(
         self, *, job_id: UUID, provider: StructuredVisionProvider, storage: TemporaryPrivateStorage
     ) -> None:
-        """Run a background job on its own PostgreSQL connection when available.
+        """Run a job on its own PostgreSQL connection when available.
 
         Psycopg async connections are connection-scoped and cannot safely serve
-        both an HTTP request and an independently scheduled worker at once.
+        both an HTTP request and an independently running worker at once.
         Tests can deliberately omit the factory and retain their single,
         deterministic ManualTaskRunner repository.
+
+        Repository acquisition is intentionally inside the lifetime boundary.
+        Callers persist WORKER_INTERRUPTED through the still-live request
+        repository if acquisition or execution raises.
         """
         worker_repository = self.repository
         owns_worker_repository = False
-        if self.worker_repository_factory is not None:
-            worker_repository = await self.worker_repository_factory()
-            owns_worker_repository = True
         try:
+            if self.worker_repository_factory is not None:
+                worker_repository = await self.worker_repository_factory()
+                owns_worker_repository = True
             await FakeExtractionJobRunner(worker_repository, provider, storage).run(job_id=job_id)
         finally:
             if owns_worker_repository:
@@ -187,6 +192,11 @@ class Phase2ExtractionService:
                 job_id=result.job.id, error_code=ErrorCode.WORKER_INTERRUPTED
             )
             raise TaskEnqueueError("Task runner did not accept the queued job") from enqueue_error
+        if isinstance(task_runner, InProcessTaskRunner):
+            current_job = await self.repository.get_job_for_client(
+                job_id=result.job.id, client_id=repository_owner(request_owner)
+            )
+            return self._upload_response(result.image, current_job), True
         return self._upload_response(result.image, result.job), True
 
     async def start_staged_extractions(
@@ -200,15 +210,47 @@ class Phase2ExtractionService:
         jobs = await self.repository.list_queued_extraction_jobs_for_session(
             session_id=session_id, client_id=repository_owner(request_owner)
         )
+
+        async def enqueue_one(job: object) -> bool:
+            return await task_runner.enqueue(
+                job_id=job.id,
+                task=lambda job_id=job.id: self._run_extraction_job(
+                    job_id=job_id, provider=provider, storage=storage
+                ),
+            )
+
+        if isinstance(task_runner, InProcessTaskRunner):
+            # Each worker gets its own repository from the factory.  Gather is
+            # fully awaited, so CloudBase Run cannot reclaim the request while
+            # extraction is still running.  Request-repository failure writes
+            # and reads happen only after all worker coroutines have finished.
+            results = await asyncio.gather(
+                *(enqueue_one(job) for job in jobs), return_exceptions=True
+            )
+            failures: list[BaseException] = []
+            for job, result in zip(jobs, results, strict=True):
+                if isinstance(result, BaseException):
+                    failures.append(result)
+                    await self.repository.fail_extraction_job(
+                        job_id=job.id, error_code=ErrorCode.WORKER_INTERRUPTED
+                    )
+            if failures:
+                raise TaskEnqueueError(
+                    "A staged extraction did not complete"
+                ) from failures[0]
+            started = []
+            for job, accepted in zip(jobs, results, strict=True):
+                if accepted:
+                    current = await self.repository.get_job_for_client(
+                        job_id=job.id, client_id=repository_owner(request_owner)
+                    )
+                    started.append(self._job_response(current))
+            return tuple(started)
+
         started: list[AnalysisJobResponse] = []
         for job in jobs:
             try:
-                accepted = await task_runner.enqueue(
-                    job_id=job.id,
-                    task=lambda job_id=job.id: self._run_extraction_job(
-                        job_id=job_id, provider=provider, storage=storage
-                    ),
-                )
+                accepted = await enqueue_one(job)
             except Exception as enqueue_error:
                 await self.repository.fail_extraction_job(
                     job_id=job.id, error_code=ErrorCode.WORKER_INTERRUPTED
@@ -316,6 +358,10 @@ class Phase2ExtractionService:
         except Exception as enqueue_error:
             await self.repository.fail_extraction_job(job_id=restored_job.id, error_code=ErrorCode.WORKER_INTERRUPTED)
             raise TaskEnqueueError("Task runner did not accept the queued retry") from enqueue_error
+        if isinstance(task_runner, InProcessTaskRunner):
+            restored_job = await self.repository.get_job_for_client(
+                job_id=restored_job.id, client_id=repository_owner(request_owner)
+            )
         return self._job_response(restored_job)
 
     @staticmethod

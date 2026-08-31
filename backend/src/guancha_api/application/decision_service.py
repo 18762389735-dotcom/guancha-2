@@ -38,6 +38,10 @@ class SessionDecisionService:
             accepted = await task_runner.enqueue(job_id=job.id, task=lambda: self.run(job_id=job.id, session_id=session_id, owner=request_owner, fingerprint=fingerprint, need_snapshot=need_snapshot, inputs_snapshot=inputs, recent_preference_evidence=recent_preference_evidence, analytics_session_id=analytics_session_id))
             if accepted and self.event_sink:
                 safe_emit_server(self.event_sink, event_name="analysis_started", resource_id=job.id, anonymous_session_id=analytics_session_id, stage="queued", metadata={"processing_mode": job.processing_mode.value if job.processing_mode else "test-fixture"})
+            if accepted and isinstance(task_runner, InProcessTaskRunner):
+                job = await self.repository.get_job_for_client(
+                    job_id=job.id, client_id=repository_owner(request_owner)
+                )
         return job
 
     async def run(

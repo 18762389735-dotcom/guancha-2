@@ -7,5 +7,5 @@ from uuid import UUID
 
 class TaskRunner(Protocol):
     async def enqueue(self, *, job_id: UUID, task: Callable[[], Awaitable[None]]) -> bool:
-        """Return True only when this process newly accepts the job identity."""
+        """Return True after this runner accepts the job identity."""
         ...
