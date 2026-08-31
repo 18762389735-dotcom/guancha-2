@@ -79,4 +79,5 @@ jobs:
           backend/tests/test_postgres_repository.py
           backend/tests/test_auth_kernel.py
           backend/tests/test_phase9_user_ownership.py
+          backend/tests/test_phase9_4a_preferences.py
           -q
