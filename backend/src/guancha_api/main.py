@@ -12,6 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from guancha_api.auth.cloudbase import CloudBaseTokenVerifier
+from guancha_api.auth.cookies import clear_refresh_cookie
+from guancha_api.auth.gateway import CloudBaseAuthError, CloudBaseAuthGateway
 from guancha_api.auth.fake import (
     ConfigurationErrorTokenVerifier,
     UnconfiguredTokenVerifier,
@@ -123,6 +125,19 @@ def _token_verifier_from_environment() -> TokenVerifier:
         # Keep anonymous startup available while making /me fail closed.
         return ConfigurationErrorTokenVerifier()
 
+
+def _auth_gateway_from_environment() -> CloudBaseAuthGateway | None:
+    env_id = os.getenv("CLOUDBASE_ENV_ID", "").strip()
+    if not env_id:
+        return None
+    try:
+        return CloudBaseAuthGateway(
+            env_id=env_id,
+            region=os.getenv("CLOUDBASE_REGION", "ap-shanghai"),
+        )
+    except ValueError:
+        return None
+
 def create_app(
     *,
     repository: PostgresPhase2Repository | None = None,
@@ -135,6 +150,7 @@ def create_app(
     feedback_provider: FeedbackReasoningProvider | None = None,
     product_event_sink: ProductEventSink | None = None,
     token_verifier: TokenVerifier | None = None,
+    auth_gateway: CloudBaseAuthGateway | None = None,
 ) -> FastAPI:
     """Build an injectable API application; tests never need external services."""
     resolved_task_runner = task_runner or InProcessTaskRunner()
@@ -145,6 +161,7 @@ def create_app(
     resolved_feedback_provider = feedback_provider or FakeFeedbackProvider()
     resolved_product_event_sink = product_event_sink or ProductEventSink.from_environment()
     resolved_token_verifier = token_verifier or _token_verifier_from_environment()
+    resolved_auth_gateway = auth_gateway or _auth_gateway_from_environment()
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -164,6 +181,7 @@ def create_app(
         application.state.feedback_provider = resolved_feedback_provider
         application.state.product_event_sink = resolved_product_event_sink
         application.state.token_verifier = resolved_token_verifier
+        application.state.auth_gateway = resolved_auth_gateway
         if application.state.repository is not None:
             await application.state.repository.recover_interrupted_jobs()
         try:
@@ -186,6 +204,7 @@ def create_app(
     application.state.feedback_provider = resolved_feedback_provider
     application.state.product_event_sink = resolved_product_event_sink
     application.state.token_verifier = resolved_token_verifier
+    application.state.auth_gateway = resolved_auth_gateway
     application.state.feedback_replays = {}
     application.state.feedback_client_ids = {}
     application.include_router(v1_router)
@@ -298,6 +317,10 @@ def _register_exception_handlers(application: FastAPI) -> None:
             return error_response(status_code=503, code=detail, message="Authentication is not configured.")
         if detail == "authentication_service_unavailable":
             return error_response(status_code=503, code=detail, message="Authentication service is unavailable.", retryable=True)
+        if detail == "session_expired":
+            response = error_response(status_code=401, code=detail, message="Login session has expired; sign in again.")
+            clear_refresh_cookie(request, response)
+            return response
         if exc.status_code == 404:
             return error_response(status_code=404, code="not_found", message="Resource not found.")
         if exc.status_code == 405:
@@ -307,6 +330,28 @@ def _register_exception_handlers(application: FastAPI) -> None:
         if exc.status_code == 503 or detail == "database_not_configured":
             return error_response(status_code=503, code="service_unavailable", message="Database service is not configured.")
         return error_response(status_code=exc.status_code, code="internal_error", message="An unexpected error occurred.")
+
+    @application.exception_handler(CloudBaseAuthError)
+    async def cloudbase_auth_error_handler(request: Request, exc: CloudBaseAuthError) -> JSONResponse:
+        messages = {
+            "invalid_credentials": "邮箱或密码不正确。",
+            "verification_invalid": "验证码无效。",
+            "verification_expired": "验证码已过期。",
+            "verification_rate_limited": "验证码请求过于频繁，请稍后重试。",
+            "registration_conflict": "该邮箱已注册。",
+            "captcha_required": "认证服务需要额外验证。",
+            "session_expired": "登录状态已过期，请重新登录。",
+            "auth_provider_unavailable": "认证服务暂时不可用，请稍后重试。",
+        }
+        response = error_response(
+            status_code=exc.status_code,
+            code=exc.code,
+            message=messages.get(exc.code, "认证服务暂时不可用，请稍后重试。"),
+            retryable=exc.retryable,
+        )
+        if exc.clear_cookie:
+            clear_refresh_cookie(request, response)
+        return response
 
     @application.exception_handler(RepositoryError)
     async def repository_error_handler(request: Request, exc: RepositoryError) -> JSONResponse:

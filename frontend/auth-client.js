@@ -4,133 +4,192 @@
   const ACCOUNT_MARKER_KEY = 'guancha.auth-user-id.v1';
   const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   const ALLOWED_REGIONS = new Set(['ap-shanghai', 'ap-guangzhou', 'ap-singapore']);
+  const SAFE_ERROR_CODES = new Set([
+    'invalid_credentials', 'verification_invalid', 'verification_expired',
+    'verification_rate_limited', 'registration_conflict', 'captcha_required',
+    'auth_provider_unavailable', 'session_expired', 'authentication_required',
+    'auth_not_configured', 'network_unavailable', 'signup_challenge_missing',
+    'verification_not_started', 'signout_failed',
+  ]);
+  const ERROR_MESSAGES = Object.freeze({
+    invalid_credentials: '邮箱或密码不正确。',
+    verification_invalid: '验证码无效，请重试。',
+    verification_expired: '验证码已过期，请重新获取。',
+    verification_rate_limited: '验证码请求过于频繁，请稍后重试。',
+    registration_conflict: '该邮箱已注册，请直接登录。',
+    captcha_required: '认证服务需要额外验证。',
+    auth_provider_unavailable: '认证服务暂时不可用，请稍后重试。',
+    session_expired: '登录状态已过期，请重新登录。',
+    authentication_required: '请先登录后再继续。',
+    auth_not_configured: '登录服务暂未配置。',
+    network_unavailable: '网络暂时不可用，请稍后重试。',
+    signup_challenge_missing: '注册验证暂时不可用，请稍后重试。',
+    verification_not_started: '请先提交注册信息。',
+    signout_failed: '退出登录暂时不可用，请重试。',
+  });
 
-  function error(code, message) {
-    const result = new Error(message);
-    result.name = 'GuanchaAuthError'; result.code = code;
+  function error(code) {
+    const safeCode = SAFE_ERROR_CODES.has(code) ? code : 'auth_provider_unavailable';
+    const result = new Error(ERROR_MESSAGES[safeCode] || ERROR_MESSAGES.auth_provider_unavailable);
+    result.name = 'GuanchaAuthError'; result.code = safeCode;
     return result;
   }
-  function safeEmail(value) { return typeof value === 'string' && value.length <= 320 ? value : null; }
+
+  function safeEmail(value) {
+    return typeof value === 'string' && value.length <= 320 ? value : null;
+  }
+
   function cleanConfig(value) {
     const input = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
-    const envId = typeof input.envId === 'string' && input.envId.trim() ? input.envId.trim() : null;
+    const envIdValue = input.envId ?? input.env_id;
+    const envId = typeof envIdValue === 'string' && envIdValue.trim() ? envIdValue.trim() : null;
     const region = typeof input.region === 'string' ? input.region.trim().toLowerCase() : '';
-    const publishableKey = typeof input.publishableKey === 'string' && input.publishableKey.trim() ? input.publishableKey.trim() : null;
     const required = input.required === true;
-    const configured = input.configured === true && input.provider === 'cloudbase' && Boolean(envId && publishableKey) && ALLOWED_REGIONS.has(region);
-    return { required, configured, envId, region, publishableKey };
+    const configured = input.configured === true && input.provider === 'cloudbase'
+      && Boolean(envId) && ALLOWED_REGIONS.has(region);
+    return { required, configured, envId, region };
   }
-  function sessionFrom(result) {
-    const session = result && result.data && result.data.session;
-    return session && typeof session === 'object' ? session : null;
+
+  function safeResponseCode(response) {
+    const body = response && response.body;
+    const candidate = body && body.error && body.error.code;
+    return typeof candidate === 'string' && SAFE_ERROR_CODES.has(candidate) ? candidate : null;
   }
-  function resultError(result) { return result && result.error ? result.error : null; }
-  function tokenFrom(session) {
-    const token = session && (session.access_token || session.accessToken);
-    return typeof token === 'string' && token ? token : null;
-  }
-  function stateFor(session) {
-    const email = safeEmail(session && session.user && session.user.email);
-    return session && tokenFrom(session)
-      ? { status: 'authenticated', email, errorCode: null }
-      : { status: 'unauthenticated', email: null, errorCode: null };
-  }
-  function normalizeSdk(sdk) {
-    if (!sdk || typeof sdk.init !== 'function') throw error('auth_sdk_unavailable', '登录服务暂不可用，请稍后重试。');
-    return sdk;
-  }
-  function isAuthObject(value) {
-    return Boolean(value) && typeof value === 'object' && ['getSession', 'signInWithPassword', 'signUp', 'signOut', 'onAuthStateChange']
-      .every(method => typeof value[method] === 'function');
-  }
-  function authFromApp(app) {
-    if (app && isAuthObject(app.auth)) return app.auth;
-    if (app && typeof app.auth === 'function') {
-      const compatibilityAuth = app.auth();
-      if (isAuthObject(compatibilityAuth)) return compatibilityAuth;
-    }
-    throw error('auth_sdk_unavailable', '登录服务暂不可用，请稍后重试。');
+
+  function defaultTransport({ method, path, payload, headers }) {
+    if (typeof global.fetch !== 'function') return Promise.reject(error('network_unavailable'));
+    const requestHeaders = { Accept: 'application/json', ...headers };
+    if (payload !== null && payload !== undefined && !requestHeaders['Content-Type']) requestHeaders['Content-Type'] = 'application/json';
+    return global.fetch(path, {
+      method,
+      credentials: 'same-origin',
+      headers: requestHeaders,
+      body: payload === null || payload === undefined ? undefined : JSON.stringify(payload),
+    }).then(async response => ({ ok: response.ok, status: response.status, body: await response.json().catch(() => null) }))
+      .catch(() => ({ ok: false, status: 0, body: { error: { code: 'network_unavailable' } } }));
   }
 
   function createAuthClient(config, options) {
     const settings = cleanConfig(config);
-    const sdk = options && options.sdk || global.cloudbase;
-    let auth = null;
-    let verification = null;
+    const transport = options && typeof options.transport === 'function' ? options.transport : defaultTransport;
     let state = { status: 'loading', email: null, errorCode: null };
-    let subscription = null;
+    let accessToken = null;
+    let expiresAt = 0;
+    let verificationId = null;
+    let verificationEmail = null;
+    let refreshPromise = null;
+    let destroyed = false;
     const listeners = new Set();
-    function notify() { listeners.forEach(listener => listener({ ...state })); }
+
+    function notify() {
+      if (destroyed) return;
+      listeners.forEach(listener => listener({ ...state }));
+    }
     function setState(next) { state = next; notify(); return state; }
-    function setError(code) { return setState({ status: 'error', email: null, errorCode: code }); }
-    function requireAuth() {
-      if (!auth) throw error('auth_not_initialized', '登录服务尚未准备好。');
-      return auth;
+    function setError(code) { return setState({ status: 'error', email: null, errorCode: SAFE_ERROR_CODES.has(code) ? code : 'auth_provider_unavailable' }); }
+    function clearSession() { accessToken = null; expiresAt = 0; state = { status: 'unauthenticated', email: null, errorCode: null }; }
+    function unauthenticated() { return setState({ status: 'unauthenticated', email: null, errorCode: null }); }
+    function tokenPayload(payload) {
+      if (!payload || typeof payload !== 'object') throw error('auth_provider_unavailable');
+      const token = typeof payload.access_token === 'string' ? payload.access_token : null;
+      const expiresIn = Number(payload.expires_in);
+      const sub = typeof payload.sub === 'string' && payload.sub.trim() ? payload.sub : null;
+      if (!token || !sub || !Number.isFinite(expiresIn) || expiresIn <= 0) throw error('auth_provider_unavailable');
+      return { token, expiresIn };
     }
-    function applySession(session) { return setState(stateFor(session)); }
+    function applyToken(payload, fallbackEmail) {
+      const parsed = tokenPayload(payload);
+      accessToken = parsed.token;
+      expiresAt = Date.now() + parsed.expiresIn * 1000;
+      return setState({ status: 'authenticated', email: safeEmail(fallbackEmail) || state.email, errorCode: null });
+    }
+    async function request(path, payload, headers = {}) {
+      let response;
+      try { response = await transport({ method: 'POST', path, payload, headers }); }
+      catch { throw error('network_unavailable'); }
+      if (!response || response.ok === false) throw error(safeResponseCode(response) || (response && response.status === 0 ? 'network_unavailable' : 'auth_provider_unavailable'));
+      return response.body;
+    }
     async function restoreSession() {
-      const response = await requireAuth().getSession();
-      if (resultError(response)) throw error('auth_restore_failed', '登录状态恢复失败，请重新登录。');
-      return sessionFrom(response);
-    }
-    function subscribeLifecycle() {
-      if (subscription || !auth || typeof auth.onAuthStateChange !== 'function') return;
-      const result = auth.onAuthStateChange((event, session, info) => {
-        if (info && info.error) { setError('auth_state_change_failed'); return; }
-        if (event === 'TOKEN_REFRESHED') return;
-        if (event === 'SIGNED_OUT') { applySession(null); return; }
-        if (event === 'INITIAL_SESSION' || event === 'SIGNED_IN') applySession(session || null);
-      });
-      subscription = result && result.data && result.data.subscription || null;
+      if (!settings.configured) {
+        if (settings.required) throw error('auth_not_configured');
+        unauthenticated();
+        return null;
+      }
+      if (refreshPromise) return refreshPromise;
+      refreshPromise = (async () => {
+        try {
+          const payload = await request('/api/v1/auth/refresh', null);
+          return applyToken(payload, state.email);
+        } catch (cause) {
+          clearSession();
+          if (cause && ['session_expired', 'authentication_required'].includes(cause.code)) unauthenticated();
+          else setError(cause && cause.code);
+          throw cause;
+        } finally {
+          refreshPromise = null;
+        }
+      })();
+      return refreshPromise;
     }
     async function initialize() {
       if (settings.required && !settings.configured) { setError('auth_not_configured'); return getState(); }
-      if (!settings.configured) { applySession(null); return getState(); }
-      try {
-        const app = normalizeSdk(sdk).init({ env: settings.envId, region: settings.region, accessKey: settings.publishableKey });
-        auth = authFromApp(app);
-        subscribeLifecycle();
-        applySession(await restoreSession());
-      } catch (cause) {
-        setError(cause && cause.code || 'auth_service_unavailable');
+      if (!settings.configured) { unauthenticated(); return getState(); }
+      try { await restoreSession(); }
+      catch (cause) {
+        if (cause && ['session_expired', 'authentication_required'].includes(cause.code)) unauthenticated();
       }
       return getState();
     }
     async function signIn(email, password) {
-      const response = await requireAuth().signInWithPassword({ email, password });
-      if (resultError(response)) throw error('invalid_credentials', '邮箱或密码不正确。');
-      const session = sessionFrom(response) || await restoreSession();
-      if (!tokenFrom(session)) throw error('auth_session_missing', '登录状态不可用，请重新登录。');
-      applySession(session);
+      const payload = await request('/api/v1/auth/sign-in', { username: email, password });
+      applyToken(payload, email);
       return getState();
     }
-    async function startSignUp(email, password) {
-      const response = await requireAuth().signUp({ email, password });
-      if (resultError(response)) throw error('signup_unavailable', '注册暂时不可用，请稍后重试。');
-      const verifyOtp = response && response.data && response.data.verifyOtp;
-      if (typeof verifyOtp !== 'function') throw error('signup_challenge_missing', '注册验证暂时不可用，请稍后重试。');
-      verification = verifyOtp;
-      return { status: 'verification_required' };
+    async function startSignUp(email) {
+      const payload = await request('/api/v1/auth/register/start', { email });
+      const id = payload && payload.verification_id;
+      if (typeof id !== 'string' || !id) throw error('signup_challenge_missing');
+      verificationId = id;
+      verificationEmail = email;
+      return { status: 'verification_required', expiresIn: payload.expires_in };
     }
-    async function verifySignUp(code) {
-      if (typeof verification !== 'function') throw error('verification_not_started', '请先提交注册信息。');
-      const response = await verification({ token: code });
-      if (resultError(response)) throw error('verification_invalid', '验证码无效或已过期。');
-      verification = null;
-      const session = sessionFrom(response) || await restoreSession();
-      if (!tokenFrom(session)) throw error('auth_session_missing', '验证完成后未能建立登录状态。');
-      applySession(session);
+    async function verifySignUp(code, password) {
+      if (!verificationId || !verificationEmail) throw error('verification_not_started');
+      const email = verificationEmail;
+      const payload = await request('/api/v1/auth/register/complete', {
+        email,
+        verification_id: verificationId,
+        verification_code: code,
+        password,
+      });
+      verificationId = null; verificationEmail = null;
+      applyToken(payload, email);
       return getState();
     }
     async function getAccessToken() {
-      if (!auth) return null;
-      const session = await restoreSession();
-      return tokenFrom(session);
+      if (accessToken && expiresAt > Date.now() + 30000) return accessToken;
+      try {
+        await restoreSession();
+        return accessToken;
+      } catch (cause) {
+        if (!cause || !['session_expired', 'authentication_required'].includes(cause.code)) setError(cause && cause.code);
+        throw error('authentication_required');
+      }
     }
     async function signOut() {
-      const response = await requireAuth().signOut();
-      if (resultError(response)) throw error('signout_failed', '退出登录暂时不可用，请重试。');
-      verification = null; applySession(null);
+      const token = accessToken;
+      verificationId = null; verificationEmail = null;
+      if (!token) { clearSession(); return unauthenticated(); }
+      try {
+        await request('/api/v1/auth/sign-out', null, { Authorization: `Bearer ${token}` });
+      } catch (cause) {
+        clearSession();
+        setError(cause && cause.code === 'session_expired' ? 'session_expired' : 'signout_failed');
+        throw cause;
+      }
+      clearSession();
+      return unauthenticated();
     }
     function getState() { return { ...state }; }
     function subscribe(listener) {
@@ -138,15 +197,12 @@
       listeners.add(listener); listener(getState());
       return () => listeners.delete(listener);
     }
-    function destroy() {
-      if (subscription && typeof subscription.unsubscribe === 'function') subscription.unsubscribe();
-      subscription = null; listeners.clear(); verification = null; auth = null;
-    }
+    function destroy() { destroyed = true; listeners.clear(); verificationId = null; verificationEmail = null; accessToken = null; expiresAt = 0; refreshPromise = null; }
     return Object.freeze({ initialize, getState, getAccessToken, signIn, startSignUp, verifySignUp, signOut, subscribe, destroy });
   }
 
   async function establishAccountBoundary({ userId, stores, storage = global.localStorage }) {
-    if (!UUID.test(userId || '')) throw error('invalid_account_marker', '账号状态无效，请重新登录。');
+    if (!UUID.test(userId || '')) throw error('auth_provider_unavailable');
     const existing = storage && storage.getItem(ACCOUNT_MARKER_KEY);
     const changed = existing !== userId;
     if (changed && stores && typeof stores.clearAll === 'function') await stores.clearAll();

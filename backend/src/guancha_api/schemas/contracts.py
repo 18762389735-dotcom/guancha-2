@@ -224,6 +224,69 @@ class CurrentUserResponse(ContractModel):
     created_at: datetime
 
 
+_AUTH_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _validate_auth_email(value: str) -> str:
+    normalized = value.strip().lower()
+    if not _AUTH_EMAIL_PATTERN.fullmatch(normalized):
+        raise ValueError("invalid email")
+    return normalized
+
+
+def _validate_auth_password(value: str) -> str:
+    if not re.fullmatch(r"(?=.*[A-Za-z])(?=.*\d).{8,32}", value):
+        raise ValueError("invalid password")
+    return value
+
+
+class RegisterStartRequest(ContractModel):
+    email: str = Field(min_length=3, max_length=320)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        return _validate_auth_email(value)
+
+
+class RegisterStartResponse(ContractModel):
+    verification_id: str = Field(min_length=1, max_length=256)
+    expires_in: int = Field(gt=0)
+
+
+class RegisterCompleteRequest(ContractModel):
+    email: str = Field(min_length=3, max_length=320)
+    verification_id: str = Field(min_length=1, max_length=256)
+    verification_code: str = Field(min_length=4, max_length=12, pattern=r"^\d+$")
+    password: str = Field(min_length=8, max_length=32)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        return _validate_auth_email(value)
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        return _validate_auth_password(value)
+
+
+class SignInRequest(ContractModel):
+    username: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=256)
+
+    @field_validator("username")
+    @classmethod
+    def normalize_username(cls, value: str) -> str:
+        return _validate_auth_email(value)
+
+class AuthTokenResponse(ContractModel):
+    access_token: str = Field(min_length=1, max_length=8192)
+    expires_in: int = Field(gt=0)
+    sub: str = Field(min_length=1, max_length=512)
+    token_type: str = "Bearer"
+
+
 # These exact values mirror the existing frontend/stores.js whitelist.  The
 # server owns the same boundary so a client cannot smuggle unrelated state into
 # the durable profile JSON document.

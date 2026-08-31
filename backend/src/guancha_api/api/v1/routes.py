@@ -2,9 +2,11 @@ import os
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Request, Response, UploadFile, status
+from fastapi import APIRouter, Cookie, Depends, File, Header, HTTPException, Query, Request, Response, UploadFile, status
 
-from guancha_api.auth.dependencies import AuthenticatedRequestRepository, CurrentUser, Owner, RequestRepository
+from guancha_api.auth.dependencies import AuthenticatedRequestRepository, CurrentUser, Owner, RequestRepository, _bearer_token
+from guancha_api.auth.cookies import AUTH_REFRESH_COOKIE, clear_refresh_cookie, set_refresh_cookie
+from guancha_api.auth.gateway import CloudBaseAuthError
 from guancha_api.application.phase2_service import Phase2ExtractionService
 from guancha_api.application.decision_service import SessionDecisionService
 from guancha_api.application.question_service import QuestionGenerationService
@@ -48,6 +50,11 @@ from guancha_api.schemas.contracts import (
     PutWarehouseTeaRequest,
     WarehouseTea,
     canonical_empty_preference_profile,
+    AuthTokenResponse,
+    RegisterCompleteRequest,
+    RegisterStartRequest,
+    RegisterStartResponse,
+    SignInRequest,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["public"])
@@ -134,7 +141,7 @@ async def admin_rule_version(_: Annotated[None, Depends(require_admin_token)]) -
     return {"rule_version": "tieguanyin-rules-v1"}
 
 def _public_auth_config() -> PublicAuthConfig:
-    """Expose only the browser-safe CloudBase initialization values."""
+    """Expose only the browser-safe CloudBase BFF configuration values."""
     required = os.getenv("GUANCHA_AUTH_REQUIRED", "false").strip().lower() in {"1", "true", "yes", "on"}
     env_id = os.getenv("CLOUDBASE_ENV_ID", "").strip() or None
     region = os.getenv("CLOUDBASE_REGION", "ap-shanghai").strip().lower() or "ap-shanghai"
@@ -142,7 +149,7 @@ def _public_auth_config() -> PublicAuthConfig:
     valid_region = region in _CLOUDBASE_PUBLIC_REGIONS
     return PublicAuthConfig(
         required=required,
-        configured=bool(env_id and publishable_key and valid_region),
+        configured=bool(env_id and valid_region),
         provider="cloudbase",
         env_id=env_id,
         region=region,
@@ -153,6 +160,122 @@ def _public_auth_config() -> PublicAuthConfig:
 @router.get("/config/public", response_model=PublicConfig)
 async def get_public_config() -> PublicConfig:
     return PublicConfig(auth=_public_auth_config())
+
+
+def _auth_gateway(raw: Request):
+    gateway = getattr(raw.app.state, "auth_gateway", None)
+    if gateway is None:
+        raise HTTPException(status_code=503, detail="auth_not_configured")
+    return gateway
+
+
+def _auth_value(payload: object, key: str) -> object:
+    if not isinstance(payload, dict):
+        return None
+    if key in payload:
+        return payload[key]
+    nested = payload.get("data")
+    return nested.get(key) if isinstance(nested, dict) else None
+
+
+def _token_response(payload: object) -> tuple[AuthTokenResponse, str]:
+    access_token = _auth_value(payload, "access_token")
+    refresh_token = _auth_value(payload, "refresh_token")
+    expires_in = _auth_value(payload, "expires_in")
+    subject = _auth_value(payload, "sub")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        raise CloudBaseAuthError("auth_provider_unavailable", status_code=503, retryable=True)
+    try:
+        result = AuthTokenResponse(
+            access_token=access_token,
+            expires_in=expires_in,
+            sub=subject,
+        )
+    except Exception:
+        raise CloudBaseAuthError("auth_provider_unavailable", status_code=503, retryable=True) from None
+    return result, refresh_token
+
+
+@router.post("/auth/register/start", response_model=RegisterStartResponse, tags=["auth"])
+async def start_registration(request: RegisterStartRequest, raw: Request) -> RegisterStartResponse:
+    payload = await _auth_gateway(raw).send_verification(request.email)
+    try:
+        return RegisterStartResponse(
+            verification_id=_auth_value(payload, "verification_id"),
+            expires_in=_auth_value(payload, "expires_in"),
+        )
+    except Exception:
+        raise CloudBaseAuthError("auth_provider_unavailable", status_code=503, retryable=True) from None
+
+
+@router.post("/auth/register/complete", response_model=AuthTokenResponse, tags=["auth"])
+async def complete_registration(
+    request: RegisterCompleteRequest,
+    raw: Request,
+    response: Response,
+) -> AuthTokenResponse:
+    verification = await _auth_gateway(raw).verify_verification(
+        request.verification_id,
+        request.verification_code,
+    )
+    verification_token = _auth_value(verification, "verification_token")
+    if not isinstance(verification_token, str) or not verification_token:
+        raise CloudBaseAuthError("auth_provider_unavailable", status_code=503, retryable=True)
+    tokens = await _auth_gateway(raw).sign_up(
+        email=request.email,
+        verification_token=verification_token,
+        password=request.password,
+    )
+    result, refresh_token = _token_response(tokens)
+    set_refresh_cookie(raw, response, refresh_token)
+    return result
+
+
+@router.post("/auth/sign-in", response_model=AuthTokenResponse, tags=["auth"])
+async def sign_in(
+    request: SignInRequest,
+    raw: Request,
+    response: Response,
+) -> AuthTokenResponse:
+    tokens = await _auth_gateway(raw).sign_in(username=request.username, password=request.password)
+    result, refresh_token = _token_response(tokens)
+    set_refresh_cookie(raw, response, refresh_token)
+    return result
+
+
+@router.post("/auth/refresh", response_model=AuthTokenResponse, tags=["auth"])
+async def refresh_session(
+    raw: Request,
+    response: Response,
+    refresh_token: str | None = Cookie(default=None, alias=AUTH_REFRESH_COOKIE),
+) -> AuthTokenResponse:
+    if not refresh_token:
+        raise HTTPException(status_code=401, detail="session_expired")
+    try:
+        tokens = await _auth_gateway(raw).refresh(refresh_token)
+        result, rotated_refresh_token = _token_response(tokens)
+    except CloudBaseAuthError as exc:
+        exc.clear_cookie = True
+        raise
+    set_refresh_cookie(raw, response, rotated_refresh_token)
+    return result
+
+
+@router.post("/auth/sign-out", tags=["auth"])
+async def sign_out(
+    raw: Request,
+    response: Response,
+    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
+) -> dict[str, str]:
+    access_token = _bearer_token(authorization)
+    try:
+        await _auth_gateway(raw).sign_out(access_token)
+    except CloudBaseAuthError as exc:
+        exc.clear_cookie = True
+        raise
+    finally:
+        clear_refresh_cookie(raw, response)
+    return {"status": "signed_out"}
 
 
 @router.get("/me", response_model=CurrentUserResponse, tags=["auth"])

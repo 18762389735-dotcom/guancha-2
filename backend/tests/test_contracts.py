@@ -59,13 +59,13 @@ def test_public_config_exposes_only_browser_safe_cloudbase_auth_values(monkeypat
     assert "must-not-leak" not in response.text
 
 
-def test_required_auth_without_publishable_key_is_not_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_required_auth_without_publishable_key_is_configured_for_server_side_bff(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GUANCHA_AUTH_REQUIRED", "true")
     monkeypatch.setenv("CLOUDBASE_ENV_ID", "env-test")
     monkeypatch.delenv("CLOUDBASE_PUBLISHABLE_KEY", raising=False)
     assert client.get("/api/v1/config/public").json()["auth"] == {
         "required": True,
-        "configured": False,
+        "configured": True,
         "provider": "cloudbase",
         "env_id": "env-test",
         "region": "ap-shanghai",
@@ -96,6 +96,11 @@ def test_openapi_contains_frozen_phase2_contract_paths() -> None:
     assert set(response.json()["paths"]) == {
         "/health",
         "/api/v1/config/public",
+        "/api/v1/auth/register/start",
+        "/api/v1/auth/register/complete",
+        "/api/v1/auth/sign-in",
+        "/api/v1/auth/refresh",
+        "/api/v1/auth/sign-out",
         "/api/v1/me",
         "/api/v1/me/preferences",
         "/api/v1/me/preference-evidence",

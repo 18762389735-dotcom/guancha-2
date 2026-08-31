@@ -16,87 +16,90 @@ function load() {
   return { auth: window.GuanchaAuth, values };
 }
 function configured() { return { required: true, configured: true, provider: 'cloudbase', envId: 'env-test', region: 'ap-shanghai', publishableKey: 'public-key' }; }
-function fakeSdk(initialSession = null) {
-  let session = initialSession;
-  let listener = null;
-  let verify = null;
+function tokenPayload(token = 'fake-access-token', sub = userA) { return { access_token: token, expires_in: 3600, sub }; }
+function transportFor({ restored = false, failures = {} } = {}) {
+  let refreshCount = 0;
   const calls = [];
-  const auth = {
-    getSession: async () => ({ data: { session } }),
-    signInWithPassword: async input => { calls.push(['login', input]); session = { access_token: 'fake-access-token', user: { email: input.email } }; return { data: { session } }; },
-    signUp: async input => { calls.push(['signup', input]); verify = async ({ token }) => token === '123456' ? ({ data: { session: session = { access_token: 'fake-access-token', user: { email: input.email } } } }) : ({ error: { code: 'invalid' } }); return { data: { verifyOtp: verify } }; },
-    signOut: async () => { calls.push(['signout']); session = null; return { data: {} }; },
-    onAuthStateChange: callback => { listener = callback; return { data: { subscription: { unsubscribe: () => { listener = null; } } } }; },
+  const transport = async request => {
+    calls.push(request);
+    if (request.path === '/api/v1/auth/refresh') {
+      refreshCount += 1;
+      if (restored || refreshCount > 1) return { ok: true, body: tokenPayload('restored-access-token') };
+      return { ok: false, status: 401, body: { error: { code: 'session_expired' } } };
+    }
+    if (failures[request.path]) return { ok: false, status: failures[request.path].status || 400, body: { error: { code: failures[request.path].code } } };
+    if (request.path === '/api/v1/auth/sign-in') return { ok: true, body: tokenPayload() };
+    if (request.path === '/api/v1/auth/register/start') return { ok: true, body: { verification_id: 'verification-1', expires_in: 600 } };
+    if (request.path === '/api/v1/auth/register/complete') return { ok: true, body: tokenPayload('registered-access-token') };
+    if (request.path === '/api/v1/auth/sign-out') return { ok: true, body: { status: 'signed_out' } };
+    throw new Error(`unexpected path ${request.path}`);
   };
-  return { sdk: { init: input => { calls.push(['init', input]); return { auth }; } }, calls, emit: (event, nextSession, info = null) => listener && listener(event, nextSession, info) };
+  return { transport, calls };
 }
 
-test('restore, login, signup verification and transient access token follow the CloudBase v3 boundary', async () => {
-  const { auth, values } = load(); const fake = fakeSdk();
-  const client = auth.createAuthClient(configured(), { sdk: fake.sdk });
+test('BFF login, registration verification, transient token and no frontend token persistence', async () => {
+  const { auth, values } = load(); const fake = transportFor();
+  const client = auth.createAuthClient(configured(), { transport: fake.transport });
   assert.equal((await client.initialize()).status, 'unauthenticated');
   await client.signIn('tea@example.com', 'Password1');
   assert.equal(client.getState().status, 'authenticated');
   assert.equal(await client.getAccessToken(), 'fake-access-token');
   assert.equal(JSON.stringify(client.getState()).includes('fake-access-token'), false);
-  await client.startSignUp('new@example.com', 'Password1');
-  await client.verifySignUp('123456');
+  await client.startSignUp('new@example.com');
+  await client.verifySignUp('123456', 'Password1');
   assert.equal(client.getState().email, 'new@example.com');
   assert.equal([...values.values()].join(''), '');
-  assert.deepEqual(JSON.parse(JSON.stringify(fake.calls[0])), ['init', { env: 'env-test', region: 'ap-shanghai', accessKey: 'public-key' }]);
-  assert.equal(fake.calls.some(item => JSON.stringify(item).includes('Password1')), true);
+  const signupStart = fake.calls.find(item => item.path.endsWith('/register/start'));
+  assert.deepEqual(JSON.parse(JSON.stringify(signupStart.payload)), { email: 'new@example.com' });
+  const complete = fake.calls.find(item => item.path.endsWith('/register/complete'));
+  assert.deepEqual(JSON.parse(JSON.stringify(complete.payload)), { email: 'new@example.com', verification_id: 'verification-1', verification_code: '123456', password: 'Password1' });
 });
 
-test('OTP failures, malformed SDK responses and signout fail closed without exporting a session', async () => {
-  const { auth } = load(); const fake = fakeSdk();
-  const client = auth.createAuthClient(configured(), { sdk: fake.sdk });
-  await client.initialize(); await client.startSignUp('tea@example.com', 'Password1');
-  await assert.rejects(client.verifySignUp('bad'), error => error.code === 'verification_invalid');
+test('reload restores through BFF refresh and refresh token is never returned to frontend state', async () => {
+  const { auth } = load(); const fake = transportFor({ restored: true });
+  const client = auth.createAuthClient(configured(), { transport: fake.transport });
+  assert.equal((await client.initialize()).status, 'authenticated');
+  assert.equal(await client.getAccessToken(), 'restored-access-token');
+  assert.equal(JSON.stringify(client.getState()).includes('refresh'), false);
+  assert.equal(fake.calls.filter(item => item.path.endsWith('/refresh')).length, 1);
+});
+
+test('BFF errors map to safe codes and malformed success fails closed', async () => {
+  const { auth } = load();
+  const invalid = transportFor({ failures: { '/api/v1/auth/sign-in': { code: 'invalid_credentials' } } });
+  const client = auth.createAuthClient(configured(), { transport: invalid.transport });
+  await client.initialize();
+  await assert.rejects(client.signIn('tea@example.com', 'Password1'), error => error.code === 'invalid_credentials' && !error.message.includes('Password1'));
+  const malformed = auth.createAuthClient(configured(), { transport: async () => ({ ok: true, body: { access_token: 'fake-access-token' } }) });
+  assert.deepEqual(JSON.parse(JSON.stringify(await malformed.initialize())), { status: 'error', email: null, errorCode: 'auth_provider_unavailable' });
+});
+
+test('signout calls the BFF and immediately clears the in-memory session', async () => {
+  const { auth } = load(); const fake = transportFor();
+  const client = auth.createAuthClient(configured(), { transport: fake.transport });
+  await client.initialize(); await client.signIn('tea@example.com', 'Password1');
   await client.signOut();
   assert.equal(client.getState().status, 'unauthenticated');
-  const malformed = auth.createAuthClient(configured(), { sdk: { init: () => ({ auth: { getSession: async () => ({ data: {} }) } }) } });
-  assert.deepEqual(JSON.parse(JSON.stringify(await malformed.initialize())), { status: 'error', email: null, errorCode: 'auth_sdk_unavailable' });
+  const signout = fake.calls.find(item => item.path.endsWith('/sign-out'));
+  assert.equal(signout.headers.Authorization, 'Bearer fake-access-token');
 });
 
-test('CloudBase v3 lifecycle signature ignores token refresh and blocks a required-auth subscriber on signed out', async () => {
-  const { auth } = load(); const fake = fakeSdk({ access_token: 'fake-access-token', user: { email: 'tea@example.com' } });
-  const client = auth.createAuthClient(configured(), { sdk: fake.sdk });
-  await client.initialize();
-  let businessReady = true;
-  client.subscribe(next => { if (next.status === 'unauthenticated') businessReady = false; });
-  const refreshed = { access_token: 'refreshed-fake-token', user: { email: 'tea@example.com' } };
-  fake.emit('TOKEN_REFRESHED', refreshed, null);
-  assert.equal(client.getState().status, 'authenticated');
-  assert.equal(businessReady, true);
-  fake.emit('SIGNED_OUT', null, null);
-  assert.equal(client.getState().status, 'unauthenticated');
-  assert.equal(businessReady, false);
-});
-
-test('callable app.auth remains a compatibility fallback after the v3 object path', async () => {
-  const { auth } = load(); const fake = fakeSdk();
-  const client = auth.createAuthClient(configured(), { sdk: { init: () => ({ auth: () => ({
-    getSession: async () => ({ data: { session: null } }), signInWithPassword: async () => ({ error: {} }), signUp: async () => ({ error: {} }), signOut: async () => ({ data: {} }), onAuthStateChange: () => ({ data: {} }),
-  }) }) } });
+test('invalid refresh becomes signed out and does not silently use anonymous state', async () => {
+  const { auth } = load(); const fake = transportFor();
+  const client = auth.createAuthClient(configured(), { transport: fake.transport });
   assert.equal((await client.initialize()).status, 'unauthenticated');
+  assert.equal(client.getState().status, 'unauthenticated');
 });
 
 test('auth client defensively accepts only the CloudBase region allowlist', async () => {
   const { auth } = load();
   for (const region of ['ap-shanghai', 'ap-guangzhou', 'ap-singapore']) {
-    const client = auth.createAuthClient({ ...configured(), region }, { sdk: fakeSdk().sdk });
+    const fake = transportFor();
+    const client = auth.createAuthClient({ ...configured(), region }, { transport: fake.transport });
     assert.equal((await client.initialize()).status, 'unauthenticated');
   }
-  const rejected = auth.createAuthClient({ ...configured(), region: 'ap-unknown' }, { sdk: fakeSdk().sdk });
+  const rejected = auth.createAuthClient({ ...configured(), region: 'ap-unknown' }, { transport: transportFor().transport });
   assert.deepEqual(JSON.parse(JSON.stringify(await rejected.initialize())), { status: 'error', email: null, errorCode: 'auth_not_configured' });
-});
-
-test('a relevant lifecycle error fails closed without exposing CloudBase details', async () => {
-  const { auth } = load(); const fake = fakeSdk({ access_token: 'fake-access-token', user: { email: 'tea@example.com' } });
-  const client = auth.createAuthClient(configured(), { sdk: fake.sdk });
-  await client.initialize();
-  fake.emit('SIGNED_IN', null, { error: { token: 'not-exposed' } });
-  assert.deepEqual(JSON.parse(JSON.stringify(client.getState())), { status: 'error', email: null, errorCode: 'auth_state_change_failed' });
 });
 
 test('account boundaries clear legacy browser state on first login and account switch, but not same-user reload', async () => {
