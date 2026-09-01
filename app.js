@@ -515,10 +515,8 @@ async function resumeLiveBackendState() {
     state.rejudgeJobId = ['queued', 'processing'].includes(snapshot.rejudge_job?.status) ? snapshot.rejudge_job.id : null;
     if (state.rejudgeJobId) state.questionStatus = 'rejudging';
     else if (snapshot.decision_delta || (snapshot.question_decision_version_id && snapshot.question_decision_version_id !== snapshot.current_decision_id)) state.questionStatus = 'completed';
-    else if (state.followupQuestions.length) {
-      const questionIds = new Set(state.followupQuestions.map(item => item.id));
-      state.questionStatus = [...questionIds].every(id => state.merchantReplyIds[id]) ? 'ready' : 'completed';
-    } else if (snapshot.question_generation_status === 'completed') state.questionStatus = 'not-needed';
+    else if (state.followupQuestions.length) state.questionStatus = merchantQuestionReadiness();
+    else if (snapshot.question_generation_status === 'completed') state.questionStatus = 'not-needed';
     else if (snapshot.question_generation_status === 'failed') state.questionStatus = 'failed';
     else state.questionStatus = 'idle';
     // Only a reload of an explicitly active selection flow may resume a
@@ -622,10 +620,7 @@ async function openFollowupQuestions() {
     state.questionDecisionVersionId = state.decisionVersionId;
     // Reopening the sheet must preserve the aggregate-rejudge readiness that
     // was earned by replies saved before this render.
-    const requiredQuestionIds = new Set(questions.map(item => item.id));
-    state.questionStatus = requiredQuestionIds.size === 0
-      ? 'not-needed'
-      : [...requiredQuestionIds].every(id => state.merchantReplyIds?.[id]) ? 'ready' : 'completed';
+    state.questionStatus = merchantQuestionReadiness();
     productAnalytics.track('merchant_question_viewed', { candidate_id: currentCandidate()?.serverCandidateId, decision_version_id: state.decisionVersionId, metadata: { question_count: questions.length, screen: state.screen } });
     saveState(); render();
   } catch (error) {
@@ -635,6 +630,38 @@ async function openFollowupQuestions() {
 }
 function replyNeedsClarification(reply) {
   return ['partially-answered', 'evasive', 'not-answered', 'conflicting'].includes(reply?.parse_status);
+}
+function pendingMerchantQuestions(candidate) {
+  return merchantQuestions(candidate).filter(item => !item.reply || replyNeedsClarification(item.reply));
+}
+function merchantQuestionReadiness() {
+  const requiredQuestionIds = new Set((state.followupQuestions || []).map(item => item.id));
+  return requiredQuestionIds.size === 0
+    ? 'not-needed'
+    : [...requiredQuestionIds].every(id => state.merchantReplyIds?.[id] || state.merchantReplies?.[id]?.id) ? 'ready' : 'completed';
+}
+function nextPendingMerchantCandidate(candidate) {
+  return state.candidates.find(item => item !== candidate && pendingMerchantQuestions(item).length) || null;
+}
+async function reconcileMerchantReplyState() {
+  let snapshot = null;
+  if (state.sessionId && apiClient.isConfigured && typeof apiClient.getSelectionSnapshot === 'function') {
+    try {
+      snapshot = await apiClient.getSelectionSnapshot(state.sessionId);
+    } catch {
+      // The successful reply is already retained locally; a temporary
+      // snapshot failure must not turn it into a false failed state.
+    }
+  }
+  if (snapshot) {
+    state.followupQuestions = snapshot.questions || [];
+    state.questionDecisionVersionId = snapshot.question_decision_version_id || null;
+    state.merchantReplyIds = Object.fromEntries((snapshot.merchant_replies || []).map(reply => [reply.followup_question_id, reply.id]));
+    state.merchantReplies = Object.fromEntries((snapshot.merchant_replies || []).map(reply => [reply.followup_question_id, reply]));
+  }
+  state.questionStatus = merchantQuestionReadiness();
+  saveState();
+  render();
 }
 function replyGuidance(question) {
   const answer = String(question?.reply?.raw_text || '').trim();
@@ -651,9 +678,16 @@ function replyGuidance(question) {
   return `商家回复${quoted}，但还不足以确认“${question?.fieldLabel || '这项信息'}”。请让商家直接说明这项信息。`;
 }
 async function submitMerchantReply(rawText) {
-  const questions = (state.followupQuestions || []).filter(item => item.candidate_id === currentCandidate()?.serverCandidateId && (!state.merchantReplyIds?.[item.id] || replyNeedsClarification(state.merchantReplies?.[item.id])));
+  const candidate = currentCandidate();
+  const questions = pendingMerchantQuestions(candidate);
   const question = questions[0];
-  if (!question || !state.sessionId || !state.decisionVersionId || !apiClient.isConfigured) return showToast('请先生成当前问题');
+  if (!question) {
+    await reconcileMerchantReplyState();
+    if (merchantQuestionReadiness() === 'ready') return render();
+    const label = candidate?.letter || '当前';
+    return showToast(`候选 ${label} 的商家回复已保存，请切换到仍待补充的候选茶。`);
+  }
+  if (!state.sessionId || !state.decisionVersionId || !apiClient.isConfigured) return showToast('请先生成当前问题');
   try {
     state.questionStatus = 'submitting'; render();
     const reply = await apiClient.createMerchantReply(state.sessionId, {
@@ -663,9 +697,9 @@ async function submitMerchantReply(rawText) {
     state.merchantReplies = state.merchantReplies || {};
     state.merchantReplyIds[question.id] = reply.id;
     state.merchantReplies[question.id] = reply;
-    const requiredQuestionIds = new Set((state.followupQuestions || []).map(item => item.id));
-    state.questionStatus = [...requiredQuestionIds].every(id => state.merchantReplyIds[id]) ? 'ready' : 'completed';
+    state.questionStatus = merchantQuestionReadiness();
     saveState(); render();
+    await reconcileMerchantReplyState();
     if (state.questionStatus !== 'ready') return showToast('商家回复已保存，请继续补充其他候选茶的回复');
     showToast('全部待回复候选茶已保存，可更新本轮判断');
   } catch (error) { state.questionStatus = 'failed'; state.rejudgeError = error.code || 'rejudge_failed'; saveState(); render(); }
@@ -837,7 +871,10 @@ function render() {
       if (page) page.scrollTop = previousScrollTop;
     });
   }
-  if (state.overlay === 'ask' && ['completed', 'ready'].includes(state.questionStatus) && merchantQuestions(currentCandidate()).length) appendMerchantReplyForm();
+  if (state.overlay === 'ask' && ['completed', 'ready'].includes(state.questionStatus) && (state.followupQuestions || []).length) {
+    state.questionStatus = merchantQuestionReadiness();
+    appendMerchantReplyForm();
+  }
   if (state.overlay === 'ask' && state.questionStatus === 'completed') {
     const privacy = app.querySelector('.ask-sheet .privacy');
     if (privacy) privacy.textContent = '商家信息会先单独保存，全部候选茶回复齐后再统一更新判断；仍属于未核验声明。';
@@ -1039,13 +1076,21 @@ function appendMerchantReplyForm() {
   if (!sheet || sheet.querySelector('[data-action="submit-merchant-reply"]')) return;
   const form = document.createElement('form');
   form.className = 'merchant-reply-form'; form.dataset.action = 'submit-merchant-reply';
-  const ready = state.questionStatus === 'ready';
-  const currentQuestion = merchantQuestions(currentCandidate()).find(item => !item.reply || replyNeedsClarification(item.reply));
+  const candidate = currentCandidate();
+  const currentPendingQuestions = pendingMerchantQuestions(candidate);
+  const ready = merchantQuestionReadiness() === 'ready';
+  const currentQuestion = merchantQuestions(currentCandidate()).find(item => currentPendingQuestions.some(pending => pending.id === item.id));
   const needsClarification = replyNeedsClarification(currentQuestion?.reply);
   const targetLabel = currentQuestion ? `（对应：${escapeHtml(currentQuestion.question)}）` : '';
-  form.innerHTML = ready && !needsClarification
-    ? '<p class="soft-note">所有需要回复的候选茶已保存。确认后统一更新本轮判断。</p><button class="primary-btn" type="button" data-action="update-merchant-judgement">提交并更新判断</button>'
-    : `<label>商家回复${targetLabel}</label><textarea name="merchant-reply" required maxlength="4000" placeholder="${needsClarification ? '请只补充当前问题的明确回答' : '粘贴商家对当前问题的回复'}"></textarea><button class="primary-btn" type="submit">${needsClarification ? '补充商家回复' : '提交商家回复'}</button>`;
+  if (!currentQuestion && !ready) {
+    const nextCandidate = nextPendingMerchantCandidate(candidate);
+    const nextLabel = nextCandidate ? `（可切换至候选 ${nextCandidate.letter || '下一位'}）` : '';
+    form.innerHTML = `<p class="soft-note">候选 ${candidate?.letter || '当前'} 的商家回复已保存，请切换到仍待补充的候选茶。${nextLabel}</p>`;
+  } else {
+    form.innerHTML = ready && !needsClarification
+      ? '<p class="soft-note">所有需要回复的候选茶已保存。确认后统一更新本轮判断。</p><button class="primary-btn" type="button" data-action="update-merchant-judgement">提交并更新判断</button>'
+      : `<label>商家回复${targetLabel}</label><textarea name="merchant-reply" required maxlength="4000" placeholder="${needsClarification ? '请只补充当前问题的明确回答' : '粘贴商家对当前问题的回复'}"></textarea><button class="primary-btn" type="submit">${needsClarification ? '补充商家回复' : '提交商家回复'}</button>`;
+  }
   sheet.append(form);
 }
 // Archived composition for reference only. It is deliberately not reachable
