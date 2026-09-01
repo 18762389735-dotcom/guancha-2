@@ -5,6 +5,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import psycopg
+from psycopg_pool import AsyncConnectionPool
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -54,6 +55,42 @@ from guancha_api.repositories.postgres import (
 )
 from guancha_api.core.errors import ApiErrorDetail, ApiErrorResponse
 from guancha_api.product_events import ProductEventSink
+
+
+# Keep the per-instance pool small: the current Run maximum of five instances
+# yields at most fifteen pooled connections before the legacy admin connection.
+# All values remain environment-configurable for a deployment-specific limit.
+DEFAULT_DB_POOL_MIN_SIZE = 1
+DEFAULT_DB_POOL_MAX_SIZE = 3
+DEFAULT_DB_POOL_TIMEOUT_SECONDS = 5.0
+
+
+def _pool_setting(name: str, default: int | float, *, minimum: int | float) -> int | float:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = float(raw_value) if isinstance(default, float) else int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a valid number") from exc
+    if value < minimum:
+        raise RuntimeError(f"{name} must be at least {minimum}")
+    return value
+
+
+def _database_pool(database_url: str) -> AsyncConnectionPool:
+    min_size = int(_pool_setting("GUANCHA_DB_POOL_MIN_SIZE", DEFAULT_DB_POOL_MIN_SIZE, minimum=0))
+    max_size = int(_pool_setting("GUANCHA_DB_POOL_MAX_SIZE", DEFAULT_DB_POOL_MAX_SIZE, minimum=1))
+    timeout = float(_pool_setting("GUANCHA_DB_POOL_TIMEOUT_SECONDS", DEFAULT_DB_POOL_TIMEOUT_SECONDS, minimum=0.1))
+    if max_size < min_size:
+        raise RuntimeError("GUANCHA_DB_POOL_MAX_SIZE must be greater than or equal to GUANCHA_DB_POOL_MIN_SIZE")
+    return AsyncConnectionPool(
+        conninfo=database_url,
+        min_size=min_size,
+        max_size=max_size,
+        timeout=timeout,
+        open=False,
+    )
 
 
 def _provider_from_environment(storage: InMemoryTemporaryPrivateStorage) -> StructuredVisionProvider:
@@ -160,6 +197,7 @@ def _auth_gateway_from_environment() -> CloudBaseAuthGateway | None:
 def create_app(
     *,
     repository: PostgresPhase2Repository | None = None,
+    database_pool: AsyncConnectionPool | None = None,
     worker_repository_factory: Callable[[], Awaitable[PostgresPhase2Repository]] | None = None,
     task_runner: InProcessTaskRunner | None = None,
     temporary_storage: InMemoryTemporaryPrivateStorage | None = None,
@@ -185,13 +223,11 @@ def create_app(
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         owns_repository = repository is None
-        database_url = os.getenv("GUANCHA_DATABASE_URL")
-        application.state.repository = repository or (
-            await PostgresPhase2Repository.connect(database_url) if database_url else None
-        )
-        application.state.worker_repository_factory = worker_repository_factory or (
-            (lambda: PostgresPhase2Repository.connect(database_url)) if database_url else None
-        )
+        owns_database_pool = database_pool is None
+        database_url = os.getenv("GUANCHA_DATABASE_URL", "").strip()
+        application.state.repository = repository
+        application.state.database_pool = database_pool
+        application.state.worker_repository_factory = worker_repository_factory
         application.state.temporary_storage = resolved_temporary_storage
         application.state.task_runner = resolved_task_runner
         application.state.provider = resolved_provider
@@ -201,19 +237,30 @@ def create_app(
         application.state.product_event_sink = resolved_product_event_sink
         application.state.token_verifier = resolved_token_verifier
         application.state.auth_gateway = resolved_auth_gateway
-        if application.state.repository is not None:
-            await application.state.repository.recover_interrupted_jobs()
         try:
+            if application.state.database_pool is None and database_url and repository is None:
+                application.state.database_pool = _database_pool(database_url)
+            if application.state.worker_repository_factory is None and database_url:
+                application.state.worker_repository_factory = lambda: PostgresPhase2Repository.connect(database_url)
+            if application.state.database_pool is not None:
+                await application.state.database_pool.open()
+            if application.state.repository is None and database_url:
+                application.state.repository = await PostgresPhase2Repository.connect(database_url)
+            if application.state.repository is not None:
+                await application.state.repository.recover_interrupted_jobs()
             yield
         finally:
             await application.state.task_runner.shutdown()
             if owns_repository and application.state.repository is not None:
                 await application.state.repository.close()
+            if owns_database_pool and application.state.database_pool is not None:
+                await application.state.database_pool.close()
 
     application = FastAPI(title="Guancha P0 API", version="0.1.0", lifespan=lifespan)
     # ASGI tests intentionally do not depend on a server process or lifespan
     # manager to exercise injected persistence boundaries.
     application.state.repository = repository
+    application.state.database_pool = database_pool
     application.state.worker_repository_factory = worker_repository_factory
     application.state.task_runner = resolved_task_runner
     application.state.temporary_storage = resolved_temporary_storage

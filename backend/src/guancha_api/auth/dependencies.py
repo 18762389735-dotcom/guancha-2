@@ -13,6 +13,7 @@ from guancha_api.auth.errors import (
     InvalidAccessToken,
 )
 from guancha_api.auth.models import CurrentUserInfo, OwnerContext
+from guancha_api.repositories.postgres import PostgresPhase2Repository
 
 
 def _bearer_token(authorization: str | None) -> str:
@@ -52,6 +53,13 @@ async def _resolve_authenticated_user(
             detail="authentication_service_unavailable",
         ) from None
 
+    database_pool = getattr(request.app.state, "database_pool", None)
+    if database_pool is not None:
+        async with database_pool.connection() as connection:
+            repository = PostgresPhase2Repository(connection)
+            app_user = await repository.resolve_or_create_app_user(identity.external_subject)
+        return CurrentUserInfo(id=app_user.id, created_at=app_user.created_at)
+
     worker_repository_factory = getattr(request.app.state, "worker_repository_factory", None)
     if worker_repository_factory is not None:
         repository = await worker_repository_factory()
@@ -77,9 +85,10 @@ async def get_authenticated_request_repository(
 ) -> AsyncIterator[object]:
     """Yield a fresh repository for a protected operation when possible.
 
-    The production fix in P9-3.5D established that authenticated user work
-    must not rely on the app-lifetime repository connection.  Retain injected
-    repositories only for deterministic isolated tests, and never close them.
+    Authenticated user work must not rely on the app-lifetime repository
+    connection.  Production uses an application-scoped Psycopg pool; the
+    factory and injected repository branches remain deterministic test and
+    compatibility fallbacks.
     """
 
     async with _request_repository(request) as repository:
@@ -89,9 +98,9 @@ async def get_authenticated_request_repository(
 async def get_request_repository(request: Request) -> AsyncIterator[object]:
     """Yield a request-scoped repository when the application provides one.
 
-    The worker factory is the production path for both authenticated and
-    anonymous request reads.  The injected application repository remains a
-    test-compatible fallback and is owned by the caller that injected it.
+    The application pool is the production path for ordinary request reads.
+    The worker factory and injected application repository remain compatible
+    fallbacks for workers, tests, and legacy paths.
     """
 
     async with _request_repository(request) as repository:
@@ -100,6 +109,12 @@ async def get_request_repository(request: Request) -> AsyncIterator[object]:
 
 @asynccontextmanager
 async def _request_repository(request: Request) -> AsyncIterator[object]:
+    database_pool = getattr(request.app.state, "database_pool", None)
+    if database_pool is not None:
+        async with database_pool.connection() as connection:
+            yield PostgresPhase2Repository(connection)
+        return
+
     worker_repository_factory = getattr(request.app.state, "worker_repository_factory", None)
     if worker_repository_factory is not None:
         repository = await worker_repository_factory()
