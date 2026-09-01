@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import psycopg
 import pytest
 import pytest_asyncio
+from psycopg_pool import AsyncConnectionPool
 from psycopg.rows import dict_row
 
 from guancha_api.repositories.postgres import (
@@ -60,6 +61,31 @@ async def _candidate(repository: PostgresPhase2Repository) -> tuple[UUID, UUID]:
     await repository.create_selection_session(session_id=session_id, client_id=client_id, idempotency_key=uuid4(), request_hash="a" * 64, need={"taste_text": "fresh"}, expires_at=datetime.now(timezone.utc))
     await repository.create_candidate(candidate_id=candidate_id, session_id=session_id, client_id=client_id, label="A", display_name="Tea", idempotency_key=uuid4(), request_hash="b" * 64)
     return client_id, candidate_id
+
+
+async def test_async_pool_preserves_repository_connection_semantics(
+    repository: PostgresPhase2Repository,
+) -> None:
+    pool = AsyncConnectionPool(
+        conninfo=DATABASE_URL,
+        kwargs={"autocommit": True, "row_factory": dict_row},
+        min_size=1,
+        max_size=1,
+        timeout=5.0,
+        open=False,
+    )
+    await pool.open()
+    try:
+        async with pool.connection() as connection:
+            assert connection.autocommit is True
+            pooled_repository = PostgresPhase2Repository(connection)
+            app_user = await pooled_repository.resolve_or_create_app_user("pool-semantics-user")
+            assert app_user.cloudbase_user_id == "pool-semantics-user"
+            async with connection.cursor() as cursor:
+                await cursor.execute("select %s as value", ("dict-row",))
+                assert await cursor.fetchone() == {"value": "dict-row"}
+    finally:
+        await pool.close()
 
 
 async def test_image_and_first_job_are_atomic_and_idempotent(repository: PostgresPhase2Repository) -> None:
