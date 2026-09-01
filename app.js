@@ -559,12 +559,15 @@ async function resumeLiveBackendState() {
 }
 function fitLabel(candidate, answerCandidate) {
   const bucket = candidate?.decision?.action_bucket;
-  if (bucket === 'not-recommended-now') return '目前不优先考虑';
-  if (bucket === 'insufficient-information') return '目前还看不清实际风格';
+  const sensoryNeedMatch = GuanchaAdapters.sensoryNeedMatch(candidate?.decision);
   // A server order can be driven by evidence sufficiency or trial cost.  It
   // must not be presented as a taste win when the explicit need found no
   // positive match for either candidate.
-  if (GuanchaAdapters.sensoryNeedMatch(candidate?.decision) <= 0) return '口味方向暂未分出高下';
+  if (sensoryNeedMatch <= 0) {
+    return Number(candidate?.decision?.overall_order) === 1 ? '综合条件下当前更优先' : '口味方向仍待体验确认';
+  }
+  if (bucket === 'not-recommended-now') return '目前不优先考虑';
+  if (bucket === 'insufficient-information') return '目前还看不清实际风格';
   if (Number(candidate?.decision?.overall_order) === 1) return '当前更接近你的方向';
   if ((answerCandidate?.sensory_interpretations || []).length) return '更偏另一种风格';
   return answerCandidate?.verdict || '目前还需要更多线索';
@@ -685,6 +688,7 @@ async function submitMerchantReply(rawText) {
     await reconcileMerchantReplyState();
     if (merchantQuestionReadiness() === 'ready') return render();
     const label = candidate?.letter || '当前';
+    if (!merchantQuestions(candidate).length) return showToast(`候选 ${label} 当前没有需要继续向商家确认的信息。`);
     return showToast(`候选 ${label} 的商家回复已保存，请切换到仍待补充的候选茶。`);
   }
   if (!state.sessionId || !state.decisionVersionId || !apiClient.isConfigured) return showToast('请先生成当前问题');
@@ -1077,6 +1081,7 @@ function appendMerchantReplyForm() {
   const form = document.createElement('form');
   form.className = 'merchant-reply-form'; form.dataset.action = 'submit-merchant-reply';
   const candidate = currentCandidate();
+  const candidateQuestions = merchantQuestions(candidate);
   const currentPendingQuestions = pendingMerchantQuestions(candidate);
   const ready = merchantQuestionReadiness() === 'ready';
   const currentQuestion = merchantQuestions(currentCandidate()).find(item => currentPendingQuestions.some(pending => pending.id === item.id));
@@ -1085,7 +1090,9 @@ function appendMerchantReplyForm() {
   if (!currentQuestion && !ready) {
     const nextCandidate = nextPendingMerchantCandidate(candidate);
     const nextLabel = nextCandidate ? `（可切换至候选 ${nextCandidate.letter || '下一位'}）` : '';
-    form.innerHTML = `<p class="soft-note">候选 ${candidate?.letter || '当前'} 的商家回复已保存，请切换到仍待补充的候选茶。${nextLabel}</p>`;
+    form.innerHTML = candidateQuestions.length
+      ? `<p class="soft-note">候选 ${candidate?.letter || '当前'} 的商家回复已保存，请切换到仍待补充的候选茶。${nextLabel}</p>`
+      : `<p class="soft-note">候选 ${candidate?.letter || '当前'} 当前没有需要继续向商家确认的信息。</p>`;
   } else {
     form.innerHTML = ready && !needsClarification
       ? '<p class="soft-note">所有需要回复的候选茶已保存。确认后统一更新本轮判断。</p><button class="primary-btn" type="button" data-action="update-merchant-judgement">提交并更新判断</button>'
@@ -1343,7 +1350,7 @@ function renderOverlay() {
     const candidate = currentCandidate(); const questions = merchantQuestions(candidate);
     const unresolvedReply = questions.find(item => replyNeedsClarification(item.reply));
     const replyNotice = unresolvedReply ? `<p class="soft-note">${escapeHtml(replyGuidance(unresolvedReply))}</p>` : '';
-    const body = state.questionStatus === 'loading' ? '<p class="soft-note">正在生成可回答的问题…</p>' : state.questionStatus === 'stale' ? '<p class="soft-note">当前判断已失效，请重新分析后再生成问题。</p>' : state.questionStatus === 'failed' ? '<p class="soft-note">问题生成失败，请重试。</p><button class="primary-btn" data-action="ask">重试生成</button>' : questions.length ? `${replyNotice}${questions.map((item,index) => `<article class="question-card"><div class="question-text"><span class="question-no">${index+1}</span>${escapeHtml(item.question)}</div><p class="question-reason">为什么值得问？${escapeHtml(item.reason || '这个回答可能改变当前选择，避免只凭商品页判断。')}</p><button class="copy-btn" data-action="copy-question" data-index="${index}">${icon('copy',16)} 复制</button></article>`).join('')}<button class="copy-all" data-action="copy-all">${icon('copy',20)} 复制全部问题</button><p class="privacy">提交商家回复后，系统会在服务端完成复判并返回变化说明。</p>` : '<p class="soft-note">目前没有值得继续追问的信息。</p>';
+    const body = state.questionStatus === 'loading' ? '<p class="soft-note">正在生成可回答的问题…</p>' : state.questionStatus === 'stale' ? '<p class="soft-note">当前判断已失效，请重新分析后再生成问题。</p>' : state.questionStatus === 'failed' ? '<p class="soft-note">问题生成失败，请重试。</p><button class="primary-btn" data-action="ask">重试生成</button>' : questions.length ? `${replyNotice}${questions.map((item,index) => `<article class="question-card"><div class="question-text"><span class="question-no">${index+1}</span>${escapeHtml(item.question)}</div><p class="question-reason">为什么值得问？${escapeHtml(item.reason || '这个回答可能改变当前选择，避免只凭商品页判断。')}</p><button class="copy-btn" data-action="copy-question" data-index="${index}">${icon('copy',16)} 复制</button></article>`).join('')}<button class="copy-all" data-action="copy-all">${icon('copy',20)} 复制全部问题</button><p class="privacy">提交商家回复后，系统会在服务端完成复判并返回变化说明。</p>` : `<p class="soft-note">候选 ${candidate.letter} 当前没有需要继续向商家确认的信息。</p>`;
     return `<div class="overlay"><section class="sheet ask-sheet"><div class="sheet-handle"></div><div class="sheet-title-row">${wordmark('ask-merchant.svg', 'wordmark--ask-merchant', '问商家')}<button class="sheet-close" data-action="close-overlay" aria-label="关闭">${icon('close')}</button></div><p class="ask-target">候选 ${candidate.letter} ・ ${escapeHtml(candidate.name)} <span class="leaf-mark">♧</span></p><p class="ask-tip"><i></i>这不是补字段：它可能改变当前哪款更值得优先考虑。</p>${body}</section></div>`;
   }
   return '';
