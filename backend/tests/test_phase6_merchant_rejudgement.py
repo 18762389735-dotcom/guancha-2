@@ -14,6 +14,7 @@ from psycopg.rows import dict_row
 
 from guancha_api.application.task_runners import ManualTaskRunner
 from guancha_api.application.merchant_reply_service import MerchantReplyService
+from guancha_api.application import merchant_reply_service as merchant_reply_service_module
 from guancha_api.domain.tieguanyin.decision import evaluate_candidate, rank_within_buckets
 from guancha_api.domain.tieguanyin.rules.rule_schema import load_approved_rules
 from guancha_api.infrastructure.storage.memory import InMemoryTemporaryPrivateStorage
@@ -229,6 +230,128 @@ async def test_rejudge_aggregates_all_saved_replies_into_one_delta(repository: P
         delta = (await client.get(f"/api/v1/decision-deltas/{completed['decision_delta_id']}", headers=headers)).json()
         assert set(delta["merchant_reply_ids"]) == set(reply_ids)
         assert delta["merchant_reply_id"] in reply_ids
+
+
+async def test_three_field_merchant_claims_survive_real_submit_and_aggregate_rejudge(
+    repository: PostgresPhase2Repository, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the full submit -> parse -> persist -> aggregate path lossless."""
+
+    values = {
+        "roast_level": "light",
+        "sample_available": "true",
+        "season": "spring",
+    }
+
+    class ThreeFieldProvider:
+        async def parse_merchant_reply(self, *, field_key, raw_text, **_kwargs):
+            return MerchantReplyParse(
+                reply_status="answered", answered_fields=(field_key,),
+                claims=({"field_key": field_key, "raw_text": raw_text, "normalized_value": values[field_key]},),
+                unresolved_fields=(), conflicts=(), coverage=1, ambiguity=0, should_rejudge=True,
+            )
+
+    captured_evidence: dict[object, list[dict[str, object]]] = {}
+    real_evaluate_candidate = merchant_reply_service_module.evaluate_candidate
+
+    def capture_evidence(**kwargs):
+        captured_evidence[kwargs["candidate_id"]] = list(kwargs["evidence"])
+        return real_evaluate_candidate(**kwargs)
+
+    monkeypatch.setattr(merchant_reply_service_module, "evaluate_candidate", capture_evidence)
+    runner = ManualTaskRunner()
+    app = create_app(
+        repository=repository, task_runner=runner, temporary_storage=InMemoryTemporaryPrivateStorage(),
+        provider=_vision(), merchant_reply_provider=ThreeFieldProvider(),
+    )
+    headers = {"X-Client-Id": str(uuid4())}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        session_id, v1 = await _current_decision(client, headers, runner)
+        async with repository._connection.cursor() as cursor:
+            await cursor.execute(
+                """select candidate_id from candidate_decisions
+                   where decision_version_id=%s order by overall_order limit 1""",
+                (v1,),
+            )
+            candidate = await cursor.fetchone()
+        assert candidate is not None
+
+        question_ids: dict[str, UUID] = {}
+        async with repository._connection.transaction():
+            async with repository._connection.cursor() as cursor:
+                for index, field_key in enumerate(values):
+                    question_id = uuid4()
+                    question_ids[field_key] = question_id
+                    await cursor.execute(
+                        """insert into followup_questions
+                           (id,decision_version_id,selection_session_id,candidate_id,field_key,question_text,reason,
+                            affected_decision,answer_branches,priority,value_score,value_components,status)
+                           values (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s::jsonb,'completed')""",
+                        (
+                            question_id, v1, session_id, candidate["candidate_id"], field_key,
+                            f"请确认{field_key}", "deterministic integration fixture", "[]", "[]", 3 - index, 3 - index, "{}",
+                        ),
+                    )
+
+        raw_texts = {
+            "roast_level": "这个火候不会太重，整体就是偏轻一点的。",
+            "sample_available": "如果想先试，可以给你寄一小袋尝尝。",
+            "season": "这是今年春天采的这一批。",
+        }
+        reply_ids: list[str] = []
+        for field_key, question_id in question_ids.items():
+            response = await client.post(
+                f"/api/v1/selection-sessions/{session_id}/merchant-replies",
+                headers={**headers, "Idempotency-Key": str(uuid4())},
+                json={"decision_version_id": v1, "followup_question_id": str(question_id), "raw_text": raw_texts[field_key]},
+            )
+            assert response.status_code == 201, response.text
+            reply_ids.append(response.json()["id"])
+
+        async with repository._connection.cursor() as cursor:
+            await cursor.execute(
+                """select count(*) as count from merchant_replies
+                   where decision_version_id=%s and id = any(%s::uuid[])""",
+                (v1, reply_ids),
+            )
+            assert (await cursor.fetchone())["count"] == 3
+
+        captured_evidence.clear()
+        job = await client.post(
+            f"/api/v1/selection-sessions/{session_id}/rejudge",
+            headers={**headers, "Idempotency-Key": str(uuid4())}, json={},
+        )
+        assert job.status_code == 201, job.text
+        assert await runner.drain() == 1
+
+        completed = (await client.get(f"/api/v1/jobs/{job.json()['id']}", headers=headers)).json()
+        assert completed["status"] == "completed"
+        delta = (await client.get(f"/api/v1/decision-deltas/{completed['decision_delta_id']}", headers=headers)).json()
+        assert set(delta["added_facts"]) == set(values)
+
+        async with repository._connection.cursor() as cursor:
+            await cursor.execute(
+                """select id,followup_question_id,candidate_id,processing_status,parse_status
+                   from merchant_replies where id = any(%s::uuid[]) order by created_at""",
+                (reply_ids,),
+            )
+            saved_replies = await cursor.fetchall()
+            await cursor.execute(
+                """select merchant_reply_id,candidate_id,field_key,normalized_value,information_status,evidence_strength
+                   from merchant_claims where merchant_reply_id = any(%s::uuid[]) order by created_at""",
+                (reply_ids,),
+            )
+            claims = await cursor.fetchall()
+
+        assert len(saved_replies) == 3
+        assert all(row["processing_status"] == "completed" and row["parse_status"] in {"answered", "conflicting"} for row in saved_replies)
+        assert len(claims) == 3
+        assert {(row["field_key"], row["normalized_value"]) for row in claims} == set(values.items())
+        assert all(row["information_status"] == "explicit" and row["evidence_strength"] == "medium" for row in claims)
+
+        assert len(captured_evidence) == 1
+        merchant_evidence = [row for row in next(iter(captured_evidence.values())) if row.get("source_type") == "merchant-claim"]
+        assert {(row["field_name"], row["normalized_value"]) for row in merchant_evidence} == set(values.items())
 
 
 async def test_foreign_client_cannot_read_reply_or_rejudge(repository: PostgresPhase2Repository) -> None:

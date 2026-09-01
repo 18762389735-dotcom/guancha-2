@@ -31,6 +31,7 @@ from guancha_api.providers.openai import OpenAIResponsesProvider
 from guancha_api.providers.mimo import DEFAULT_MIMO_BASE_URL, MiMoVisionProvider
 from guancha_api.providers.reasoning import FakeReasoningProvider, ReasoningProvider
 from guancha_api.providers.merchant_reply import FakeMerchantReplyReasoningProvider, MerchantReplyReasoningProvider
+from guancha_api.providers.merchant_reply_mimo import MiMoMerchantReplyReasoningProvider
 from guancha_api.providers.feedback import FakeFeedbackProvider, FeedbackReasoningProvider
 from guancha_api.repositories.postgres import (
     CandidateLimitExceeded,
@@ -126,6 +127,24 @@ def _token_verifier_from_environment() -> TokenVerifier:
         return ConfigurationErrorTokenVerifier()
 
 
+def _merchant_reply_provider_from_environment() -> MerchantReplyReasoningProvider:
+    configured_mode = os.getenv("GUANCHA_MERCHANT_REPLY_PROVIDER", "").strip().lower()
+    mode = configured_mode or ("mimo" if os.getenv("GUANCHA_PROVIDER", "").strip().lower() == "mimo" else "fake")
+    if mode == "fake":
+        return FakeMerchantReplyReasoningProvider()
+    if mode == "mimo":
+        api_key = os.getenv("MIMO_API_KEY", "").strip()
+        model = os.getenv("GUANCHA_MIMO_MODEL", "").strip()
+        if not api_key or not model:
+            raise RuntimeError("GUANCHA_MERCHANT_REPLY_PROVIDER=mimo requires MIMO_API_KEY and GUANCHA_MIMO_MODEL")
+        return MiMoMerchantReplyReasoningProvider(
+            api_key=api_key,
+            model=model,
+            base_url=os.getenv("MIMO_BASE_URL", DEFAULT_MIMO_BASE_URL),
+        )
+    raise RuntimeError("GUANCHA_MERCHANT_REPLY_PROVIDER must be fake or mimo")
+
+
 def _auth_gateway_from_environment() -> CloudBaseAuthGateway | None:
     env_id = os.getenv("CLOUDBASE_ENV_ID", "").strip()
     if not env_id:
@@ -157,7 +176,7 @@ def create_app(
     resolved_temporary_storage = temporary_storage or InMemoryTemporaryPrivateStorage()
     resolved_provider = provider or _provider_from_environment(resolved_temporary_storage)
     resolved_reasoning_provider = reasoning_provider or FakeReasoningProvider()
-    resolved_merchant_reply_provider = merchant_reply_provider or FakeMerchantReplyReasoningProvider()
+    resolved_merchant_reply_provider = merchant_reply_provider or _merchant_reply_provider_from_environment()
     resolved_feedback_provider = feedback_provider or FakeFeedbackProvider()
     resolved_product_event_sink = product_event_sink or ProductEventSink.from_environment()
     resolved_token_verifier = token_verifier or _token_verifier_from_environment()
