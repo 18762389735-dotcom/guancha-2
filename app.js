@@ -638,10 +638,13 @@ function pendingMerchantQuestions(candidate) {
   return merchantQuestions(candidate).filter(item => !item.reply || replyNeedsClarification(item.reply));
 }
 function merchantQuestionReadiness() {
-  const requiredQuestionIds = new Set((state.followupQuestions || []).map(item => item.id));
-  return requiredQuestionIds.size === 0
+  const requiredQuestions = (state.followupQuestions || []).filter(item => item?.id);
+  return requiredQuestions.length === 0
     ? 'not-needed'
-    : [...requiredQuestionIds].every(id => state.merchantReplyIds?.[id] || state.merchantReplies?.[id]?.id) ? 'ready' : 'completed';
+    : requiredQuestions.every(item => {
+      const reply = state.merchantReplies?.[item.id];
+      return Boolean(state.merchantReplyIds?.[item.id] || reply?.id) && !replyNeedsClarification(reply);
+    }) ? 'ready' : 'completed';
 }
 function nextPendingMerchantCandidate(candidate) {
   return state.candidates.find(item => item !== candidate && pendingMerchantQuestions(item).length) || null;
@@ -683,8 +686,7 @@ function replyGuidance(question) {
 async function submitMerchantReply(rawText) {
   const candidate = currentCandidate();
   const questions = pendingMerchantQuestions(candidate);
-  const question = questions[0];
-  if (!question) {
+  if (!questions.length) {
     await reconcileMerchantReplyState();
     if (merchantQuestionReadiness() === 'ready') return render();
     const label = candidate?.letter || '当前';
@@ -694,17 +696,30 @@ async function submitMerchantReply(rawText) {
   if (!state.sessionId || !state.decisionVersionId || !apiClient.isConfigured) return showToast('请先生成当前问题');
   try {
     state.questionStatus = 'submitting'; render();
-    const reply = await apiClient.createMerchantReply(state.sessionId, {
-      decision_version_id: state.decisionVersionId, followup_question_id: question.id, raw_text: rawText,
-    });
+    let failedCount = 0;
     state.merchantReplyIds = state.merchantReplyIds || {};
     state.merchantReplies = state.merchantReplies || {};
-    state.merchantReplyIds[question.id] = reply.id;
-    state.merchantReplies[question.id] = reply;
-    state.questionStatus = merchantQuestionReadiness();
-    saveState(); render();
+    for (const question of questions) {
+      try {
+        const reply = await apiClient.createMerchantReply(state.sessionId, {
+          decision_version_id: state.decisionVersionId, followup_question_id: question.id, raw_text: rawText,
+        });
+        state.merchantReplyIds[question.id] = reply.id;
+        state.merchantReplies[question.id] = reply;
+      } catch (error) {
+        failedCount += 1;
+        state.rejudgeError = error.code || 'rejudge_failed';
+      }
+    }
     await reconcileMerchantReplyState();
-    if (state.questionStatus !== 'ready') return showToast('商家回复已保存，请继续补充其他候选茶的回复');
+    const remaining = pendingMerchantQuestions(candidate).length;
+    if (failedCount && remaining) return showToast(`部分商家回复已保存，还有 ${remaining} 项未提交成功，请重试。`);
+    if (state.questionStatus !== 'ready') {
+      if (remaining) return showToast(`商家回复已保存，但仍有 ${remaining} 项信息需要补充。`);
+      const nextCandidate = nextPendingMerchantCandidate(candidate);
+      const nextLabel = nextCandidate ? `（可切换至候选 ${nextCandidate.letter || '下一位'}）` : '';
+      return showToast(`候选 ${candidate?.letter || '当前'} 的商家回复已保存，请切换到仍待补充的候选茶。${nextLabel}`);
+    }
     showToast('全部待回复候选茶已保存，可更新本轮判断');
   } catch (error) { state.questionStatus = 'failed'; state.rejudgeError = error.code || 'rejudge_failed'; saveState(); render(); }
 }
@@ -1078,25 +1093,21 @@ function renderAnalysis() {
 function appendMerchantReplyForm() {
   const sheet = app.querySelector('.ask-sheet');
   if (!sheet || sheet.querySelector('[data-action="submit-merchant-reply"]')) return;
-  const form = document.createElement('form');
-  form.className = 'merchant-reply-form'; form.dataset.action = 'submit-merchant-reply';
   const candidate = currentCandidate();
   const candidateQuestions = merchantQuestions(candidate);
   const currentPendingQuestions = pendingMerchantQuestions(candidate);
   const ready = merchantQuestionReadiness() === 'ready';
-  const currentQuestion = merchantQuestions(currentCandidate()).find(item => currentPendingQuestions.some(pending => pending.id === item.id));
-  const needsClarification = replyNeedsClarification(currentQuestion?.reply);
-  const targetLabel = currentQuestion ? `（对应：${escapeHtml(currentQuestion.question)}）` : '';
-  if (!currentQuestion && !ready) {
+  if (!candidateQuestions.length && !ready) return;
+  const form = document.createElement('form');
+  form.className = 'merchant-reply-form'; form.dataset.action = 'submit-merchant-reply';
+  if (!currentPendingQuestions.length && !ready) {
     const nextCandidate = nextPendingMerchantCandidate(candidate);
     const nextLabel = nextCandidate ? `（可切换至候选 ${nextCandidate.letter || '下一位'}）` : '';
-    form.innerHTML = candidateQuestions.length
-      ? `<p class="soft-note">候选 ${candidate?.letter || '当前'} 的商家回复已保存，请切换到仍待补充的候选茶。${nextLabel}</p>`
-      : `<p class="soft-note">候选 ${candidate?.letter || '当前'} 当前没有需要继续向商家确认的信息。</p>`;
+    form.innerHTML = `<p class="soft-note">候选 ${candidate?.letter || '当前'} 的商家回复已保存，请切换到仍待补充的候选茶。${nextLabel}</p>`;
   } else {
-    form.innerHTML = ready && !needsClarification
+    form.innerHTML = ready
       ? '<p class="soft-note">所有需要回复的候选茶已保存。确认后统一更新本轮判断。</p><button class="primary-btn" type="button" data-action="update-merchant-judgement">提交并更新判断</button>'
-      : `<label>商家回复${targetLabel}</label><textarea name="merchant-reply" required maxlength="4000" placeholder="${needsClarification ? '请只补充当前问题的明确回答' : '粘贴商家对当前问题的回复'}"></textarea><button class="primary-btn" type="submit">${needsClarification ? '补充商家回复' : '提交商家回复'}</button>`;
+      : '<label>商家回复</label><p class="soft-note">粘贴商家对以上问题的完整回复，系统会分别提取对应信息。</p><textarea name="merchant-reply" required maxlength="4000" placeholder="例如：中焙，不提供试饮，这是今年秋茶。"></textarea><button class="primary-btn" type="submit">保存商家回复</button>';
   }
   sheet.append(form);
 }
@@ -1737,13 +1748,21 @@ function warehouseTeaFromCandidate(candidate) {
   };
 }
 async function confirmWarehouseFromSelection() {
-  const candidate = currentCandidate() || { name: '春日乌龙', type: '乌龙茶 · 清香型' };
+  const candidate = currentCandidate();
+  if (!candidate) {
+    showToast('当前没有可加入茶仓的候选茶');
+    return;
+  }
   let existing = state.warehouse.find(item => item.name === candidate.name);
   if (authenticatedPostPurchaseSyncAvailable() && !serverUuid(existing?.id)) existing = null;
   if (!existing) {
     const persisted = await persistWarehouseTea(warehouseTeaFromCandidate(candidate), 0);
     if (!persisted) return;
     existing = persisted;
+    if (!authenticatedPostPurchaseSyncAvailable() && !state.warehouse.some(item => item.id === existing.id || item.name === existing.name)) {
+      state.warehouse.unshift(existing);
+      saveState();
+    }
   }
   state.selectedTeaId = existing.id;
   productAnalytics.track('tea_stock_added', { candidate_id: candidate.serverCandidateId || undefined, decision_version_id: state.decisionVersionId || undefined, metadata: { source: 'selection', screen: 'ownership' } });
