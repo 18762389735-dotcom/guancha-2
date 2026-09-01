@@ -169,10 +169,10 @@ test('completed empty questions unlock only their current decision and survive s
   const source = fs.readFileSync(path.resolve(root, '..', 'app.js'), 'utf8');
   assert.match(source, /snapshot\.question_generation_status === 'completed'\) state\.questionStatus = 'not-needed'/);
   assert.match(source, /state\.questionStatus === 'not-needed' && state\.questionDecisionVersionId === state\.decisionVersionId/);
-  assert.match(source, /requiredQuestionIds\.size === 0\s*\? 'not-needed'/);
+  assert.match(source, /requiredQuestions\.length === 0\s*\? 'not-needed'/);
 });
 
-test('one merchant reply is bound to exactly one current question without fan-out', () => {
+test('one merchant reply fans out to every pending question for the candidate', () => {
   const source = fs.readFileSync(path.resolve(root, '..', 'app.js'), 'utf8');
   const start = source.indexOf('async function submitMerchantReply(rawText)');
   const end = source.indexOf('async function refreshSelectionAnswer()', start);
@@ -180,8 +180,10 @@ test('one merchant reply is bound to exactly one current question without fan-ou
   assert.ok(start >= 0 && end > start);
   assert.equal((implementation.match(/apiClient\.createMerchantReply/g) || []).length, 1);
   assert.doesNotMatch(implementation, /extraQuestion|questions\.slice\(1\)/);
-  assert.match(source, /const currentQuestion = merchantQuestions\(currentCandidate\(\)\)\.find/);
-  assert.match(source, /对应：\$\{escapeHtml\(currentQuestion\.question\)\}/);
+  assert.match(implementation, /for \(const question of questions\)/);
+  assert.doesNotMatch(implementation, /questions\[0\]/);
+  assert.doesNotMatch(source, /对应：\$\{escapeHtml\(currentQuestion\.question\)\}/);
+  assert.match(source, /粘贴商家对以上问题的完整回复，系统会分别提取对应信息/);
 });
 
 test('Need edits update the server before clearing stale decision and returning to candidates', () => {

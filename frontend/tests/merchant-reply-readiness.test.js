@@ -13,7 +13,7 @@ function loadMerchantReplyLifecycle(context) {
   const render = context.render;
   const showToast = context.showToast;
   vm.runInNewContext(
-    `${appSource.slice(start, end)}; globalThis.appendMerchantReplyForm = appendMerchantReplyForm; globalThis.reconcileMerchantReplyState = reconcileMerchantReplyState; globalThis.submitMerchantReply = submitMerchantReply;`,
+    `${appSource.slice(start, end)}; globalThis.appendMerchantReplyForm = appendMerchantReplyForm; globalThis.reconcileMerchantReplyState = reconcileMerchantReplyState; globalThis.submitMerchantReply = submitMerchantReply; globalThis.renderOverlay = renderOverlay;`,
     context,
     { filename: 'app.js' },
   );
@@ -145,12 +145,137 @@ test('successful reply is followed by snapshot reconciliation to ready', async (
   assert.equal(context.toast, '全部待回复候选茶已保存，可更新本轮判断');
 });
 
+test('one merchant message is submitted to every pending question', async () => {
+  const state = baseState();
+  const questions = ['question-a', 'question-b', 'question-c'].map(id => question(id, 'server-a'));
+  const calls = [];
+  state.followupQuestions = questions;
+  const replies = questions.map((item, index) => reply(`reply-${index}`, item.id, 'server-a'));
+  const { context } = createSheetContext(state, {
+    createMerchantReply: async (_sessionId, payload) => {
+      calls.push(payload);
+      return replies[calls.length - 1];
+    },
+    getSelectionSnapshot: async () => ({ questions, merchant_replies: replies, question_decision_version_id: 'decision-2' }),
+  });
+  loadMerchantReplyLifecycle(context);
+
+  await context.submitMerchantReply('中焙，不提供试饮，这是秋茶。');
+
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls.map(item => item.followup_question_id), ['question-a', 'question-b', 'question-c']);
+  assert.deepEqual(calls.map(item => item.raw_text), Array(3).fill('中焙，不提供试饮，这是秋茶。'));
+});
+
+test('batch submission skips an already satisfactory reply', async () => {
+  const state = baseState();
+  const questions = ['question-a', 'question-b', 'question-c'].map(id => question(id, 'server-a'));
+  const savedA = reply('reply-a', 'question-a', 'server-a');
+  const savedB = reply('reply-b', 'question-b', 'server-a');
+  state.followupQuestions = questions;
+  state.merchantReplyIds = { 'question-a': savedA.id };
+  state.merchantReplies = { 'question-a': savedA };
+  const calls = [];
+  const { context } = createSheetContext(state, {
+    createMerchantReply: async (_sessionId, payload) => {
+      calls.push(payload);
+      return payload.followup_question_id === 'question-b' ? savedB : reply('reply-c', 'question-c', 'server-a');
+    },
+    getSelectionSnapshot: async () => ({ questions, merchant_replies: [savedA, savedB, reply('reply-c', 'question-c', 'server-a')], question_decision_version_id: 'decision-2' }),
+  });
+  loadMerchantReplyLifecycle(context);
+
+  await context.submitMerchantReply('补充完整商家回复');
+
+  assert.deepEqual(calls.map(item => item.followup_question_id), ['question-b', 'question-c']);
+});
+
+test('all answered questions plus a zero-question candidate are globally ready', () => {
+  const state = baseState();
+  const qA = question('question-a', 'server-a');
+  const savedA = reply('reply-a', 'question-a', 'server-a');
+  state.activeCandidate = 1;
+  state.followupQuestions = [qA];
+  state.merchantReplyIds = { 'question-a': savedA.id };
+  state.merchantReplies = { 'question-a': savedA };
+  const { context, sheet } = createSheetContext(state);
+  loadMerchantReplyLifecycle(context).appendMerchantReplyForm();
+
+  assert.equal((sheet.form.innerHTML.match(/当前没有需要继续向商家确认的信息/g) || []).length, 0);
+  assert.match(sheet.form.innerHTML, /所有需要回复的候选茶已保存。/);
+  assert.match(sheet.form.innerHTML, /提交并更新判断/);
+});
+
+test('zero-question candidate does not duplicate its informational copy', () => {
+  const state = baseState();
+  const qA = question('question-a', 'server-a');
+  const savedA = reply('reply-a', 'question-a', 'server-a');
+  state.activeCandidate = 1;
+  state.followupQuestions = [qA];
+  state.merchantReplyIds = { };
+  state.merchantReplies = { };
+  const sheet = { form: null, querySelector: () => null, append(form) { this.form = form; } };
+  const context = createSheetContext(state).context;
+  context.app = { querySelector: selector => selector === '.ask-sheet' ? { append: form => { sheet.form = form; }, querySelector: () => null } : null };
+  loadMerchantReplyLifecycle(context).appendMerchantReplyForm();
+
+  assert.equal(sheet.form, null);
+});
+
+test('partial batch failure retains successes and leaves only failed questions pending', async () => {
+  const state = baseState();
+  const questions = ['question-a', 'question-b', 'question-c'].map(id => question(id, 'server-a'));
+  const savedA = reply('reply-a', 'question-a', 'server-a');
+  const savedB = reply('reply-b', 'question-b', 'server-a');
+  state.followupQuestions = questions;
+  const calls = [];
+  const { context } = createSheetContext(state, {
+    createMerchantReply: async (_sessionId, payload) => {
+      calls.push(payload);
+      if (payload.followup_question_id === 'question-c') throw Object.assign(new Error('temporary'), { code: 'network_unavailable' });
+      return payload.followup_question_id === 'question-a' ? savedA : savedB;
+    },
+    getSelectionSnapshot: async () => ({ questions, merchant_replies: [savedA, savedB], question_decision_version_id: 'decision-2' }),
+  });
+  loadMerchantReplyLifecycle(context);
+
+  await context.submitMerchantReply('完整商家回复');
+
+  assert.equal(calls.length, 3);
+  assert.deepEqual(Object.keys(state.merchantReplyIds).sort(), ['question-a', 'question-b']);
+  assert.equal(state.questionStatus, 'completed');
+  assert.match(context.toast, /还有 1 项未提交成功，请重试/);
+});
+
+test('clarification reply remains pending while unrelated answered questions are skipped', async () => {
+  const state = baseState();
+  const questions = ['question-a', 'question-b'].map(id => question(id, 'server-a'));
+  const clarification = reply('reply-a', 'question-a', 'server-a', 'partially-answered');
+  const savedB = reply('reply-b', 'question-b', 'server-a');
+  state.followupQuestions = questions;
+  state.merchantReplyIds = { 'question-a': clarification.id, 'question-b': savedB.id };
+  state.merchantReplies = { 'question-a': clarification, 'question-b': savedB };
+  const calls = [];
+  const { context } = createSheetContext(state, {
+    createMerchantReply: async (_sessionId, payload) => { calls.push(payload); return reply('reply-a2', 'question-a', 'server-a'); },
+    getSelectionSnapshot: async () => ({ questions, merchant_replies: [reply('reply-a2', 'question-a', 'server-a'), savedB], question_decision_version_id: 'decision-2' }),
+  });
+  loadMerchantReplyLifecycle(context);
+
+  await context.submitMerchantReply('只补充澄清项');
+
+  assert.deepEqual(calls.map(item => item.followup_question_id), ['question-a']);
+});
+
 test('snapshot failure after reply keeps the returned local reply and avoids false failure', async () => {
   const state = baseState();
   const qA = question('question-a', 'server-a');
   const qB = question('question-b', 'server-b');
   const savedA = reply('reply-a', 'question-a', 'server-a');
+  const savedB = reply('reply-b', 'question-b', 'server-a');
   state.followupQuestions = [qA, qB];
+  state.merchantReplyIds = { 'question-b': savedB.id };
+  state.merchantReplies = { 'question-b': savedB };
   const { context } = createSheetContext(state, {
     createMerchantReply: async () => savedA,
     getSelectionSnapshot: async () => { throw Object.assign(new Error('temporary network failure'), { code: 'network_unavailable' }); },
@@ -161,7 +286,7 @@ test('snapshot failure after reply keeps the returned local reply and avoids fal
 
   assert.equal(state.merchantReplyIds['question-a'], 'reply-a');
   assert.strictEqual(state.merchantReplies['question-a'], savedA);
-  assert.equal(state.questionStatus, 'completed');
+  assert.equal(state.questionStatus, 'ready');
   assert.notEqual(state.questionStatus, 'failed');
 });
 
@@ -176,7 +301,8 @@ test('clarification-required reply keeps the current question textarea', () => {
   loadMerchantReplyLifecycle(context).appendMerchantReplyForm();
 
   assert.match(sheet.form.innerHTML, /textarea/);
-  assert.match(sheet.form.innerHTML, /补充商家回复/);
+  assert.match(sheet.form.innerHTML, /保存商家回复/);
+  assert.doesNotMatch(sheet.form.innerHTML, /对应：/);
 });
 
 test('refresh with all persisted replies restores ready state', async () => {
