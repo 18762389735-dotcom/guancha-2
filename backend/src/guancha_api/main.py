@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 import psycopg
 from psycopg_pool import AsyncConnectionPool
+from psycopg.rows import dict_row
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -86,6 +87,7 @@ def _database_pool(database_url: str) -> AsyncConnectionPool:
         raise RuntimeError("GUANCHA_DB_POOL_MAX_SIZE must be greater than or equal to GUANCHA_DB_POOL_MIN_SIZE")
     return AsyncConnectionPool(
         conninfo=database_url,
+        kwargs={"autocommit": True, "row_factory": dict_row},
         min_size=min_size,
         max_size=max_size,
         timeout=timeout,

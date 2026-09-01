@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from psycopg.rows import dict_row
 
 import guancha_api.auth.dependencies as auth_dependencies
 import guancha_api.main as main_module
@@ -118,6 +119,7 @@ async def test_lifespan_opens_and_closes_owned_pool_with_conservative_defaults(m
         assert len(pool_instances) == 1
         assert pool_instances[0].options == {
             "conninfo": "postgresql://local-only.invalid/test",
+            "kwargs": {"autocommit": True, "row_factory": dict_row},
             "min_size": 1,
             "max_size": 3,
             "timeout": 5.0,
