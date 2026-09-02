@@ -9,6 +9,7 @@ claim remains the duplicate-event authority.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
@@ -23,6 +24,7 @@ from guancha_api.repositories.postgres import PostgresPhase2Repository
 
 
 DEFAULT_WORKER_TIMEOUT_SECONDS = 170.0
+logger = logging.getLogger(__name__)
 
 
 class WorkerEventError(ValueError):
@@ -90,16 +92,49 @@ class CloudFunctionExtractionWorker:
     async def run(self, event: object) -> dict[str, str]:
         job_id = validate_worker_event(event)
         repository = await self.repository_factory()
+        claimed = False
         try:
+            if not await repository.claim_job(job_id=job_id):
+                return {"job_id": str(job_id), "status": "duplicate"}
+            claimed = True
             storage = self.storage_factory()
             provider = self.provider_factory(storage)
             runner = self.runner_factory(
                 repository, provider, storage, timeout_seconds=self.timeout_seconds
             )
-            await runner.run(job_id=job_id)
+            await runner.run(job_id=job_id, already_claimed=True)
             return {"job_id": str(job_id), "status": "handled"}
+        except asyncio.CancelledError:
+            if claimed:
+                await self._fail_claimed_job(repository=repository, job_id=job_id)
+            raise
+        except Exception:
+            if claimed:
+                await self._fail_claimed_job(repository=repository, job_id=job_id)
+            return {
+                "job_id": str(job_id),
+                "status": "failed",
+                "error_code": "worker_interrupted",
+            }
         finally:
             await repository.close()
+
+    @staticmethod
+    async def _fail_claimed_job(
+        *, repository: PostgresPhase2Repository, job_id: UUID
+    ) -> None:
+        """Best-effort conditional terminalization without exception details."""
+
+        from guancha_api.schemas.contracts import ErrorCode
+
+        try:
+            await asyncio.shield(
+                repository.fail_extraction_job(
+                    job_id=job_id, error_code=ErrorCode.WORKER_INTERRUPTED
+                )
+            )
+        except Exception:
+            logger.warning("async extraction worker could not persist terminal state")
 
 
 async def run_worker_event(event: object) -> dict[str, str]:

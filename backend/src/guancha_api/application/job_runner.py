@@ -100,8 +100,8 @@ class FakeExtractionJobRunner:
             await asyncio.shield(cleanup_task)
             return cancellation
 
-    async def run(self, *, job_id: UUID) -> None:
-        if not await self.repository.claim_job(job_id=job_id):
+    async def run(self, *, job_id: UUID, already_claimed: bool = False) -> None:
+        if not already_claimed and not await self.repository.claim_job(job_id=job_id):
             return
         job = await self.repository.get_claimed_job(job_id=job_id)
         input_image_ids = job.input_image_ids or (job.candidate_image_id,)

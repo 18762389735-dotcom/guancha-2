@@ -24,6 +24,7 @@ SOURCE_FILES = (
     "auth/interfaces.py",
     "auth/models.py",
     "application/__init__.py",
+    "application/extraction_recovery.py",
     "application/job_runner.py",
     "repositories/__init__.py",
     "repositories/interfaces.py",

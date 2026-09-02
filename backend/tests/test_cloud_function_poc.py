@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -210,7 +210,16 @@ def test_worker_rejects_malformed_job_id(event: object) -> None:
 
 @dataclass
 class _WorkerRepository:
+    claim_results: list[bool] = field(default_factory=lambda: [True])
+    failures: list[tuple[UUID, object]] = field(default_factory=list)
     close_calls: int = 0
+
+    async def claim_job(self, *, job_id: UUID) -> bool:
+        del job_id
+        return self.claim_results.pop(0) if self.claim_results else False
+
+    async def fail_extraction_job(self, *, job_id: UUID, error_code: object) -> None:
+        self.failures.append((job_id, error_code))
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -224,7 +233,8 @@ class _Runner:
         self.timeout_seconds = timeout_seconds
         self.job_ids: list[UUID] = []
 
-    async def run(self, *, job_id: UUID) -> None:
+    async def run(self, *, job_id: UUID, already_claimed: bool = False) -> None:
+        assert already_claimed is True
         self.job_ids.append(job_id)
 
 
@@ -252,6 +262,108 @@ async def test_worker_delegates_to_the_existing_claimed_job_runner_and_closes_re
     assert runners[0].job_ids == [job_id]
     assert runners[0].timeout_seconds == 170.0
     assert repository.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_terminalizes_after_claim_when_storage_construction_fails() -> None:
+    job_id = uuid4()
+    repository = _WorkerRepository()
+
+    def storage_factory() -> object:
+        raise RuntimeError("synthetic storage configuration failure")
+
+    worker = CloudFunctionExtractionWorker(
+        repository_factory=lambda: _ready(repository),  # type: ignore[arg-type]
+        storage_factory=storage_factory,
+    )
+
+    result = await worker.run({"job_id": str(job_id)})
+
+    assert result["status"] == "failed"
+    assert repository.failures[0][0] == job_id
+    assert repository.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_terminalizes_after_claim_when_provider_construction_fails() -> None:
+    job_id = uuid4()
+    repository = _WorkerRepository()
+
+    def provider_factory(_: object) -> object:
+        raise RuntimeError("synthetic provider configuration failure")
+
+    worker = CloudFunctionExtractionWorker(
+        repository_factory=lambda: _ready(repository),  # type: ignore[arg-type]
+        storage_factory=lambda: object(),
+        provider_factory=provider_factory,  # type: ignore[arg-type]
+    )
+
+    result = await worker.run({"job_id": str(job_id)})
+
+    assert result["status"] == "failed"
+    assert repository.failures[0][0] == job_id
+
+
+@pytest.mark.asyncio
+async def test_worker_terminalizes_after_claim_when_runner_bootstrap_fails() -> None:
+    job_id = uuid4()
+    repository = _WorkerRepository()
+
+    def runner_factory(*_: object, **__: object) -> object:
+        raise RuntimeError("synthetic pre-run failure")
+
+    worker = CloudFunctionExtractionWorker(
+        repository_factory=lambda: _ready(repository),  # type: ignore[arg-type]
+        storage_factory=lambda: object(),
+        provider_factory=lambda _: object(),  # type: ignore[arg-type]
+        runner_factory=runner_factory,  # type: ignore[arg-type]
+    )
+
+    result = await worker.run({"job_id": str(job_id)})
+
+    assert result["status"] == "failed"
+    assert repository.failures[0][0] == job_id
+
+
+@pytest.mark.asyncio
+async def test_completed_or_duplicate_job_is_not_overwritten_by_outer_guard() -> None:
+    repository = _WorkerRepository(claim_results=[False])
+    worker = CloudFunctionExtractionWorker(
+        repository_factory=lambda: _ready(repository),  # type: ignore[arg-type]
+        storage_factory=lambda: object(),
+        provider_factory=lambda _: object(),  # type: ignore[arg-type]
+    )
+
+    result = await worker.run({"job_id": str(uuid4())})
+
+    assert result["status"] == "duplicate"
+    assert repository.failures == []
+
+
+@pytest.mark.asyncio
+async def test_duplicate_event_does_not_construct_a_second_provider() -> None:
+    job_id = uuid4()
+    repository = _WorkerRepository(claim_results=[True, False])
+    provider_calls = 0
+
+    def provider_factory(_: object) -> object:
+        nonlocal provider_calls
+        provider_calls += 1
+        return object()
+
+    worker = CloudFunctionExtractionWorker(
+        repository_factory=lambda: _ready(repository),  # type: ignore[arg-type]
+        storage_factory=lambda: object(),
+        provider_factory=provider_factory,  # type: ignore[arg-type]
+        runner_factory=_Runner,  # type: ignore[arg-type]
+    )
+
+    first = await worker.run({"job_id": str(job_id)})
+    duplicate = await worker.run({"job_id": str(job_id)})
+
+    assert first["status"] == "handled"
+    assert duplicate["status"] == "duplicate"
+    assert provider_calls == 1
 
 
 @pytest.mark.asyncio
