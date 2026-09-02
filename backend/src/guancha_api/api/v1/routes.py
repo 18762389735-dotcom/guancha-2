@@ -556,7 +556,7 @@ async def delete_candidate(candidate_id: UUID, owner: Owner, raw: Request, repos
 async def upload_candidate_image(candidate_id: UUID, owner: Owner, idempotency_key: IdempotencyKey, raw: Request, repository: RequestRepository, file: Annotated[UploadFile, File()], x_analytics_session_id: AnalyticsSession = None) -> UploadCandidateImageResponse:
     data = await file.read(5_242_881)
     try:
-        result, created = await _service(raw, repository).upload_image(owner=owner, candidate_id=candidate_id, idempotency_key=idempotency_key, data=data, declared_content_type=file.content_type or '', storage=raw.app.state.temporary_storage, task_runner=raw.app.state.task_runner, provider=raw.app.state.provider)
+        result, created = await _service(raw, repository).upload_image(owner=owner, candidate_id=candidate_id, idempotency_key=idempotency_key, data=data, declared_content_type=file.content_type or '', storage=raw.app.state.temporary_storage, task_runner=raw.app.state.extraction_task_runner, provider=raw.app.state.provider)
         if created:
             _emit(raw, event_name="candidate_image_added", resource_id=result.image.id, analytics_session=x_analytics_session_id, candidate_id=candidate_id)
         return result
@@ -589,7 +589,7 @@ async def analyze_selection_session(session_id: UUID, owner: Owner, idempotency_
         session_id=session_id,
         owner=owner,
         storage=raw.app.state.temporary_storage,
-        task_runner=raw.app.state.task_runner,
+        task_runner=raw.app.state.extraction_task_runner,
         provider=raw.app.state.provider,
     )
     if staged:
@@ -684,6 +684,6 @@ async def get_current_extraction(candidate_id: UUID, owner: Owner, raw: Request,
 @router.post("/candidates/{candidate_id}/extraction-jobs", response_model=AnalysisJobResponse, status_code=201)
 async def retry_extraction_job(candidate_id: UUID, owner: Owner, idempotency_key: IdempotencyKey, raw: Request, repository: RequestRepository) -> AnalysisJobResponse:
     try:
-        return await _service(raw, repository).retry_job(owner=owner, candidate_id=candidate_id, idempotency_key=idempotency_key, storage=raw.app.state.temporary_storage, task_runner=raw.app.state.task_runner, provider=raw.app.state.provider)
+        return await _service(raw, repository).retry_job(owner=owner, candidate_id=candidate_id, idempotency_key=idempotency_key, storage=raw.app.state.temporary_storage, task_runner=raw.app.state.extraction_task_runner, provider=raw.app.state.provider)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
