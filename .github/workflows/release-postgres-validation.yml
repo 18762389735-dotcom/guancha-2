@@ -1,0 +1,112 @@
+name: Release PostgreSQL validation
+
+on:
+  push:
+    branches:
+      - codex/release-db-validation
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-release-validation:
+    name: PostgreSQL 16 release validation
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: guancha_test
+          POSTGRES_USER: guancha
+          POSTGRES_PASSWORD: guancha
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U guancha -d guancha_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgresql://guancha:guancha@localhost:5432/guancha_test
+      GUANCHA_DATABASE_URL: postgresql://guancha:guancha@localhost:5432/guancha_test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install declared backend development dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e "./backend[dev]"
+
+      - name: Apply all migrations from an empty PostgreSQL 16 database
+        run: python backend/scripts/migrate_database.py
+
+      - name: Verify all 11 migrations are applied
+        run: >-
+          python -c "import os, psycopg; conn=psycopg.connect(os.environ['TEST_DATABASE_URL']); cur=conn.cursor(); cur.execute('select count(*) from guancha_schema_migrations'); count=cur.fetchone()[0]; cur.close(); conn.close(); assert count == 11, count; print('MIGRATIONS=PASS (11/11)')"
+
+      - name: Replay previous PostgreSQL error tests
+        run: >-
+          python -m pytest
+          backend/tests/test_async_stale_recovery.py::test_poll_reconciles_stale_processing_job_to_failed
+          backend/tests/test_auth_kernel.py::test_app_user_repository_mapping_is_stable
+          backend/tests/test_auth_kernel.py::test_concurrent_app_user_first_use_keeps_one_identity
+          backend/tests/test_phase2_image_job_api.py::test_screenshot_evidence_cannot_be_promoted_by_provider
+          backend/tests/test_phase2_image_job_api.py::test_upload_replay_get_delete_and_job_metadata
+          "backend/tests/test_phase2_image_job_api.py::test_upload_security_matrix_rejects_untrusted_input[truncated-<lambda>-image/jpeg-unsafe_or_corrupt_image]"
+          backend/tests/test_phase2_session_candidate_api.py::test_concurrent_candidate_replay_returns_one_persisted_candidate
+          "backend/tests/test_phase4_decision_api.py::test_decision_supports_three_and_five_current_candidates[3]"
+          backend/tests/test_phase5_followup_questions.py::test_stale_decision_and_foreign_client_cannot_use_questions
+          backend/tests/test_phase5_followup_questions.py::test_reasoning_provider_failure_preserves_decision_and_writes_no_question
+          "backend/tests/test_phase6_merchant_rejudgement.py::test_persisted_merchant_conflict_requires_an_explicit_known_opposite_product_claim[explicit-heavy-conflict]"
+          backend/tests/test_phase6_merchant_rejudgement.py::test_evasive_reply_still_produces_a_comparative_decision
+          backend/tests/test_phase7_brew_feedback.py::test_feedback_replay_is_persisted_without_a_second_provider_call
+          backend/tests/test_phase8_demo_postgres.py::test_non_fixture_provider_failure_remains_failed
+          backend/tests/test_phase8_demo_postgres.py::test_admin_observability_is_token_protected
+          backend/tests/test_phase8_demo_postgres.py::test_failed_fixture_images_cannot_create_decision_inputs
+          backend/tests/test_postgres_repository.py::test_session_and_candidate_create_or_replay_persist_full_request
+          backend/tests/test_postgres_repository.py::test_idempotency_key_cannot_be_reused_for_a_different_image
+          backend/tests/test_postgres_repository.py::test_job_is_visible_only_to_its_anonymous_client
+          backend/tests/test_postgres_repository.py::test_phase3_candidate_and_image_limits
+          -vv --tb=long --maxfail=1
+
+      - name: Replay previous PostgreSQL failed tests
+        run: >-
+          python -m pytest
+          backend/tests/test_phase2_image_job_api.py::test_startup_recovery_makes_interrupted_enqueue_failure_retryable
+          backend/tests/test_postgres_repository.py::test_async_pool_preserves_repository_connection_semantics
+          -vv --tb=long
+
+      - name: Full DB-enabled backend release suite
+        run: python -m pytest backend/tests -vv --tb=long
+
+      - name: Async extraction and database focused tests
+        run: >-
+          python -m pytest
+          backend/tests/test_cloud_function_poc.py
+          backend/tests/test_extraction_execution_config.py
+          backend/tests/test_shared_private_storage.py
+          backend/tests/test_async_stale_recovery.py
+          backend/tests/test_database_pool.py
+          backend/tests/test_postgres_repository.py
+          -q --tb=long
+
+      - name: Frontend tests and JavaScript syntax
+        run: |
+          node --check app.js
+          node --check frontend/auth-client.js
+          node --check frontend/api-client.js
+          node --test frontend/tests/*.test.js
+
+      - name: Python compile validation
+        run: python -m compileall -q backend/src backend/scripts
+
+      - name: Linux x86_64 Python 3.11 worker build
+        run: python backend/scripts/build_extraction_worker.py --output build/ci-guancha-extraction-worker
+
+      - name: Git diff check
+        run: git diff --check
