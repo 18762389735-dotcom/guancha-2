@@ -480,7 +480,7 @@ async def test_startup_recovery_makes_interrupted_enqueue_failure_retryable(
     assert failed.status_code == 503 and len(storage.objects) == 1
     async with repository._connection.cursor() as cursor:
         await cursor.execute(
-            "update analysis_jobs set created_at=now() - interval '91 seconds' where candidate_id=%s",
+            "update analysis_jobs set created_at=now() - interval '301 seconds' where candidate_id=%s",
             (candidate_id,),
         )
     retry_runner = ManualTaskRunner()

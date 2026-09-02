@@ -80,7 +80,7 @@ class _LegacyRepository:
         self.recover_calls = 0
         self.close_calls = 0
 
-    async def recover_interrupted_jobs(self) -> None:
+    async def recover_interrupted_jobs(self, **_: object) -> None:
         self.recover_calls += 1
 
     async def close(self) -> None:

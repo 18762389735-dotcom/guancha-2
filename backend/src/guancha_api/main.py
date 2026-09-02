@@ -23,6 +23,9 @@ from guancha_api.auth.fake import (
 from guancha_api.auth.interfaces import TokenVerifier
 from guancha_api.api.v1.routes import router as v1_router
 from guancha_api.application.task_runners import InProcessTaskRunner, TaskEnqueueError, TaskRunner
+from guancha_api.application.extraction_recovery import (
+    extraction_stale_before_from_environment,
+)
 from guancha_api.infrastructure.storage.factory import temporary_private_storage_from_environment
 from guancha_api.infrastructure.storage.interfaces import (
     TemporaryImageCleanupError,
@@ -280,7 +283,9 @@ def create_app(
             if application.state.repository is None and database_url:
                 application.state.repository = await PostgresPhase2Repository.connect(database_url)
             if application.state.repository is not None:
-                await application.state.repository.recover_interrupted_jobs()
+                await application.state.repository.recover_interrupted_jobs(
+                    stale_before=extraction_stale_before_from_environment()
+                )
             yield
         finally:
             await application.state.task_runner.shutdown()

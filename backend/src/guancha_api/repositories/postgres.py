@@ -8,7 +8,7 @@ database in CI; production Supabase wiring remains a separate, manual smoke test
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 import psycopg
@@ -158,6 +158,8 @@ class StoredJob:
     processing_mode: ProcessingMode | None
     created_at: datetime
     updated_at: datetime
+    claimed_at: datetime | None = None
+    started_at: datetime | None = None
     stage: JobStage | None = None
     error_code: ErrorCode | None = None
     extraction_version_id: UUID | None = None
@@ -864,7 +866,7 @@ class PostgresPhase2Repository:
             await cursor.execute(
                 """select id, candidate_id, candidate_image_id, status, stage, attempt,
                           error_code, extraction_version_id, decision_version_id, decision_delta_id, processing_mode,
-                          input_image_ids, input_set_version, created_at, updated_at
+                          input_image_ids, input_set_version, created_at, claimed_at, started_at, updated_at
                    from analysis_jobs where id = %s""",
                 (job_id,),
             )
@@ -1930,31 +1932,52 @@ class PostgresPhase2Repository:
                 await cursor.execute("update extraction_versions set status='stale', is_current=false where candidate_id=%s and is_current", (row["candidate_id"],))
                 await cursor.execute("update analysis_jobs set status='failed', stage='failed', error_code='worker_interrupted', finished_at=now(), updated_at=now() where candidate_id=%s and status in ('queued','processing')", (row["candidate_id"],))
 
-    async def recover_interrupted_jobs(self) -> int:
-        cutoff = datetime.now(timezone.utc) - timedelta(seconds=90)
-        # A queued job is only recovered after the same bounded timeout as a
-        # processing job. This leaves normal newly queued work alone while
-        # making an enqueue failure whose error persistence was interrupted
-        # recoverable after application restart.
+    async def recover_stale_analysis_job(
+        self, *, job_id: UUID, stale_before: datetime
+    ) -> bool:
+        """Atomically terminalize only a still-stale queued or processing Job."""
         async with self._connection.transaction():
             async with self._connection.cursor() as cursor:
                 await cursor.execute(
                     """update analysis_jobs set status='failed', stage='failed', error_code='worker_interrupted',
                        finished_at=now(), updated_at=now()
-                       where (status='processing' and started_at < %s)
+                       where id=%s and (
+                           (status='processing' and coalesce(started_at, claimed_at, created_at) < %s)
+                           or (status='queued' and created_at < %s)
+                       )
+                       returning candidate_image_id""",
+                    (job_id, stale_before, stale_before),
+                )
+                row = await cursor.fetchone()
+                if row is not None:
+                    await cursor.execute(
+                        """update candidate_images set status='failed', error_code='worker_interrupted'
+                           where id=%s and status != 'deleted'""",
+                        (row["candidate_image_id"],),
+                    )
+        return row is not None
+
+    async def recover_interrupted_jobs(self, *, stale_before: datetime) -> int:
+        """Startup fallback using the same stale semantics as Job polling."""
+
+        async with self._connection.transaction():
+            async with self._connection.cursor() as cursor:
+                await cursor.execute(
+                    """update analysis_jobs set status='failed', stage='failed', error_code='worker_interrupted',
+                       finished_at=now(), updated_at=now()
+                       where (status='processing' and coalesce(started_at, claimed_at, created_at) < %s)
                           or (status='queued' and created_at < %s)
                        returning candidate_image_id""",
-                    (cutoff, cutoff),
+                    (stale_before, stale_before),
                 )
                 recovered = await cursor.fetchall()
-                changed = len(recovered)
                 for row in recovered:
                     await cursor.execute(
                         """update candidate_images set status='failed', error_code='worker_interrupted'
                            where id=%s and status != 'deleted'""",
                         (row["candidate_image_id"],),
                     )
-        return changed
+        return len(recovered)
 
     async def get_claimed_job(self, *, job_id: UUID) -> StoredJob:
         async with self._connection.cursor() as cursor:
@@ -2318,7 +2341,10 @@ class PostgresPhase2Repository:
             input_image_ids=tuple(row.get("input_image_ids") or (row["candidate_image_id"],)),
             input_set_version=int(row.get("input_set_version") or 0),
             processing_mode=ProcessingMode(mode) if mode is not None else None,
-            created_at=row["created_at"], updated_at=row["updated_at"],
+            created_at=row["created_at"],
+            claimed_at=row.get("claimed_at"),
+            started_at=row.get("started_at"),
+            updated_at=row["updated_at"],
         )  # type: ignore[arg-type]
 
     @staticmethod

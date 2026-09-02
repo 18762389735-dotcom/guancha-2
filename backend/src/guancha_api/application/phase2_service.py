@@ -7,7 +7,11 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from guancha_api.auth.models import OwnerContext, repository_owner, resolve_owner
 from guancha_api.repositories.idempotency import request_hash
-from guancha_api.repositories.postgres import CandidateExtractionInProgress, PostgresPhase2Repository
+from guancha_api.repositories.postgres import (
+    CandidateExtractionInProgress,
+    PostgresPhase2Repository,
+    StoredJob,
+)
 from guancha_api.schemas.contracts import Candidate, CreateCandidateRequest, SelectionNeedInput, SelectionSession
 from guancha_api.schemas.contracts import ErrorCode, ProcessingMode, UploadCandidateImageResponse, CandidateImageMetadata, AnalysisJobResponse
 from guancha_api.infrastructure.image_pipeline import sanitize_image_upload
@@ -17,6 +21,9 @@ from guancha_api.infrastructure.storage.interfaces import (
 )
 from guancha_api.infrastructure.temporary_images import temporary_image_object_key
 from guancha_api.application.job_runner import FakeExtractionJobRunner
+from guancha_api.application.extraction_recovery import (
+    extraction_stale_before_from_environment,
+)
 from guancha_api.application.task_runners import InProcessTaskRunner, TaskEnqueueError, TaskRunner
 from guancha_api.providers.execution import StructuredVisionProvider
 from guancha_api.providers.mimo import MiMoVisionProvider
@@ -307,7 +314,28 @@ class Phase2ExtractionService:
 
     async def get_job(self, *, job_id: UUID, owner: OwnerContext | None = None, client_id: UUID | None = None) -> AnalysisJobResponse:
         request_owner = resolve_owner(owner=owner, client_id=client_id)
-        return self._job_response(await self.repository.get_job_for_client(job_id=job_id, client_id=repository_owner(request_owner)))
+        repository_owner_id = repository_owner(request_owner)
+        job = await self.repository.get_job_for_client(
+            job_id=job_id, client_id=repository_owner_id
+        )
+        stale_before = extraction_stale_before_from_environment()
+        if self._is_stale_job(job, stale_before=stale_before):
+            if await self.repository.recover_stale_analysis_job(
+                job_id=job_id,
+                stale_before=stale_before,
+            ):
+                job = await self.repository.get_job_for_client(
+                    job_id=job_id, client_id=repository_owner_id
+                )
+        return self._job_response(job)
+
+    @staticmethod
+    def _is_stale_job(job: StoredJob, *, stale_before: datetime) -> bool:
+        if job.status.value == "queued":
+            return job.created_at < stale_before
+        if job.status.value == "processing":
+            return (job.started_at or job.claimed_at or job.created_at) < stale_before
+        return False
 
     async def get_image_metadata(
         self, *, image_id: UUID, owner: OwnerContext | None = None, client_id: UUID | None = None
