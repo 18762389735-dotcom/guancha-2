@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from typing import Protocol
 
 
 class TaskEnqueueError(RuntimeError):
     """A task could not be accepted after its queued Job was persisted."""
+
+
+class TaskRunner(Protocol):
+    """Minimal boundary shared by local and Cloud Function job dispatchers."""
+
+    async def enqueue(self, *, job_id: object, task: Callable[[], Awaitable[None]]) -> bool: ...
+
+    async def shutdown(self) -> None: ...
 
 
 class InProcessTaskRunner:

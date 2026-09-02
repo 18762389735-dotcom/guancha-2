@@ -8,6 +8,10 @@ class TemporaryImageCleanupError(RuntimeError):
     """A private-object delete failed after an upload operation needed cleanup."""
 
 
+class SharedPrivateStorageError(RuntimeError):
+    """A shared private-object operation failed without exposing provider details."""
+
+
 @dataclass(frozen=True, slots=True)
 class TemporaryImageObject:
     """Private object reference. It is intentionally not a public URL."""

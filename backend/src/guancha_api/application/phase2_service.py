@@ -17,7 +17,7 @@ from guancha_api.infrastructure.storage.interfaces import (
 )
 from guancha_api.infrastructure.temporary_images import temporary_image_object_key
 from guancha_api.application.job_runner import FakeExtractionJobRunner
-from guancha_api.application.task_runners import InProcessTaskRunner, ManualTaskRunner, TaskEnqueueError
+from guancha_api.application.task_runners import InProcessTaskRunner, TaskEnqueueError, TaskRunner
 from guancha_api.providers.execution import StructuredVisionProvider
 from guancha_api.providers.mimo import MiMoVisionProvider
 from guancha_api.providers.openai import OpenAIResponsesProvider
@@ -128,7 +128,7 @@ class Phase2ExtractionService:
     async def upload_image(
         self, *, candidate_id: UUID, idempotency_key: UUID,
         data: bytes, declared_content_type: str, storage: TemporaryPrivateStorage,
-        task_runner: InProcessTaskRunner | ManualTaskRunner, provider: StructuredVisionProvider,
+        task_runner: TaskRunner, provider: StructuredVisionProvider,
         owner: OwnerContext | None = None, client_id: UUID | None = None,
     ) -> tuple[UploadCandidateImageResponse, bool]:
         request_owner = resolve_owner(owner=owner, client_id=client_id)
@@ -210,7 +210,7 @@ class Phase2ExtractionService:
     async def start_staged_extractions(
         self, *, session_id: UUID,
         storage: TemporaryPrivateStorage,
-        task_runner: InProcessTaskRunner | ManualTaskRunner,
+        task_runner: TaskRunner,
         provider: StructuredVisionProvider,
         owner: OwnerContext | None = None, client_id: UUID | None = None,
     ) -> tuple[AnalysisJobResponse, ...]:
@@ -326,7 +326,7 @@ class Phase2ExtractionService:
 
     async def retry_job(
         self, *, candidate_id: UUID, idempotency_key: UUID, storage: TemporaryPrivateStorage,
-        task_runner: InProcessTaskRunner | ManualTaskRunner, provider: StructuredVisionProvider,
+        task_runner: TaskRunner, provider: StructuredVisionProvider,
         owner: OwnerContext | None = None, client_id: UUID | None = None,
     ) -> AnalysisJobResponse:
         request_owner = resolve_owner(owner=owner, client_id=client_id)

@@ -27,6 +27,12 @@ openai = [
   "openai>=2.0,<3.0",
   "instructor>=1.16,<2.0",
 ]
+cloud-storage = [
+  "cos-python-sdk-v5>=1.9.44,<2.0",
+]
+cloud-function = [
+  "tencentcloud-sdk-python>=3.1.166,<4.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

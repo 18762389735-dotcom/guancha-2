@@ -22,10 +22,12 @@ from guancha_api.auth.fake import (
 )
 from guancha_api.auth.interfaces import TokenVerifier
 from guancha_api.api.v1.routes import router as v1_router
-from guancha_api.application.task_runners import InProcessTaskRunner
-from guancha_api.application.task_runners import TaskEnqueueError
-from guancha_api.infrastructure.storage.memory import InMemoryTemporaryPrivateStorage
-from guancha_api.infrastructure.storage.interfaces import TemporaryImageCleanupError
+from guancha_api.application.task_runners import InProcessTaskRunner, TaskEnqueueError, TaskRunner
+from guancha_api.infrastructure.storage.factory import temporary_private_storage_from_environment
+from guancha_api.infrastructure.storage.interfaces import (
+    TemporaryImageCleanupError,
+    TemporaryPrivateStorage,
+)
 from guancha_api.providers.fake import FakeProvider
 from guancha_api.providers.unavailable import UnconfiguredVisionProvider
 from guancha_api.providers.execution import StructuredVisionProvider
@@ -56,6 +58,7 @@ from guancha_api.repositories.postgres import (
 )
 from guancha_api.core.errors import ApiErrorDetail, ApiErrorResponse
 from guancha_api.product_events import ProductEventSink
+from guancha_api.tasks.cloud_function import CloudFunctionExtractionDispatcher
 
 
 # Keep the per-instance pool small: the current Run maximum of five instances
@@ -64,6 +67,7 @@ from guancha_api.product_events import ProductEventSink
 DEFAULT_DB_POOL_MIN_SIZE = 1
 DEFAULT_DB_POOL_MAX_SIZE = 3
 DEFAULT_DB_POOL_TIMEOUT_SECONDS = 5.0
+DEFAULT_EXTRACTION_EXECUTION = "in-process"
 
 
 def _pool_setting(name: str, default: int | float, *, minimum: int | float) -> int | float:
@@ -95,7 +99,25 @@ def _database_pool(database_url: str) -> AsyncConnectionPool:
     )
 
 
-def _provider_from_environment(storage: InMemoryTemporaryPrivateStorage) -> StructuredVisionProvider:
+def _extraction_task_runner_from_environment() -> TaskRunner:
+    """Select only screenshot extraction dispatch; other background work stays local."""
+
+    backend = os.getenv(
+        "GUANCHA_EXTRACTION_EXECUTION", DEFAULT_EXTRACTION_EXECUTION
+    ).strip().lower()
+    if backend in {"", "in-process"}:
+        return InProcessTaskRunner()
+    if backend == "cloud-function":
+        region = os.getenv("GUANCHA_EXTRACTION_FUNCTION_REGION", "").strip()
+        if not region:
+            raise RuntimeError("GUANCHA_EXTRACTION_FUNCTION_REGION must not be empty")
+        return CloudFunctionExtractionDispatcher.from_environment(region=region)
+    raise RuntimeError(
+        "GUANCHA_EXTRACTION_EXECUTION must be in-process or cloud-function"
+    )
+
+
+def _provider_from_environment(storage: TemporaryPrivateStorage) -> StructuredVisionProvider:
     # Fake is deliberately opt-in.  The competition application must never
     # turn an absent live configuration into a plausible fixture result.
     mode = os.getenv("GUANCHA_PROVIDER", "").lower()
@@ -201,8 +223,9 @@ def create_app(
     repository: PostgresPhase2Repository | None = None,
     database_pool: AsyncConnectionPool | None = None,
     worker_repository_factory: Callable[[], Awaitable[PostgresPhase2Repository]] | None = None,
-    task_runner: InProcessTaskRunner | None = None,
-    temporary_storage: InMemoryTemporaryPrivateStorage | None = None,
+    task_runner: TaskRunner | None = None,
+    extraction_task_runner: TaskRunner | None = None,
+    temporary_storage: TemporaryPrivateStorage | None = None,
     provider: StructuredVisionProvider | None = None,
     reasoning_provider: ReasoningProvider | None = None,
     merchant_reply_provider: MerchantReplyReasoningProvider | None = None,
@@ -213,7 +236,14 @@ def create_app(
 ) -> FastAPI:
     """Build an injectable API application; tests never need external services."""
     resolved_task_runner = task_runner or InProcessTaskRunner()
-    resolved_temporary_storage = temporary_storage or InMemoryTemporaryPrivateStorage()
+    # Tests and explicitly injected callers retain their existing single-runner
+    # behavior. Normal startup selects an extraction-only runner by config.
+    resolved_extraction_task_runner = (
+        extraction_task_runner
+        or task_runner
+        or _extraction_task_runner_from_environment()
+    )
+    resolved_temporary_storage = temporary_storage or temporary_private_storage_from_environment()
     resolved_provider = provider or _provider_from_environment(resolved_temporary_storage)
     resolved_reasoning_provider = reasoning_provider or FakeReasoningProvider()
     resolved_merchant_reply_provider = merchant_reply_provider or _merchant_reply_provider_from_environment()
@@ -232,6 +262,7 @@ def create_app(
         application.state.worker_repository_factory = worker_repository_factory
         application.state.temporary_storage = resolved_temporary_storage
         application.state.task_runner = resolved_task_runner
+        application.state.extraction_task_runner = resolved_extraction_task_runner
         application.state.provider = resolved_provider
         application.state.reasoning_provider = resolved_reasoning_provider
         application.state.merchant_reply_provider = resolved_merchant_reply_provider
@@ -253,6 +284,8 @@ def create_app(
             yield
         finally:
             await application.state.task_runner.shutdown()
+            if application.state.extraction_task_runner is not application.state.task_runner:
+                await application.state.extraction_task_runner.shutdown()
             if owns_repository and application.state.repository is not None:
                 await application.state.repository.close()
             if owns_database_pool and application.state.database_pool is not None:
@@ -265,6 +298,7 @@ def create_app(
     application.state.database_pool = database_pool
     application.state.worker_repository_factory = worker_repository_factory
     application.state.task_runner = resolved_task_runner
+    application.state.extraction_task_runner = resolved_extraction_task_runner
     application.state.temporary_storage = resolved_temporary_storage
     application.state.provider = resolved_provider
     application.state.reasoning_provider = resolved_reasoning_provider
