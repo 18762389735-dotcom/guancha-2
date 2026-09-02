@@ -40,7 +40,12 @@ jobs:
           python-version: '3.11'
 
       - name: Install declared backend development dependencies
-        run: python -m pip install --upgrade pip && python -m pip install -e "./backend[dev]"
+        run: python -m pip install --upgrade pip && python -m pip install -e "./backend[dev,cloud-function,cloud-storage]"
+
+      - name: Verify optional SDK imports
+        run: >-
+          python -c "import tencentcloud; print('tencentcloud sdk import ok')"
+          && python -c "import qcloud_cos; print('cos sdk import ok')"
 
       - name: Apply all migrations from an empty PostgreSQL 16 database
         run: python backend/scripts/migrate_database.py
