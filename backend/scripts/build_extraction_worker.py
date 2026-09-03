@@ -41,6 +41,7 @@ SOURCE_FILES = (
     "providers/__init__.py",
     "providers/execution.py",
     "providers/fake.py",
+    "providers/interfaces.py",
     "providers/mimo.py",
     "providers/openai.py",
     "functions/__init__.py",
