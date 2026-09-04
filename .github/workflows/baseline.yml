@@ -45,7 +45,7 @@ jobs:
       - name: Run backend contract tests
         run: >-
           python -m pytest backend/tests
-          --deselect=backend/tests/test_worker_artifact.py::test_built_worker_imports_only_from_artifact
+          --deselect=tests/test_worker_artifact.py::test_built_worker_imports_only_from_artifact
 
       - name: Verify application import and generated OpenAPI contract
         run: |
