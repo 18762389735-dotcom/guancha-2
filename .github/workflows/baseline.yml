@@ -43,12 +43,35 @@ jobs:
           python -c "import qcloud_cos"
 
       - name: Run backend contract tests
-        run: python -m pytest backend/tests
+        run: >-
+          python -m pytest backend/tests
+          --deselect=backend/tests/test_worker_artifact.py::test_built_worker_imports_only_from_artifact
 
       - name: Verify application import and generated OpenAPI contract
         run: |
           python -c "from guancha_api.main import app; assert app.title == 'Guancha P0 API'"
           python -c "from guancha_api.main import app; schema = app.openapi(); assert '/api/v1/candidates/{candidate_id}/images' in schema['paths']; assert '/api/v1/jobs/{job_id}' in schema['paths']"
+
+  worker-artifact-py311:
+    name: Worker artifact validation (Python 3.11)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install declared worker build dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e "./backend[dev,cloud-function,cloud-storage]"
+
+      - name: Build and import worker artifact on Linux
+        run: >-
+          python -m pytest
+          backend/tests/test_worker_artifact.py::test_built_worker_imports_only_from_artifact
+          -vv
 
   backend-postgres-repository:
     name: PostgreSQL repository integration tests
