@@ -69,3 +69,9 @@ test('critical async actions have UI-side duplicate-submit guards', () => {
   assert.match(appSource, /if \(rejudgeInFlight\) return;/);
 });
 
+test('sample marker is forwarded to extraction and merchant fallback boundaries', () => {
+  assert.match(appSource, /uploadCandidateImage\(candidate\.serverCandidateId, runtime\.file, undefined, \{ demoSample: candidate\.isDemoSample === true \}\)/);
+  assert.match(appSource, /createMerchantReply\(state\.sessionId,[\s\S]*demoSample: candidate\?\.isDemoSample === true/);
+  assert.match(appSource, /rejudgeMerchantReply\(state\.sessionId, undefined, \{ demoSample: currentCandidate\(\)\?\.isDemoSample === true \}\)/);
+  assert.match(appSource, /isDemoSample: demoSampleByServerId\.get\(remote\.id\) === true/);
+});

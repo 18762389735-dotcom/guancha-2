@@ -553,10 +553,10 @@ async def delete_candidate(candidate_id: UUID, owner: Owner, raw: Request, repos
     _emit(raw, event_name="candidate_deleted", resource_id=candidate_id, analytics_session=x_analytics_session_id, candidate_id=candidate_id)
 
 @router.post("/candidates/{candidate_id}/images", response_model=UploadCandidateImageResponse, status_code=201)
-async def upload_candidate_image(candidate_id: UUID, owner: Owner, idempotency_key: IdempotencyKey, raw: Request, repository: RequestRepository, file: Annotated[UploadFile, File()], x_analytics_session_id: AnalyticsSession = None) -> UploadCandidateImageResponse:
+async def upload_candidate_image(candidate_id: UUID, owner: Owner, idempotency_key: IdempotencyKey, raw: Request, repository: RequestRepository, file: Annotated[UploadFile, File()], x_guancha_demo_sample: Annotated[bool, Header(alias="X-Guancha-Demo-Sample")] = False, x_analytics_session_id: AnalyticsSession = None) -> UploadCandidateImageResponse:
     data = await file.read(5_242_881)
     try:
-        result, created = await _service(raw, repository).upload_image(owner=owner, candidate_id=candidate_id, idempotency_key=idempotency_key, data=data, declared_content_type=file.content_type or '', storage=raw.app.state.temporary_storage, task_runner=raw.app.state.extraction_task_runner, provider=raw.app.state.provider)
+        result, created = await _service(raw, repository).upload_image(owner=owner, candidate_id=candidate_id, idempotency_key=idempotency_key, data=data, declared_content_type=file.content_type or '', storage=raw.app.state.temporary_storage, task_runner=raw.app.state.extraction_task_runner, provider=raw.app.state.provider, allow_demo_fallback=x_guancha_demo_sample)
         if created:
             _emit(raw, event_name="candidate_image_added", resource_id=result.image.id, analytics_session=x_analytics_session_id, candidate_id=candidate_id)
         return result
@@ -640,10 +640,11 @@ async def get_merchant_reply(reply_id: UUID, owner: Owner, raw: Request, reposit
     return result
 
 @router.post("/selection-sessions/{session_id}/rejudge", response_model=AnalysisJobResponse, status_code=201)
-async def rejudge_merchant_reply(session_id: UUID, request: CreateRejudgeRequest, owner: Owner, idempotency_key: IdempotencyKey, raw: Request, repository: RequestRepository, x_analytics_session_id: AnalyticsSession = None) -> AnalysisJobResponse:
+async def rejudge_merchant_reply(session_id: UUID, request: CreateRejudgeRequest, owner: Owner, idempotency_key: IdempotencyKey, raw: Request, repository: RequestRepository, x_guancha_demo_sample: Annotated[bool, Header(alias="X-Guancha-Demo-Sample")] = False, x_analytics_session_id: AnalyticsSession = None) -> AnalysisJobResponse:
     job = await _merchant_reply_service(raw, repository).rejudge(
         session_id=session_id, owner=owner,
         idempotency_key=idempotency_key, task_runner=raw.app.state.task_runner,
+        allow_demo_fallback=x_guancha_demo_sample,
         analytics_session_id=parse_analytics_session(x_analytics_session_id),
     )
     result = _job(job)

@@ -416,7 +416,7 @@ async function startMvpAnalysis({ recoveredMissingSession = false } = {}) {
           const localImage = candidate.images[index];
           const runtime = runtimeImages.get(localImage.id);
           if (localImage.serverImageId || !runtime?.file) continue;
-          const uploaded = await apiClient.uploadCandidateImage(candidate.serverCandidateId, runtime.file);
+          const uploaded = await apiClient.uploadCandidateImage(candidate.serverCandidateId, runtime.file, undefined, { demoSample: candidate.isDemoSample === true });
           candidate.serverImageId = uploaded.image.id;
           candidate.jobId = uploaded.extraction_job.id;
           candidate.images[index] = { ...localImage, serverImageId: uploaded.image.id, status: uploaded.image.status, localOnly: false };
@@ -495,10 +495,12 @@ async function resumeLiveBackendState() {
   try {
     const snapshot = await apiClient.getSelectionSnapshot(state.sessionId);
     const activeId = state.activeCandidateId || candidateIdentity(currentCandidate());
+    const demoSampleByServerId = new Map(state.candidates.map(candidate => [candidate.serverCandidateId, candidate.isDemoSample === true]));
     const recoveryScreen = GuanchaAdapters.activeRecoveryScreen(snapshot);
     const pendingLocal = state.candidates.filter(candidate => !candidate.serverCandidateId && (candidate.images || []).some(image => image.localOnly));
     state.candidates = snapshot.candidates.map((remote, index) => ({
       letter: remote.display_label || String.fromCharCode(65 + index), name: remote.display_name || `候选茶 ${remote.display_label || index + 1}`,
+      isDemoSample: demoSampleByServerId.get(remote.id) === true,
       type: '商品信息整理中', fields: '', serverCandidateId: remote.id,
       images: (remote.images || []).map(image => ({ id: `server-${image.id}`, serverImageId: image.id, status: image.status, localOnly: false })),
       serverImageId: remote.images?.at(-1)?.id || null, jobId: remote.images?.at(-1)?.current_job_id || null,
@@ -713,7 +715,7 @@ async function submitMerchantReply(rawText) {
       try {
         const reply = await apiClient.createMerchantReply(state.sessionId, {
           decision_version_id: state.decisionVersionId, followup_question_id: question.id, raw_text: rawText,
-        });
+        }, undefined, { demoSample: candidate?.isDemoSample === true });
         state.merchantReplyIds[question.id] = reply.id;
         state.merchantReplies[question.id] = reply;
       } catch (error) {
@@ -742,7 +744,7 @@ async function updateMerchantJudgement() {
   if (!replyIds.length || !state.sessionId || !apiClient.isConfigured) return showToast('请先保存商家回复');
   try {
     state.questionStatus = 'rejudging'; render();
-    const job = await apiClient.rejudgeMerchantReply(state.sessionId);
+    const job = await apiClient.rejudgeMerchantReply(state.sessionId, undefined, { demoSample: currentCandidate()?.isDemoSample === true });
     state.rejudgeJobId = job.id; state.questionStatus = 'rejudging'; saveState(); render();
     GuanchaJobPoller.start({ jobId: job.id, resourceId: state.sessionId, versionId: job.id, fetchStatus: apiClient.getJob, getCurrentVersion: () => state.rejudgeJobId, onUpdate: async status => {
       if (status.status === 'completed' && status.decision_version_id) {
@@ -1119,9 +1121,12 @@ function appendMerchantReplyForm() {
   } else {
     const rejudging = typeof rejudgeInFlight !== 'undefined' && rejudgeInFlight;
     const savingReply = typeof merchantReplyInFlight !== 'undefined' && merchantReplyInFlight;
+    const replyPlaceholder = candidate?.isDemoSample
+      ? '例如：这是中火茶，2025年春茶，可以先寄小样。'
+      : '例如：中焙，不提供试饮，这是今年秋茶。';
     form.innerHTML = ready
       ? `<p class="soft-note">所有需要回复的候选茶已保存。确认后统一更新本轮判断。</p><button class="primary-btn" type="button" data-action="update-merchant-judgement" ${rejudging ? 'disabled' : ''}>${rejudging ? '正在更新判断…' : '提交并更新判断'}</button>`
-      : `<label>商家回复</label><p class="soft-note">粘贴商家对以上问题的完整回复，系统会分别提取对应信息。</p><textarea name="merchant-reply" required maxlength="4000" placeholder="例如：中焙，不提供试饮，这是今年秋茶。"></textarea><button class="primary-btn" type="submit" ${savingReply ? 'disabled' : ''}>${savingReply ? '正在保存…' : '保存商家回复'}</button>`;
+      : `<label>商家回复</label><p class="soft-note">粘贴商家对以上问题的完整回复，系统会分别提取对应信息。</p><textarea name="merchant-reply" required maxlength="4000" placeholder="${replyPlaceholder}"></textarea><button class="primary-btn" type="submit" ${savingReply ? 'disabled' : ''}>${savingReply ? '正在保存…' : '保存商家回复'}</button>`;
   }
   sheet.append(form);
 }

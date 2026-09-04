@@ -136,6 +136,7 @@ class Phase2ExtractionService:
         self, *, candidate_id: UUID, idempotency_key: UUID,
         data: bytes, declared_content_type: str, storage: TemporaryPrivateStorage,
         task_runner: TaskRunner, provider: StructuredVisionProvider,
+        allow_demo_fallback: bool = False,
         owner: OwnerContext | None = None, client_id: UUID | None = None,
     ) -> tuple[UploadCandidateImageResponse, bool]:
         request_owner = resolve_owner(owner=owner, client_id=client_id)
@@ -161,6 +162,11 @@ class Phase2ExtractionService:
         except Exception as storage_error:
             raise TaskEnqueueError("Temporary private storage did not accept the image") from storage_error
         try:
+            processing_mode = (
+                ProcessingMode.CACHE_FALLBACK
+                if allow_demo_fallback and provider.provider_name in {"openai", "mimo"}
+                else provider.processing_mode
+            )
             result = await self.repository.create_image_and_initial_job(
                 image_id=image_id, job_id=job_id, candidate_id=candidate_id, client_id=repository_owner(request_owner),
                 idempotency_key=idempotency_key, content_type=image.content_type, size_bytes=image.size_bytes,
@@ -169,7 +175,7 @@ class Phase2ExtractionService:
                 request_hash=digest,
                 width=image.width,
                 height=image.height,
-                processing_mode=provider.processing_mode,
+                processing_mode=processing_mode,
                 stage_until_selection_start=isinstance(
                     provider, (MiMoVisionProvider, OpenAIResponsesProvider)
                 ),

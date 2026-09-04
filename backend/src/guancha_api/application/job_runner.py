@@ -6,6 +6,8 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from guancha_api.domain.tieguanyin.demo_fallback import DemoFallbackCatalog
+from guancha_api.domain.tieguanyin.fixture_catalog import ExtractionFixture
 from guancha_api.infrastructure.storage.interfaces import TemporaryPrivateStorage
 from guancha_api.infrastructure.temporary_images import (
     TemporaryImageCleanupError,
@@ -108,6 +110,7 @@ class FakeExtractionJobRunner:
         object_keys = tuple(temporary_image_object_key(image_id) for image_id in input_image_ids)
         legacy_cleanup = not job.input_image_ids or job.input_set_version == 0
         result: FakeExtractionPayload | None = None
+        used_fallback = False
         failure: BaseException | None = None
 
         try:
@@ -149,6 +152,29 @@ class FakeExtractionJobRunner:
         if isinstance(failure, asyncio.CancelledError):
             await self._fail(job_id=job_id, error_code=ErrorCode.WORKER_INTERRUPTED)
             raise failure
+        # A deterministic result is allowed only for an explicitly marked
+        # sample job.  The marker is persisted in the existing processing_mode
+        # column; fixture hashes alone can never authorize this path for a
+        # normal user upload.  Storage/read failures are intentionally not
+        # treated as provider failures.
+        if (
+            failure is not None
+            and job.processing_mode is ProcessingMode.CACHE_FALLBACK
+            and self.provider.provider_name in {"openai", "mimo"}
+            and isinstance(
+                failure,
+                (TimeoutError, ProviderNetworkExhaustedError, ProviderSchemaInvalidError),
+            )
+        ):
+            fallback = await self._fallback_after_provider_failure(
+                job_id=job_id,
+                candidate_id=job.candidate_id,
+                input_image_ids=input_image_ids,
+            )
+            if fallback is not None:
+                result = fallback
+                failure = None
+                used_fallback = True
         if isinstance(failure, TimeoutError):
             await self._fail(job_id=job_id, error_code=ErrorCode.AI_TIMEOUT)
             return
@@ -212,7 +238,7 @@ class FakeExtractionJobRunner:
                     id=uuid4(), analysis_job_id=job_id,
                     provider=self.provider.provider_name,
                     model_identifier=self.provider.model_identifier,
-                processing_mode=self._success_mode(),
+                    processing_mode=(ProcessingMode.CACHE_FALLBACK if used_fallback else self._success_mode()),
                     provider_version="phase8-v1",
                     request_metadata={"prompt_version": f"{self.provider.provider_name}-vision-v1", "schema_version": "phase3-joint-images-v1"},
                 ),
@@ -221,6 +247,57 @@ class FakeExtractionJobRunner:
         except Exception:
             # The repository transaction has rolled back; no partial version is exposed.
             await self._fail(job_id=job_id, error_code=ErrorCode.WORKER_INTERRUPTED)
+
+    async def _fallback_after_provider_failure(
+        self, *, job_id: UUID, candidate_id: UUID, input_image_ids: tuple[UUID, ...]
+    ) -> FakeExtractionPayload | None:
+        """Load a result only for an exact, committed project demo image set."""
+        rows = await self.repository.get_job_input_images(job_id=job_id)
+        if len(rows) != len(input_image_ids):
+            return None
+        fixture = DemoFallbackCatalog().match(
+            candidate_id=candidate_id,
+            images=(
+                (int(row["display_order"]), str(row["sanitized_sha256"]))
+                for row in rows
+            ),
+        )
+        return self._fixture_payload(fixture) if fixture is not None else None
+
+    @staticmethod
+    def _fixture_payload(fixture: ExtractionFixture) -> FakeExtractionPayload:
+        fields = fixture.fields
+        evidence = tuple(
+            FakeEvidencePayload(
+                field_name=str(item["field_name"]),
+                raw_text=str(item.get("raw_text") or item["field_name"]),
+                normalized_value=str(item.get("normalized_value") or item.get("raw_text") or item["field_name"]),
+                model_confidence=0.9,
+                information_status=InformationStatus(item["information_status"]),
+                source_type=EvidenceSourceType(item["source_type"]),
+                verification_status=VerificationStatus(item["verification_status"]),
+                source_location=str(item["source_location"]),
+                evidence_strength=EvidenceStrength(item["evidence_strength"]),
+                source_image_index=1,
+            )
+            for item in fixture.evidence
+        )
+        aroma = fields.get("aroma_style")
+        aroma_claims = tuple(aroma) if isinstance(aroma, list) else ((str(aroma),) if aroma else ())
+        return FakeExtractionPayload(
+            product_name=str(fields["tea_type"]) if fields.get("tea_type") else None,
+            tea_category="乌龙茶",
+            tea_subtype=str(fields["tea_type"]) if fields.get("tea_type") else None,
+            origin=str(fields["origin_text"]) if fields.get("origin_text") else None,
+            roast_or_style=str(fields["roast_level"]) if fields.get("roast_level") else None,
+            aroma_claims=aroma_claims,
+            season=str(fields["season"]) if fields.get("season") else None,
+            year_or_batch=str(fields["year_or_batch"]) if fields.get("year_or_batch") else None,
+            weight=str(fields["weight_grams"]) if fields.get("weight_grams") is not None else None,
+            price=str(fields["price"]) if fields.get("price") is not None else None,
+            risk_flags=tuple(str(item) for item in (fields.get("missing_fields") or ())),
+            evidence=evidence,
+        )
 
     @staticmethod
     def _provider_error_code(failure: BaseException) -> ErrorCode:

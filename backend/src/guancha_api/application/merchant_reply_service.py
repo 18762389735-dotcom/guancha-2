@@ -3,13 +3,15 @@ from __future__ import annotations
 from uuid import UUID, uuid4
 
 from guancha_api.auth.models import OwnerContext, repository_owner, resolve_owner
+from guancha_api.domain.tieguanyin.fixture_catalog import FixtureCatalog
 from guancha_api.repositories.idempotency import request_hash
 from guancha_api.application.task_runners import InProcessTaskRunner, ManualTaskRunner
 from guancha_api.domain.tieguanyin.decision import evaluate_candidate, rank_within_buckets
 from guancha_api.domain.tieguanyin.rules.rule_schema import load_approved_rules
 from guancha_api.repositories.postgres import PostgresPhase2Repository, StoredJob
 from guancha_api.schemas.contracts import CreateMerchantReplyRequest, ErrorCode, MerchantReply
-from guancha_api.providers.merchant_reply import FakeMerchantReplyReasoningProvider, MerchantReplyReasoningProvider
+from guancha_api.providers.merchant_reply import FakeMerchantReplyReasoningProvider, MerchantReplyParse, MerchantReplyReasoningProvider
+from guancha_api.providers.merchant_reply_mimo import MiMoMerchantReplyReasoningProvider
 from guancha_api.product_events import ProductEventSink, safe_emit_server
 
 
@@ -43,6 +45,7 @@ class MerchantReplyService:
     async def rejudge(
         self, *, session_id: UUID, idempotency_key: UUID,
         task_runner: InProcessTaskRunner | ManualTaskRunner,
+        allow_demo_fallback: bool = False,
         analytics_session_id: UUID | None = None,
         owner: OwnerContext | None = None, client_id: UUID | None = None,
     ) -> StoredJob:
@@ -59,7 +62,7 @@ class MerchantReplyService:
         if created:
             accepted = await task_runner.enqueue(
                 job_id=job.id,
-                task=lambda: self.run_rejudge(job_id=job.id, reply_id=reply_id, owner=request_owner, fingerprint=fingerprint, analytics_session_id=analytics_session_id),
+                task=lambda: self.run_rejudge(job_id=job.id, reply_id=reply_id, owner=request_owner, fingerprint=fingerprint, allow_demo_fallback=allow_demo_fallback, analytics_session_id=analytics_session_id),
             )
             if accepted and self.event_sink:
                 safe_emit_server(self.event_sink, event_name="rejudge_started", resource_id=job.id, anonymous_session_id=analytics_session_id, stage="queued", metadata={"processing_mode": job.processing_mode.value if job.processing_mode else "test-fixture"})
@@ -71,6 +74,7 @@ class MerchantReplyService:
 
     async def run_rejudge(
         self, *, job_id: UUID, reply_id: UUID, fingerprint: str,
+        allow_demo_fallback: bool = False,
         analytics_session_id: UUID | None = None,
         owner: OwnerContext | None = None, client_id: UUID | None = None,
     ) -> None:
@@ -86,7 +90,7 @@ class MerchantReplyService:
             )
             for saved in replies:
                 if saved["processing_status"] == "queued":
-                    await self.parse(reply_id=saved["id"], owner=request_owner, analytics_session_id=analytics_session_id)
+                    await self.parse(reply_id=saved["id"], owner=request_owner, allow_demo_fallback=allow_demo_fallback, analytics_session_id=analytics_session_id)
             reply_context, parent, inputs, replies, all_claims = await self.repository.merchant_rejudgement_batch(
                 anchor_reply_id=reply_id, client_id=repo_owner
             )
@@ -152,6 +156,7 @@ class MerchantReplyService:
 
     async def parse(
         self, *, reply_id: UUID, analytics_session_id: UUID | None = None,
+        allow_demo_fallback: bool = False,
         owner: OwnerContext | None = None, client_id: UUID | None = None,
     ) -> None:
         request_owner = resolve_owner(owner=owner, client_id=client_id)
@@ -164,6 +169,16 @@ class MerchantReplyService:
             parsed = await self.provider.parse_merchant_reply(
                 field_key=reply["field_key"], raw_text=reply["raw_text"], product_evidence=product_evidence
             )
+        except Exception:
+            parsed = self._demo_reply_fallback(
+                field_key=str(reply["field_key"]),
+                raw_text=str(reply["raw_text"]),
+                allow_demo_fallback=allow_demo_fallback,
+            )
+            if parsed is None:
+                await self.repository.fail_merchant_reply_parse(reply_id=reply_id, client_id=repo_owner)
+                raise
+        try:
             await self.repository.persist_merchant_reply_parse(
                 reply_id=reply_id, client_id=repo_owner, parsed_status=parsed.reply_status, claims=parsed.claims
             )
@@ -176,6 +191,33 @@ class MerchantReplyService:
                 anonymous_session_id=analytics_session_id,
                 candidate_id=reply.get("candidate_id"), decision_version_id=reply.get("decision_version_id"),
             )
+
+    def _demo_reply_fallback(
+        self, *, field_key: str, raw_text: str, allow_demo_fallback: bool
+    ) -> MerchantReplyParse | None:
+        """Use the existing merchant fixture only for an explicit sample flow."""
+        if not allow_demo_fallback or not isinstance(self.provider, MiMoMerchantReplyReasoningProvider):
+            return None
+        fixture = FixtureCatalog().load_merchant_reply("merchant-answered")
+        claim = next((item for item in fixture.expected_claims if item.get("field_name") == field_key), None)
+        if claim is None:
+            return None
+        normalized = claim.get("normalized_value")
+        if not isinstance(normalized, str) or not normalized:
+            return None
+        return MerchantReplyParse(
+            reply_status="answered",
+            answered_fields=(field_key,),
+            claims=(
+                {
+                    "field_key": field_key,
+                    "raw_text": str(claim.get("raw_text") or raw_text),
+                    "normalized_value": normalized,
+                },
+            ),
+            unresolved_fields=(), conflicts=(), coverage=1, ambiguity=0,
+            should_rejudge=True,
+        )
 
     @staticmethod
     def _dto(row: dict[str, object]) -> MerchantReply:

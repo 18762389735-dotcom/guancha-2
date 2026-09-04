@@ -11,6 +11,7 @@ function browser() {
     localStorage: { getItem: key => values.get(key) || null, setItem: (key, value) => values.set(key, value), removeItem: key => values.delete(key) },
     structuredClone,
     FormData: global.FormData,
+    Blob: global.Blob,
     setTimeout,
     document: { hidden: false },
   };
@@ -71,6 +72,24 @@ test('API client exposes merchant reply and asynchronous rejudgement contracts',
   assert.equal(request.payload, '{}');
   await client.getDecisionDelta('delta-1');
   assert.equal(request.path, '/api/v1/decision-deltas/delta-1');
+});
+
+test('sample-only requests carry an explicit demo marker while normal requests do not', async () => {
+  const { window } = browser();
+  load(window, path.join(root, 'api-client.js'));
+  const requests = [];
+  const client = window.GuanchaApi.createApiClient({ clientId: 'd3ac0eb0-6436-4d48-a3cc-6f0d9f171a0f', transport: item => { requests.push(item); return Promise.resolve({ ok: true, body: { id: 'ok' } }); } });
+  const key = '4d482cc6-3546-4859-9fbf-01063e12d234';
+  const file = new window.Blob(['synthetic'], { type: 'image/png' });
+  await client.uploadCandidateImage('candidate-1', file, key);
+  await client.uploadCandidateImage('candidate-1', file, key, { demoSample: true });
+  await client.createMerchantReply('session-1', { decision_version_id: 'v1', followup_question_id: 'q1', raw_text: 'reply' }, key, { demoSample: true });
+  await client.rejudgeMerchantReply('session-1', key, { demoSample: true });
+
+  assert.equal(requests[0].headers['X-Guancha-Demo-Sample'], undefined);
+  assert.equal(requests[1].headers['X-Guancha-Demo-Sample'], 'true');
+  assert.equal(requests[2].headers['X-Guancha-Demo-Sample'], 'true');
+  assert.equal(requests[3].headers['X-Guancha-Demo-Sample'], 'true');
 });
 
 test('API client submits brew feedback through the idempotent server bridge', async () => {

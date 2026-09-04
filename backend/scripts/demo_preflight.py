@@ -79,13 +79,13 @@ def check_offline_fixture_paths(catalog: FixtureCatalog) -> bool:
                     "product_name": fixture.fields.get("tea_type"), "tea_category": "乌龙茶",
                     "tea_subtype": fixture.fields.get("tea_type"), "origin": fixture.fields.get("origin_text"),
                     "roast_or_style": fixture.fields.get("roast_level"), "aroma_claims": [], "taste_claims": [],
-                    "year_or_harvest": fixture.fields.get("year_or_batch"), "grade": None,
+                    "year_or_batch": fixture.fields.get("year_or_batch"), "grade": None,
                     "weight": None, "price": None, "brew_claims": [], "risk_flags": [],
-                    "evidence": [{"field_name": item.field_name, "raw_text": item.raw_text or item.field_name,
-                        "normalized_value": item.normalized_value or item.field_name, "model_confidence": 0.9,
-                        "information_status": item.information_status, "source_type": item.source_type,
-                        "verification_status": item.verification_status, "source_location": item.source_location,
-                        "evidence_strength": item.evidence_strength} for item in fixture.evidence],
+                    "evidence": [{"field_name": item["field_name"], "raw_text": item.get("raw_text") or item["field_name"],
+                        "normalized_value": item.get("normalized_value") or item["field_name"], "model_confidence": 0.9,
+                        "information_status": item["information_status"], "source_type": item["source_type"],
+                        "verification_status": item["verification_status"], "source_location": item["source_location"],
+                        "evidence_strength": item["evidence_strength"]} for item in fixture.evidence],
                 })
         report("PASS", "A/B/C hashes, schemas, Fake-mode 3 candidates/6 real images, cache fallback simulation")
         return True
