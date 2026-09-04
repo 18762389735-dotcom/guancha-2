@@ -75,7 +75,8 @@ test('mixed candidate failures render a failure summary instead of perpetual loa
 
   assert.match(html, /分析未完成/);
   assert.match(html, /候选 A/);
-  assert.match(html, /ai_schema_invalid/);
+  assert.match(html, /这张图片暂时没分析成功/);
+  assert.doesNotMatch(html, /ai_schema_invalid/);
   assert.match(html, /data-candidate-id="candidate-a"/);
   assert.doesNotMatch(html, /正在分析中/);
   assert.strictEqual(state.candidates[1].extraction, completedExtraction);

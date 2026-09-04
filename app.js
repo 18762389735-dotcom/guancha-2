@@ -34,6 +34,12 @@ const productAnalytics = GuanchaProductAnalytics.create({ endpoint: `${configure
 productAnalytics.track('app_open', { metadata: { screen: 'home' } });
 const runtimeImages = new Map();
 let pendingImageCandidateId = null;
+let sampleCandidateInFlight = false;
+let analysisInFlight = false;
+let merchantReplyInFlight = false;
+let rejudgeInFlight = false;
+let warehouseSaveInFlight = false;
+let brewSaveInFlight = false;
 // A cached older stores.js must never make the upload UI unusable.  Its
 // fallback keeps the current page functional; a fresh load restores the
 // IndexedDB-backed persistence path below.
@@ -47,6 +53,10 @@ const pendingImageStore = GuanchaStores.pendingImages || {
 // screenshot for each candidate.  The compact candidate card remains the
 // same; only its existing small "+" control exposes the second-image path.
 const PRODUCT_LIMITS = Object.freeze({ maxCandidates: 5, maxImagesPerCandidate: 2 });
+const SAMPLE_CANDIDATE_ASSETS = Object.freeze([
+  'test-fixtures/demo-images/candidate-a-qingxiang-1.png',
+  'test-fixtures/demo-images/candidate-a-qingxiang-2.png',
+]);
 
 const defaultState = {
   screen: 'home',
@@ -1026,10 +1036,12 @@ function needCard({ editable = true, className = '' } = {}) {
 }
 function renderCandidates() {
   const has = state.candidates.length > 0;
-  const list = has ? `<div class="candidate-list">${state.candidates.map((candidate, index) => candidateRow(candidate, index)).join('')}</div><p class="candidate-more">还可添加 ${candidateLimit() - state.candidates.length} 款候选茶</p>` : `<div class="candidate-empty"><span class="candidate-scene" role="img" aria-label="候选茶分析插画"></span><h3>还没有候选茶</h3><p>点击右下角 +，把你正在纠结的茶放进来。<br>观茶会帮你看清它们对你有什么不同。</p></div>`;
+  const list = has ? `<div class="candidate-list">${state.candidates.map((candidate, index) => candidateRow(candidate, index)).join('')}</div><p class="candidate-more">还可添加 ${candidateLimit() - state.candidates.length} 款候选茶</p>` : `<div class="candidate-empty"><span class="candidate-scene" role="img" aria-label="候选茶分析插画"></span><h3>还没有候选茶</h3><p>点击右下角 +，把你正在纠结的茶放进来。<br>观茶会帮你看清它们对你有什么不同。</p><div class="candidate-sample-entry"><button class="secondary-btn" data-action="use-sample-candidate" ${sampleCandidateInFlight ? 'disabled' : ''}>${sampleCandidateInFlight ? '正在准备示例候选…' : '使用示例候选'}</button><p>没有截图也可以先看完整流程。示例内容不会使用你的照片。</p></div></div>`;
+  const analysisDisabled = !has || analysisInFlight;
+  const analysisLabel = analysisInFlight ? '正在准备分析…' : `开始分析${has ? ` ${state.candidates.length} 款茶` : ''}`;
   return `<section class="page page-tight" aria-label="添加候选"><button class="icon-btn back-btn" data-action="go-home" aria-label="返回">${icon('back')}</button>${wordmark('add-candidate.svg', 'wordmark--add-candidate', '添加候选')}${needCard()}
   <section class="candidate-panel card no-offset"><h2 class="candidate-panel-title">候选茶 <span>(${state.candidates.length}/${candidateLimit()})</span></h2>${list}</section>
-  <div class="bottom-actions"><button class="primary-btn" data-action="start-analysis" ${has ? '' : 'disabled'}>开始分析${has ? ` ${state.candidates.length} 款茶` : ''}</button><button class="add-round" data-action="open-source" aria-label="添加候选茶">+</button></div></section>`;
+  <div class="bottom-actions"><button class="primary-btn" data-action="start-analysis" ${analysisDisabled ? 'disabled' : ''}>${analysisLabel}</button><button class="add-round" data-action="open-source" aria-label="添加候选茶">+</button></div></section>`;
 }
 function candidateRow(candidate, index) {
   const images = Array.isArray(candidate.images) ? candidate.images : [];
@@ -1039,7 +1051,8 @@ function candidateRow(candidate, index) {
   const addImage = images.length < imageLimit() ? `<button class="candidate-image-add" data-action="add-candidate-image" data-candidate-id="${escapeHtml(candidate.id)}" aria-label="为候选${candidate.letter}补第${images.length + 1}张图片">+</button>` : '';
   const readText = candidate.extractionStatus === 'completed' ? `已加入比较 · ${images.length} 张商品截图` : `已暂存 ${images.length}/${imageLimit()} 张商品截图`;
   const extractText = candidate.extractionStatus === 'completed' ? '已整理商品信息与风格线索' : '等待整理这款茶与你需求有关的差异';
-  return `<article class="candidate-row"><span class="candidate-image-slot">${visual}${addImage}</span><div><div class="candidate-name">${escapeHtml(candidate.name)}</div><div class="candidate-type">${escapeHtml(candidate.type)}</div><div class="candidate-read">${readText}</div><div class="candidate-extract">${extractText}</div></div><button class="remove-candidate" data-action="remove-candidate" data-index="${index}" aria-label="删除候选${candidate.letter}">×</button></article>`;
+  const sampleBadge = candidate.isDemoSample ? '<span class="candidate-badge">示例内容</span>' : '';
+  return `<article class="candidate-row"><span class="candidate-image-slot">${visual}${addImage}</span><div><div class="candidate-name">${escapeHtml(candidate.name)}${sampleBadge}</div><div class="candidate-type">${escapeHtml(candidate.type)}</div><div class="candidate-read">${readText}</div><div class="candidate-extract">${extractText}</div></div><button class="remove-candidate" data-action="remove-candidate" data-index="${index}" aria-label="删除候选${candidate.letter}">×</button></article>`;
 }
 
 function renderO1() {
@@ -1078,8 +1091,7 @@ function renderAnalysis() {
   if (failedCandidates.length) {
     const failureItems = failedCandidates.map(({ candidate, index }) => {
       const label = `候选 ${candidate.letter || String.fromCharCode(65 + index)}`;
-      const errorCode = candidate.jobError ? `：错误代码 ${escapeHtml(candidate.jobError)}` : '';
-      return `<li>${escapeHtml(label)}${errorCode}</li>`;
+      return `<li>${escapeHtml(label)}：这张图片暂时没分析成功，请确认截图清晰后再试一次。</li>`;
     }).join('');
     const retryActions = failedCandidates.map(({ candidate, index }) => {
       const label = candidate.letter || String.fromCharCode(65 + index);
@@ -1105,9 +1117,11 @@ function appendMerchantReplyForm() {
     const nextLabel = nextCandidate ? `（可切换至候选 ${nextCandidate.letter || '下一位'}）` : '';
     form.innerHTML = `<p class="soft-note">候选 ${candidate?.letter || '当前'} 的商家回复已保存，请切换到仍待补充的候选茶。${nextLabel}</p>`;
   } else {
+    const rejudging = typeof rejudgeInFlight !== 'undefined' && rejudgeInFlight;
+    const savingReply = typeof merchantReplyInFlight !== 'undefined' && merchantReplyInFlight;
     form.innerHTML = ready
-      ? '<p class="soft-note">所有需要回复的候选茶已保存。确认后统一更新本轮判断。</p><button class="primary-btn" type="button" data-action="update-merchant-judgement">提交并更新判断</button>'
-      : '<label>商家回复</label><p class="soft-note">粘贴商家对以上问题的完整回复，系统会分别提取对应信息。</p><textarea name="merchant-reply" required maxlength="4000" placeholder="例如：中焙，不提供试饮，这是今年秋茶。"></textarea><button class="primary-btn" type="submit">保存商家回复</button>';
+      ? `<p class="soft-note">所有需要回复的候选茶已保存。确认后统一更新本轮判断。</p><button class="primary-btn" type="button" data-action="update-merchant-judgement" ${rejudging ? 'disabled' : ''}>${rejudging ? '正在更新判断…' : '提交并更新判断'}</button>`
+      : `<label>商家回复</label><p class="soft-note">粘贴商家对以上问题的完整回复，系统会分别提取对应信息。</p><textarea name="merchant-reply" required maxlength="4000" placeholder="例如：中焙，不提供试饮，这是今年秋茶。"></textarea><button class="primary-btn" type="submit" ${savingReply ? 'disabled' : ''}>${savingReply ? '正在保存…' : '保存商家回复'}</button>`;
   }
   sheet.append(form);
 }
@@ -1254,7 +1268,7 @@ function renderOwnership() {
       ${ownershipOption('bought','我已经买到','本次购入，加入茶仓后开始记录','can')}
       ${ownershipOption('owned','我本来就有','已有的茶，也可以加入茶仓开始记录','gaiwan')}
     </div>
-    <div class="screen-bottom"><button class="primary-btn" data-action="confirm-warehouse">确认加入茶仓</button><button class="text-link" data-action="save-choice-only">暂不加入茶仓，仅保存选择结果</button></div>
+    <div class="screen-bottom"><button class="primary-btn" data-action="confirm-warehouse" ${warehouseSaveInFlight ? 'disabled' : ''}>${warehouseSaveInFlight ? '正在加入茶仓…' : '确认加入茶仓'}</button><button class="text-link" data-action="save-choice-only">暂不加入茶仓，仅保存选择结果</button></div>
   </section>`;
 }
 function ownershipOption(value, title, copy, art) { const selected = state.ownershipChoice === value; return `<button class="ownership-option ${selected ? 'selected' : ''}" data-action="set-ownership" data-value="${value}">${teaArt({art},'ownership-art')}<span><b>${title}</b><small>${copy}</small></span><i class="radio-dot ${selected ? 'selected' : ''}">${selected ? icon('check',16) : ''}</i></button>`; }
@@ -1329,11 +1343,11 @@ function choiceButtons(field, values, selected, cls='feedback-options') {
 }
 function renderFeedback() { const brew=ensureBrew(); const f=brew.feedback; const showSource=['一般','不喜欢'].includes(f.taste)||['偏淡','偏浓'].includes(f.strength); return `<section class="page feedback-page">${topBack('exit-brew')}${titleWithSub('标题_泡茶记录.svg','泡茶记录','用半分钟，记下这一杯的感受。')}
   <section class="feedback-card card"><h2>这杯合你的口味吗？<em>必选</em></h2>${choiceButtons('taste',['喜欢','一般','不喜欢','还不确定'],f.taste)}<h2>本次浓淡如何？<em>必选</em></h2>${choiceButtons('strength',['偏淡','刚好','偏浓','不确定'],f.strength)}${showSource ? `<h2>你觉得问题主要来自？</h2>${choiceButtons('source',['茶本身不太适合','本次泡法可能不合适','两方面都有','还判断不出来'],f.source)}` : ''}<h2>这一泡的感觉 <span>最多 2 个</span></h2>${choiceButtons('tags',['清爽','顺口','醇厚','没感觉','不确定'],f.tags,'feedback-options multi')}<label class="impression-label">今天对这杯茶的印象 <span>可选</span><textarea data-action="feedback-impression" maxlength="80" placeholder="写一句想记住的话…">${escapeHtml(f.impression)}</textarea></label><h2>回购意愿 <span>可选</span></h2>${choiceButtons('repurchase',['想回购','暂不确定','不会回购'],f.repurchase)}</section>
-  <div class="screen-bottom"><button class="primary-btn" data-action="go-advanced">继续（可选进阶记录）</button><button class="text-link" data-action="save-record">跳过进阶记录，保存</button></div></section>`; }
+  <div class="screen-bottom"><button class="primary-btn" data-action="go-advanced">继续（可选进阶记录）</button><button class="text-link" data-action="save-record" ${brewSaveInFlight ? 'disabled' : ''}>${brewSaveInFlight ? '正在保存…' : '跳过进阶记录，保存'}</button></div></section>`; }
 
 function renderAdvanced() { const brew=ensureBrew(); const f=brew.feedback; const dimensions={汤感:['偏薄','顺滑','有厚度','不确定'],回甘:['未感到','有一点','明显','不确定'],生津:['未感到','有一点','明显','不确定'],体感:['无明显感受','放松温暖','有刺激感','不确定'],余韵:['很短','有一点','较久','不确定']}; return `<section class="page advanced-page">${topBack('go-feedback')}${titleWithSub('标题_泡茶记录.svg','多记一点','这些都是可选的，只为帮助你自己回看。')}
   <section class="feedback-card card"><div class="advanced-head"><h2>香气 <span>最多 3 个</span></h2><b>已选 ${f.aroma.length}/3</b></div>${choiceButtons('aroma',FLAVORS.concat(['没有明显香气','不确定']),f.aroma,'aroma-grid multi')}${Object.entries(dimensions).map(([key,values])=>`<section class="dimension"><h3>${key}<small>${advancedExplain(key)}</small></h3>${choiceButtons(`advanced-${key}`,values,f.advanced[key])}</section>`).join('')}<h2>给这次泡茶打个分 <span>可选</span></h2><div class="score-row">${[1,2,3,4,5].map(value=>`<button class="${f.score===value ? 'selected' : ''}" data-action="set-feedback" data-field="score" data-value="${value}">${value}</button>`).join('')}</div></section>
-  <div class="screen-bottom"><button class="primary-btn" data-action="save-record">保存泡茶记录</button></div></section>`; }
+  <div class="screen-bottom"><button class="primary-btn" data-action="save-record" ${brewSaveInFlight ? 'disabled' : ''}>${brewSaveInFlight ? '正在保存…' : '保存泡茶记录'}</button></div></section>`; }
 function advancedExplain(key) { return ({汤感:'入口偏薄、顺滑，还是有厚度？',回甘:'咽下后是否慢慢泛出甜感？',生津:'喝后口腔是否变得湿润？',体感:'主观上是否放松、温暖或有刺激感？',余韵:'吞咽后香气或滋味停留多久？'})[key]; }
 
 function renderBrewResult() {
@@ -1353,7 +1367,7 @@ function detailSection(title, body) { return `<section class="detail-list card">
 function renderSettings() { const signedIn = authClient?.getState().status === 'authenticated'; return `<section class="page settings-page">${greeting()}${titleWithSub('标题_设置.svg','设置','把你的偏好和本地演示数据放在这里。')}<section class="settings-list card"><button data-action="open-preferences"><span>${icon('leaf',23)} 初始口味偏好</span>${icon('right',20)}</button><button data-action="show-evidence"><span>${icon('book',23)} 近期饮用证据</span>${icon('right',20)}</button><button data-action="reset-demo"><span>${icon('jar',23)} 清除本地演示数据</span>${icon('right',20)}</button>${signedIn ? '<button data-action="logout"><span>退出登录</span><span>›</span></button>' : ''}</section>${tabbar()}</section>`; }
 
 function renderOverlay() {
-  if (state.overlay === 'source') return `<div class="overlay" data-action="close-overlay"><section class="sheet"><div class="sheet-handle"></div>${wordmark('add-candidate.svg', 'wordmark--source-add', '添加候选')}<button class="source-choice" data-action="choose-camera"><span>${icon('camera')}</span><b>拍照</b><span>›</span></button><button class="source-choice" data-action="choose-album"><span>${icon('photo')}</span><b>从相册上传商品截图</b><span>›</span></button><button class="sheet-close" style="display:block;margin:28px auto 0" data-action="close-overlay" aria-label="关闭">${icon('close')}</button></section></div>`;
+  if (state.overlay === 'source') return `<div class="overlay" data-action="close-overlay"><section class="sheet"><div class="sheet-handle"></div>${wordmark('add-candidate.svg', 'wordmark--source-add', '添加候选')}<button class="source-choice" data-action="choose-camera"><span>${icon('camera')}</span><b>拍照</b><span>›</span></button><button class="source-choice" data-action="choose-album"><span>${icon('photo')}</span><b>从相册上传商品截图</b><span>›</span></button><button class="source-choice" data-action="use-sample-candidate" ${sampleCandidateInFlight ? 'disabled' : ''}><span>${icon('leaf')}</span><b>${sampleCandidateInFlight ? '正在准备示例候选…' : '使用示例候选'}</b><span>›</span></button><button class="sheet-close" style="display:block;margin:28px auto 0" data-action="close-overlay" aria-label="关闭">${icon('close')}</button></section></div>`;
   if (state.overlay === 'camera') return `<div class="overlay"><section class="sheet camera-sheet"><div class="sheet-handle"></div><div class="sheet-title-row"><h2 class="sheet-title">拍照识别</h2><button class="sheet-close" data-action="close-overlay" aria-label="关闭">${icon('close')}</button></div><div class="camera-preview"><video id="camera-preview" autoplay playsinline muted aria-label="电脑摄像头预览"></video><div class="camera-fallback" id="camera-fallback" hidden>暂时无法访问电脑摄像头。<br><button class="secondary-btn" data-action="choose-album">从相册选择图片</button></div></div><div class="camera-actions"><button class="camera-cancel" data-action="close-overlay" aria-label="取消">${icon('close',22)}</button><button class="camera-capture" data-action="capture-camera" aria-label="拍摄"></button><span aria-hidden="true"></span></div></section></div>`;
   if (state.overlay === 'need-editor') return `<div class="modal"><form class="modal-box" data-action="save-needs"><h2>编辑本次需求</h2><div class="form-row"><label for="need-taste">口味或偏好</label><input id="need-taste" name="taste" value="${escapeHtml(state.need.taste)}" /></div><div class="form-row"><label for="need-purpose">用途</label><input id="need-purpose" name="purpose" value="${escapeHtml(state.need.purpose)}" /></div><div class="form-row"><label for="need-budget">预算</label><input id="need-budget" name="budget" value="${escapeHtml(state.need.budget)}" /></div><div class="modal-actions"><button class="secondary-btn" type="button" data-action="close-overlay">取消</button><button class="primary-btn" style="width:auto;height:44px;padding:0 18px;font-size:16px" type="submit">保存</button></div></form></div>`;
   if (state.overlay === 'plan-editor') { const p=ensureBrew().plan; return `<div class="modal"><form class="modal-box" data-action="save-plan"><h2>调整冲泡参数</h2><div class="form-row"><label>茶具<input name="ware" value="${escapeHtml(p.ware)}" /></label></div><div class="form-row"><label>注水量<input name="water" value="${escapeHtml(p.water)}" /></label></div><div class="form-row"><label>投茶量<input name="grams" value="${escapeHtml(p.grams)}" /></label></div><div class="form-row"><label>水温<input name="temp" value="${escapeHtml(p.temp)}" /></label></div><div class="form-row"><label>第 1 泡秒数<input type="number" min="3" max="60" name="seconds" value="${p.seconds}" /></label></div><div class="modal-actions"><button class="secondary-btn" type="button" data-action="close-overlay">取消</button><button class="primary-btn" style="width:auto;height:44px;padding:0 18px;font-size:16px" type="submit">保存参数</button></div></form></div>`; }
@@ -1444,6 +1458,36 @@ async function addCandidate(files) {
     return { ok: true, candidate, converted: prepared.converted };
   } catch {
     return { ok: false, code: 'local_image_stage_failed', message: '图片暂存失败，请重试' };
+  }
+}
+async function addSampleCandidate() {
+  if (sampleCandidateInFlight) return false;
+  sampleCandidateInFlight = true;
+  render();
+  try {
+    const files = await Promise.all(SAMPLE_CANDIDATE_ASSETS.map(async (path, index) => {
+      const response = await fetch(path, { credentials: 'same-origin' });
+      if (!response.ok) throw new Error('sample_asset_unavailable');
+      const blob = await response.blob();
+      return new File([blob], `guancha-demo-candidate-a-${index + 1}.png`, { type: 'image/png' });
+    }));
+    const added = await addCandidate(files);
+    if (!added.ok) {
+      showToast(added.message);
+      return false;
+    }
+    added.candidate.isDemoSample = true;
+    saveState();
+    state.overlay = null;
+    setScreen('candidates');
+    showToast('示例候选已加入，可以直接开始分析');
+    return true;
+  } catch {
+    showToast('示例候选暂时无法加载，请改用截图上传');
+    return false;
+  } finally {
+    sampleCandidateInFlight = false;
+    if (state.screen === 'candidates') render();
   }
 }
 async function appendCandidateImage(candidateId, files) {
@@ -1580,12 +1624,21 @@ document.addEventListener('click', event => {
     stopCamera(); state.overlay=null; return render();
   }
   if (action === 'open-source') { state.overlay='source'; return render(); }
+  if (action === 'use-sample-candidate') return addSampleCandidate();
   if (action === 'add-candidate-image') { pendingImageCandidateId=target.dataset.candidateId; candidateImageInput.click(); return; }
   if (action === 'choose-camera') { state.overlay='camera'; return render(); }
   if (action === 'capture-camera') return captureCamera();
   if (action === 'choose-album') { stopCamera(); state.overlay=null; render(); albumInput.click(); return; }
   if (action === 'remove-candidate') { const activeId=candidateIdentity(currentCandidate()); const [removed]=state.candidates.splice(Number(target.dataset.index),1); if (removed?.serverCandidateId && apiClient.isConfigured) apiClient.deleteCandidate(removed.serverCandidateId).catch(() => {}); (removed?.images || []).forEach(image=>{ const runtime=runtimeImages.get(image.id); if(runtime) URL.revokeObjectURL(runtime.url); runtimeImages.delete(image.id); pendingImageStore.remove(image.id); }); renumberCandidates(); syncActiveCandidate(activeId); state.decisionVersionId=null; saveState(); return render(); }
-  if (action === 'start-analysis') return startMvpAnalysis();
+  if (action === 'start-analysis') {
+    if (analysisInFlight) return;
+    analysisInFlight = true;
+    render();
+    return Promise.resolve(startMvpAnalysis()).finally(() => {
+      analysisInFlight = false;
+      if (state.screen === 'candidates') render();
+    });
+  }
   if (action === 'retry-analysis') {
     const candidateId = target.dataset.candidateId;
     const candidate = candidateId
@@ -1595,7 +1648,12 @@ document.addEventListener('click', event => {
   }
   if (action === 'retry-decision') { state.decisionJobId = null; state.decisionStatus = 'not_requested'; saveState(); return maybeStartSessionDecision(); }
   if (action === 'ask') return openFollowupQuestions();
-  if (action === 'update-merchant-judgement') return updateMerchantJudgement();
+  if (action === 'update-merchant-judgement') {
+    if (rejudgeInFlight) return;
+    rejudgeInFlight = true;
+    render();
+    return Promise.resolve(updateMerchantJudgement()).finally(() => { rejudgeInFlight = false; });
+  }
   if (action === 'copy-question') { const item = merchantQuestions(currentCandidate())[Number(target.dataset.index)]; if (item) productAnalytics.track('merchant_question_copied', { candidate_id: currentCandidate()?.serverCandidateId, decision_version_id: state.decisionVersionId || undefined, metadata: { question_field: item.field_key || 'unknown', question_count: 1, screen: state.screen } }); return item?.question && copyText(item.question); }
   if (action === 'copy-all') { const questions = merchantQuestions(currentCandidate()); productAnalytics.track('merchant_question_copied', { candidate_id: currentCandidate()?.serverCandidateId, decision_version_id: state.decisionVersionId || undefined, metadata: { question_count: questions.length, source: 'copy_all', screen: state.screen } }); return copyText(questions.map((item,index)=>`${index+1}. ${item.question}`).join('\n')); }
   if (action === 'slide-prev') { slide(-1); return trackResultView(); }
@@ -1604,7 +1662,15 @@ document.addEventListener('click', event => {
   if (action === 'confirm-choice') { productAnalytics.track('candidate_selected', { candidate_id: currentCandidate()?.serverCandidateId, decision_version_id: state.decisionVersionId || undefined, metadata: { action_bucket: currentCandidate()?.decision?.action_bucket || 'unknown', screen: state.screen } }); return setScreen('ownership'); }
   if (action === 'back-from-ownership') return setScreen('candidates');
   if (action === 'set-ownership') { state.ownershipChoice = target.dataset.value; saveState(); return render(); }
-  if (action === 'confirm-warehouse') return confirmWarehouseFromSelection();
+  if (action === 'confirm-warehouse') {
+    if (warehouseSaveInFlight) return;
+    warehouseSaveInFlight = true;
+    render();
+    return Promise.resolve(confirmWarehouseFromSelection()).finally(() => {
+      warehouseSaveInFlight = false;
+      if (state.screen === 'ownership') render();
+    });
+  }
   if (action === 'save-choice-only') { addSelectionHistory(currentCandidate()); completeSelectionFlow(); showToast('已保存选茶结果'); return setScreen('home'); }
   if (action === 'go-warehouse') return setScreen('warehouse');
   if (action === 'open-warehouse-add') return setScreen('warehouse-add');
@@ -1630,7 +1696,17 @@ document.addEventListener('click', event => {
   if (action === 'exit-brew') { if (state.brew && !window.confirm('要结束这次泡茶吗？未保存的记录会丢失。')) return; state.brew=null; return setScreen('journal-day'); }
   if (action === 'set-feedback') { setFeedback(target.dataset.field,target.dataset.value); saveState(); return render(); }
   if (action === 'go-advanced') { const f=ensureBrew().feedback; if (!f.taste || !f.strength) return showToast('请先完成两项基础感受'); return setScreen('advanced'); }
-  if (action === 'save-record') { const f=ensureBrew().feedback; if (!f.taste || !f.strength) return showToast('请先完成两项基础感受'); return saveBrewRecord().then(saved => { if (saved) setScreen('brew-result'); }); }
+  if (action === 'save-record') {
+    const f=ensureBrew().feedback;
+    if (!f.taste || !f.strength) return showToast('请先完成两项基础感受');
+    if (brewSaveInFlight) return;
+    brewSaveInFlight = true;
+    render();
+    return Promise.resolve(saveBrewRecord()).then(saved => { if (saved) setScreen('brew-result'); }).finally(() => {
+      brewSaveInFlight = false;
+      if (state.screen === 'feedback' || state.screen === 'advanced') render();
+    });
+  }
   if (action === 'analyze-brew-feedback') { const record=state.journalRecords.find(item=>item.id===target.dataset.id); const tea=record && getTea(record.teaId); if (record && tea) analyzeBrewRecord(record, tea); return; }
   if (action === 'open-record') { state.activeRecordId=target.dataset.id; return setScreen('record-detail'); }
   if (action === 'open-latest-record') { state.activeRecordId=state.journalRecords.at(-1)?.id; return setScreen('record-detail'); }
@@ -1660,7 +1736,14 @@ document.addEventListener('submit', event => {
     if (password !== confirmation) return showToast('两次输入的密码不一致');
     return authClient.verifySignUp(code, password).then(completeAuthLogin).catch((error) => showToast(error?.message || '验证码无效或已过期，请重试。'));
   }
-  if (form.dataset.action === 'submit-merchant-reply') { const reply=String(data.get('merchant-reply') || '').trim(); if (reply) { productAnalytics.track('merchant_reply_started', { candidate_id: currentCandidate()?.serverCandidateId, decision_version_id: state.decisionVersionId || undefined, metadata: { screen: state.screen } }); submitMerchantReply(reply); } return; }
+  if (form.dataset.action === 'submit-merchant-reply') {
+    const reply=String(data.get('merchant-reply') || '').trim();
+    if (!reply || merchantReplyInFlight) return;
+    merchantReplyInFlight = true;
+    render();
+    productAnalytics.track('merchant_reply_started', { candidate_id: currentCandidate()?.serverCandidateId, decision_version_id: state.decisionVersionId || undefined, metadata: { screen: state.screen } });
+    return Promise.resolve(submitMerchantReply(reply)).finally(() => { merchantReplyInFlight = false; if (state.overlay === 'ask') render(); });
+  }
   if (form.dataset.action === 'save-needs') {
     const nextNeed = { taste:data.get('taste').trim()||'清爽花香', purpose:data.get('purpose').trim()||'送礼', budget:data.get('budget').trim()||'150–300 元' };
     saveSelectionNeed(nextNeed); return;
@@ -1916,6 +1999,12 @@ function stopRuntimeBusinessState() {
   stopBrewTimer();
   stopCamera();
   GuanchaJobPoller.cancelAll?.();
+  sampleCandidateInFlight = false;
+  analysisInFlight = false;
+  merchantReplyInFlight = false;
+  rejudgeInFlight = false;
+  warehouseSaveInFlight = false;
+  brewSaveInFlight = false;
   runtimeImages.forEach(item => URL.revokeObjectURL(item.url));
   runtimeImages.clear();
   pendingImageCandidateId = null;

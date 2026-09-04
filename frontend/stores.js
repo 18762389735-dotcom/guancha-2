@@ -68,6 +68,7 @@
     if (id) result.id = id;
     if (serverCandidateId) result.serverCandidateId = serverCandidateId;
     if (/^[A-E]$/.test(value.letter)) result.letter = value.letter;
+    if (value.isDemoSample === true) result.isDemoSample = true;
     if (extractionStatus.has(value.extractionStatus)) result.extractionStatus = value.extractionStatus;
     if (extractionErrors.has(value.jobError)) result.jobError = value.jobError;
     for (const field of ['jobId', 'extractionVersionId']) {
