@@ -5,7 +5,9 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from psycopg import InterfaceError
 from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
 import guancha_api.auth.dependencies as auth_dependencies
 import guancha_api.main as main_module
@@ -55,6 +57,51 @@ class _Pool:
 
     async def close(self) -> None:
         self.close_calls += 1
+
+
+class _HealthCheckConnection:
+    def __init__(self, *, broken: bool = False) -> None:
+        self.autocommit = True
+        self.broken = broken
+        self.execute_calls = 0
+
+    async def execute(self, _query: str) -> None:
+        self.execute_calls += 1
+        if self.broken:
+            raise InterfaceError("synthetic stale connection")
+
+    async def __aenter__(self) -> "_HealthCheckConnection":
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback) -> bool:
+        return False
+
+
+class _HealthCheckedPool(AsyncConnectionPool):
+    def __init__(self, connections: list[_HealthCheckConnection]) -> None:
+        super().__init__(
+            "",
+            min_size=0,
+            max_size=1,
+            timeout=1.0,
+            check=main_module._DATABASE_POOL_CHECK,
+            open=False,
+        )
+        self._opened = True
+        self._closed = False
+        self._open_implicit = False
+        self.connections = list(connections)
+        self.rejected: list[_HealthCheckConnection] = []
+
+    async def _getconn_unchecked(self, _timeout: float) -> _HealthCheckConnection:
+        return self.connections.pop(0)
+
+    async def _putconn(self, connection: _HealthCheckConnection, *, from_getconn: bool) -> None:
+        if from_getconn:
+            self.rejected.append(connection)
+
+    async def putconn(self, connection: _HealthCheckConnection) -> None:
+        await self._putconn(connection, from_getconn=False)
 
 
 class _PooledRepository:
@@ -190,6 +237,43 @@ async def test_authenticated_user_resolution_uses_pool_without_new_connect_calls
     assert pool.connection_object.close_calls == 0
     assert factory_calls == 0
     assert connect_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_authenticated_resolution_replaces_stale_connection_before_me_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale = _HealthCheckConnection(broken=True)
+    healthy = _HealthCheckConnection()
+    pool = _HealthCheckedPool([stale, healthy])
+
+    monkeypatch.setattr(auth_dependencies, "PostgresPhase2Repository", _PooledRepository)
+    request = _request(pool, token_verifier=FakeTokenVerifier())
+
+    resolved = await _resolve_authenticated_user(request, "Bearer valid-token-a")
+
+    assert resolved.id == _PooledRepository.instances[-1].user.id
+    assert pool.rejected == [stale]
+    assert stale.execute_calls == 1
+    assert healthy.execute_calls == 1
+    assert _PooledRepository.instances[-1].connection is healthy
+
+
+@pytest.mark.asyncio
+async def test_authenticated_resolution_keeps_valid_connection_path_healthy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    healthy = _HealthCheckConnection()
+    pool = _HealthCheckedPool([healthy])
+
+    monkeypatch.setattr(auth_dependencies, "PostgresPhase2Repository", _PooledRepository)
+    request = _request(pool, token_verifier=FakeTokenVerifier())
+
+    resolved = await _resolve_authenticated_user(request, "Bearer valid-token-a")
+
+    assert resolved.id == _PooledRepository.instances[-1].user.id
+    assert pool.rejected == []
+    assert healthy.execute_calls == 1
 
 
 def test_pool_settings_reject_invalid_or_oversized_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
