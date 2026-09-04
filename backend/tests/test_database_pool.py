@@ -123,6 +123,7 @@ async def test_lifespan_opens_and_closes_owned_pool_with_conservative_defaults(m
             "min_size": 1,
             "max_size": 3,
             "timeout": 5.0,
+            "check": main_module._DATABASE_POOL_CHECK,
             "open": False,
         }
         assert pool_instances[0].open_calls == 1
