@@ -4,10 +4,11 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
+import psycopg
 import pytest
-from psycopg import InterfaceError
+from fastapi import HTTPException
 from psycopg.rows import dict_row
-from psycopg_pool import AsyncConnectionPool
+from psycopg_pool import PoolTimeout
 
 import guancha_api.auth.dependencies as auth_dependencies
 import guancha_api.main as main_module
@@ -59,49 +60,45 @@ class _Pool:
         self.close_calls += 1
 
 
-class _HealthCheckConnection:
-    def __init__(self, *, broken: bool = False) -> None:
-        self.autocommit = True
+class _ResolutionConnection:
+    def __init__(self, *, broken: bool = False, failure: BaseException | None = None, user: AppUser | None = None) -> None:
         self.broken = broken
-        self.execute_calls = 0
+        self.failure = failure
+        self.user = user
+        self.resolve_calls = 0
 
-    async def execute(self, _query: str) -> None:
-        self.execute_calls += 1
-        if self.broken:
-            raise InterfaceError("synthetic stale connection")
 
-    async def __aenter__(self) -> "_HealthCheckConnection":
-        return self
+class _ResolutionLease:
+    def __init__(self, pool: "_ResolutionPool", item: _ResolutionConnection | BaseException) -> None:
+        self.pool = pool
+        self.item = item
+
+    async def __aenter__(self) -> _ResolutionConnection:
+        if isinstance(self.item, BaseException):
+            raise self.item
+        self.pool.checked_out.append(self.item)
+        return self.item
 
     async def __aexit__(self, exc_type, exc, traceback) -> bool:
+        if isinstance(self.item, _ResolutionConnection):
+            if exc_type is not None and self.item.broken:
+                self.pool.discarded.append(self.item)
+            else:
+                self.pool.returned.append(self.item)
         return False
 
 
-class _HealthCheckedPool(AsyncConnectionPool):
-    def __init__(self, connections: list[_HealthCheckConnection]) -> None:
-        super().__init__(
-            "",
-            min_size=0,
-            max_size=1,
-            timeout=1.0,
-            check=main_module._DATABASE_POOL_CHECK,
-            open=False,
-        )
-        self._opened = True
-        self._closed = False
-        self._open_implicit = False
-        self.connections = list(connections)
-        self.rejected: list[_HealthCheckConnection] = []
+class _ResolutionPool:
+    def __init__(self, items: list[_ResolutionConnection | BaseException]) -> None:
+        self.items = list(items)
+        self.checked_out: list[_ResolutionConnection] = []
+        self.returned: list[_ResolutionConnection] = []
+        self.discarded: list[_ResolutionConnection] = []
+        self.checkout_calls = 0
 
-    async def _getconn_unchecked(self, _timeout: float) -> _HealthCheckConnection:
-        return self.connections.pop(0)
-
-    async def _putconn(self, connection: _HealthCheckConnection, *, from_getconn: bool) -> None:
-        if from_getconn:
-            self.rejected.append(connection)
-
-    async def putconn(self, connection: _HealthCheckConnection) -> None:
-        await self._putconn(connection, from_getconn=False)
+    def connection(self) -> _ResolutionLease:
+        self.checkout_calls += 1
+        return _ResolutionLease(self, self.items.pop(0))
 
 
 class _PooledRepository:
@@ -122,6 +119,24 @@ class _PooledRepository:
         return self.user
 
 
+class _ResolutionRepository:
+    def __init__(self, connection: _ResolutionConnection) -> None:
+        self.connection = connection
+        now = datetime.now(timezone.utc)
+        self.user = connection.user or AppUser(
+            id=uuid4(),
+            cloudbase_user_id="cloudbase-user-a",
+            created_at=now,
+            updated_at=now,
+        )
+
+    async def resolve_or_create_app_user(self, _subject: str) -> AppUser:
+        self.connection.resolve_calls += 1
+        if self.connection.failure is not None:
+            raise self.connection.failure
+        return self.user
+
+
 class _LegacyRepository:
     def __init__(self) -> None:
         self.recover_calls = 0
@@ -134,7 +149,7 @@ class _LegacyRepository:
         self.close_calls += 1
 
 
-def _request(pool: _Pool, **state_values: object) -> SimpleNamespace:
+def _request(pool: object, **state_values: object) -> SimpleNamespace:
     state = SimpleNamespace(database_pool=pool, **state_values)
     return SimpleNamespace(app=SimpleNamespace(state=state))
 
@@ -170,7 +185,6 @@ async def test_lifespan_opens_and_closes_owned_pool_with_conservative_defaults(m
             "min_size": 1,
             "max_size": 3,
             "timeout": 5.0,
-            "check": main_module._DATABASE_POOL_CHECK,
             "open": False,
         }
         assert pool_instances[0].open_calls == 1
@@ -243,37 +257,114 @@ async def test_authenticated_user_resolution_uses_pool_without_new_connect_calls
 async def test_authenticated_resolution_replaces_stale_connection_before_me_access(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    stale = _HealthCheckConnection(broken=True)
-    healthy = _HealthCheckConnection()
-    pool = _HealthCheckedPool([stale, healthy])
+    user = AppUser(id=uuid4(), cloudbase_user_id="cloudbase-user-a", created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc))
+    stale = _ResolutionConnection(broken=True, failure=psycopg.OperationalError("synthetic stale connection"))
+    healthy = _ResolutionConnection(user=user)
+    pool = _ResolutionPool([stale, healthy])
 
-    monkeypatch.setattr(auth_dependencies, "PostgresPhase2Repository", _PooledRepository)
+    monkeypatch.setattr(auth_dependencies, "PostgresPhase2Repository", _ResolutionRepository)
     request = _request(pool, token_verifier=FakeTokenVerifier())
 
     resolved = await _resolve_authenticated_user(request, "Bearer valid-token-a")
 
-    assert resolved.id == _PooledRepository.instances[-1].user.id
-    assert pool.rejected == [stale]
-    assert stale.execute_calls == 1
-    assert healthy.execute_calls == 1
-    assert _PooledRepository.instances[-1].connection is healthy
+    assert resolved.id == user.id
+    assert pool.checkout_calls == 2
+    assert pool.discarded == [stale]
+    assert healthy.resolve_calls == 1
 
 
 @pytest.mark.asyncio
 async def test_authenticated_resolution_keeps_valid_connection_path_healthy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    healthy = _HealthCheckConnection()
-    pool = _HealthCheckedPool([healthy])
+    healthy = _ResolutionConnection()
+    pool = _ResolutionPool([healthy])
 
-    monkeypatch.setattr(auth_dependencies, "PostgresPhase2Repository", _PooledRepository)
+    monkeypatch.setattr(auth_dependencies, "PostgresPhase2Repository", _ResolutionRepository)
     request = _request(pool, token_verifier=FakeTokenVerifier())
 
     resolved = await _resolve_authenticated_user(request, "Bearer valid-token-a")
 
-    assert resolved.id == _PooledRepository.instances[-1].user.id
-    assert pool.rejected == []
-    assert healthy.execute_calls == 1
+    assert resolved.id is not None
+    assert pool.checkout_calls == 1
+    assert healthy.resolve_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_authenticated_resolution_does_not_retry_nonbroken_operational_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _ResolutionConnection(
+        broken=False,
+        failure=psycopg.OperationalError("synthetic operation failure"),
+    )
+    second = _ResolutionConnection()
+    pool = _ResolutionPool([first, second])
+
+    monkeypatch.setattr(auth_dependencies, "PostgresPhase2Repository", _ResolutionRepository)
+    request = _request(pool, token_verifier=FakeTokenVerifier())
+
+    with pytest.raises(psycopg.OperationalError):
+        await _resolve_authenticated_user(request, "Bearer valid-token-a")
+
+    assert pool.checkout_calls == 1
+    assert first.resolve_calls == 1
+    assert pool.discarded == []
+    assert second.resolve_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_authenticated_resolution_does_not_retry_pool_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _ResolutionPool([PoolTimeout("synthetic pool timeout"), _ResolutionConnection()])
+
+    monkeypatch.setattr(auth_dependencies, "PostgresPhase2Repository", _ResolutionRepository)
+    request = _request(pool, token_verifier=FakeTokenVerifier())
+
+    with pytest.raises(PoolTimeout):
+        await _resolve_authenticated_user(request, "Bearer valid-token-a")
+
+    assert pool.checkout_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_authenticated_resolution_stops_after_second_broken_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _ResolutionConnection(
+        broken=True,
+        failure=psycopg.OperationalError("synthetic first stale connection"),
+    )
+    second = _ResolutionConnection(
+        broken=True,
+        failure=psycopg.OperationalError("synthetic second stale connection"),
+    )
+    pool = _ResolutionPool([first, second, _ResolutionConnection()])
+
+    monkeypatch.setattr(auth_dependencies, "PostgresPhase2Repository", _ResolutionRepository)
+    request = _request(pool, token_verifier=FakeTokenVerifier())
+
+    with pytest.raises(psycopg.OperationalError):
+        await _resolve_authenticated_user(request, "Bearer valid-token-a")
+
+    assert pool.checkout_calls == 2
+    assert first.resolve_calls == second.resolve_calls == 1
+    assert pool.discarded == [first, second]
+
+
+@pytest.mark.asyncio
+async def test_authenticated_resolution_does_not_touch_pool_when_token_verification_fails(
+) -> None:
+    pool = _ResolutionPool([_ResolutionConnection()])
+
+    request = _request(pool, token_verifier=FakeTokenVerifier())
+
+    with pytest.raises(HTTPException) as error:
+        await _resolve_authenticated_user(request, "Bearer unavailable-token")
+
+    assert getattr(error.value, "status_code", None) == 503
+    assert pool.checkout_calls == 0
 
 
 def test_pool_settings_reject_invalid_or_oversized_configuration(monkeypatch: pytest.MonkeyPatch) -> None:

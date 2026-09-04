@@ -2,9 +2,10 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
+import psycopg
 from fastapi import Depends, Header, HTTPException, Request
 
 from guancha_api.auth.errors import (
@@ -55,9 +56,7 @@ async def _resolve_authenticated_user(
 
     database_pool = getattr(request.app.state, "database_pool", None)
     if database_pool is not None:
-        async with database_pool.connection() as connection:
-            repository = PostgresPhase2Repository(connection)
-            app_user = await repository.resolve_or_create_app_user(identity.external_subject)
+        app_user = await _resolve_app_user_from_pool(database_pool, identity.external_subject)
         return CurrentUserInfo(id=app_user.id, created_at=app_user.created_at)
 
     worker_repository_factory = getattr(request.app.state, "worker_repository_factory", None)
@@ -74,6 +73,29 @@ async def _resolve_authenticated_user(
             raise HTTPException(status_code=503, detail="database_not_configured")
         app_user = await repository.resolve_or_create_app_user(identity.external_subject)
     return CurrentUserInfo(id=app_user.id, created_at=app_user.created_at)
+
+
+async def _resolve_app_user_from_pool(database_pool: Any, subject: str):
+    """Resolve the verified subject with one narrow stale-connection recovery."""
+
+    for attempt in range(2):
+        retryable_connection_failure = False
+        try:
+            async with database_pool.connection() as connection:
+                repository = PostgresPhase2Repository(connection)
+                try:
+                    return await repository.resolve_or_create_app_user(subject)
+                except psycopg.OperationalError:
+                    retryable_connection_failure = (
+                        attempt == 0 and getattr(connection, "broken", False) is True
+                    )
+                    raise
+        except psycopg.OperationalError:
+            if retryable_connection_failure:
+                continue
+            raise
+
+    raise AssertionError("authenticated app-user resolution exhausted unexpectedly")
 
 
 CurrentUser = Annotated[CurrentUserInfo, Depends(get_current_user)]

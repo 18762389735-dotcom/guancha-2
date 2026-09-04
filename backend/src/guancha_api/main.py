@@ -71,7 +71,6 @@ DEFAULT_DB_POOL_MIN_SIZE = 1
 DEFAULT_DB_POOL_MAX_SIZE = 3
 DEFAULT_DB_POOL_TIMEOUT_SECONDS = 5.0
 DEFAULT_EXTRACTION_EXECUTION = "in-process"
-_DATABASE_POOL_CHECK = AsyncConnectionPool.check_connection
 
 
 def _pool_setting(name: str, default: int | float, *, minimum: int | float) -> int | float:
@@ -99,7 +98,6 @@ def _database_pool(database_url: str) -> AsyncConnectionPool:
         min_size=min_size,
         max_size=max_size,
         timeout=timeout,
-        check=_DATABASE_POOL_CHECK,
         open=False,
     )
 
