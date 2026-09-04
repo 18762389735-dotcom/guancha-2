@@ -4,7 +4,14 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Cookie, Depends, File, Header, HTTPException, Query, Request, Response, UploadFile, status
 
-from guancha_api.auth.dependencies import AuthenticatedRequestRepository, CurrentUser, Owner, RequestRepository, _bearer_token
+from guancha_api.auth.dependencies import (
+    AuthenticatedRequestRepository,
+    CurrentUser,
+    Owner,
+    RequestRepository,
+    _bearer_token,
+    validated_bearer_token_for_owner,
+)
 from guancha_api.auth.cookies import AUTH_REFRESH_COOKIE, clear_refresh_cookie, set_refresh_cookie
 from guancha_api.auth.gateway import CloudBaseAuthError
 from guancha_api.application.phase2_service import Phase2ExtractionService
@@ -15,6 +22,9 @@ from guancha_api.application.answer_contract import build_selection_answer
 from guancha_api.repositories.idempotency import request_hash
 from guancha_api.schemas.contracts import BrewFeedbackAnalysisRequest, BrewFeedbackAnalysisResponse
 from guancha_api.product_events import CLIENT_EVENT_NAMES, ClientProductEvent, parse_analytics_session, safe_emit_client, safe_emit_server
+from guancha_api.infrastructure.storage.factory import cloudbase_http_storage_from_environment
+from guancha_api.providers.unavailable import UnconfiguredVisionProvider
+from guancha_api.tasks.cloudbase_handoff import CloudBaseHandoffDispatcher
 
 from guancha_api.core.errors import ApiErrorResponse
 from guancha_api.schemas.contracts import (
@@ -124,6 +134,76 @@ def _question_service(request: Request, repository: object) -> QuestionGeneratio
 
 def _merchant_reply_service(request: Request, repository: object) -> MerchantReplyService:
     return MerchantReplyService(repository, request.app.state.merchant_reply_provider, request.app.state.product_event_sink)
+
+
+def _request_access_token(
+    request: Request,
+    *,
+    owner: object,
+    authorization: str | None,
+) -> str | None:
+    requires_token = (
+        request.app.state.storage_backend == "cloudbase-http"
+        or request.app.state.extraction_execution == "cloudbase-handoff"
+    )
+    if not requires_token:
+        return None
+    return validated_bearer_token_for_owner(
+        owner=owner, authorization=authorization  # type: ignore[arg-type]
+    )
+
+
+def _request_storage(
+    request: Request,
+    *,
+    owner: object,
+    authorization: str | None,
+):
+    token = _request_access_token(
+        request, owner=owner, authorization=authorization
+    )
+    if request.app.state.storage_backend == "cloudbase-http":
+        if token is None:
+            raise HTTPException(status_code=503, detail="storage_not_configured")
+        return cloudbase_http_storage_from_environment(access_token=token)
+    storage = getattr(request.app.state, "temporary_storage", None)
+    if storage is None:
+        raise HTTPException(status_code=503, detail="storage_not_configured")
+    return storage
+
+
+def _request_extraction_resources(
+    request: Request,
+    *,
+    owner: object,
+    authorization: str | None,
+):
+    storage = _request_storage(
+        request, owner=owner, authorization=authorization
+    )
+    token = _request_access_token(
+        request, owner=owner, authorization=authorization
+    )
+    if request.app.state.extraction_execution == "cloudbase-handoff":
+        if token is None:
+            raise HTTPException(status_code=503, detail="storage_not_configured")
+        handoff_runner = getattr(request.app.state, "extraction_task_runner", None)
+        if handoff_runner is None:
+            handoff_runner = CloudBaseHandoffDispatcher.from_environment(
+                access_token=token
+            )
+        return (
+            storage,
+            handoff_runner,
+            UnconfiguredVisionProvider(),
+        )
+    runner = getattr(request.app.state, "extraction_task_runner", None)
+    if runner is None:
+        raise HTTPException(status_code=503, detail="service_unavailable")
+    provider = getattr(request.app.state, "provider", None)
+    if provider is None:
+        provider = request.app.state.provider_factory(storage)
+    return storage, runner, provider
 
 def _job(value): return AnalysisJobResponse(id=value.id, candidate_id=value.candidate_id, candidate_image_id=value.candidate_image_id, status=value.status, stage=value.stage, attempt=value.attempt, error_code=value.error_code, extraction_version_id=value.extraction_version_id, decision_version_id=value.decision_version_id, decision_delta_id=value.decision_delta_id, processing_mode=value.processing_mode, created_at=value.created_at, updated_at=value.updated_at)
 def _image(value, job_id=None): return CandidateImageMetadata(id=value.id, candidate_id=value.candidate_id, content_type=value.content_type, size_bytes=value.size_bytes, sha256=value.sanitized_sha256, width=value.width, height=value.height, display_order=value.display_order, status=value.status, current_job_id=job_id, created_at=value.created_at)
@@ -548,15 +628,17 @@ async def get_selection_snapshot(session_id: UUID, owner: Owner, repository: Req
     return await repository.selection_snapshot_for_client(session_id=session_id, client_id=owner)
 
 @router.delete("/candidates/{candidate_id}", status_code=204)
-async def delete_candidate(candidate_id: UUID, owner: Owner, raw: Request, repository: RequestRepository, x_analytics_session_id: AnalyticsSession = None) -> None:
-    await _service(raw, repository).delete_candidate(owner=owner, candidate_id=candidate_id, storage=raw.app.state.temporary_storage)
+async def delete_candidate(candidate_id: UUID, owner: Owner, raw: Request, repository: RequestRepository, authorization: Annotated[str | None, Header(alias="Authorization")] = None, x_analytics_session_id: AnalyticsSession = None) -> None:
+    storage = _request_storage(raw, owner=owner, authorization=authorization)
+    await _service(raw, repository).delete_candidate(owner=owner, candidate_id=candidate_id, storage=storage)
     _emit(raw, event_name="candidate_deleted", resource_id=candidate_id, analytics_session=x_analytics_session_id, candidate_id=candidate_id)
 
 @router.post("/candidates/{candidate_id}/images", response_model=UploadCandidateImageResponse, status_code=201)
-async def upload_candidate_image(candidate_id: UUID, owner: Owner, idempotency_key: IdempotencyKey, raw: Request, repository: RequestRepository, file: Annotated[UploadFile, File()], x_analytics_session_id: AnalyticsSession = None) -> UploadCandidateImageResponse:
+async def upload_candidate_image(candidate_id: UUID, owner: Owner, idempotency_key: IdempotencyKey, raw: Request, repository: RequestRepository, file: Annotated[UploadFile, File()], authorization: Annotated[str | None, Header(alias="Authorization")] = None, x_analytics_session_id: AnalyticsSession = None) -> UploadCandidateImageResponse:
     data = await file.read(5_242_881)
     try:
-        result, created = await _service(raw, repository).upload_image(owner=owner, candidate_id=candidate_id, idempotency_key=idempotency_key, data=data, declared_content_type=file.content_type or '', storage=raw.app.state.temporary_storage, task_runner=raw.app.state.extraction_task_runner, provider=raw.app.state.provider)
+        storage, task_runner, provider = _request_extraction_resources(raw, owner=owner, authorization=authorization)
+        result, created = await _service(raw, repository).upload_image(owner=owner, candidate_id=candidate_id, idempotency_key=idempotency_key, data=data, declared_content_type=file.content_type or '', storage=storage, task_runner=task_runner, provider=provider, defer_initial_dispatch=raw.app.state.extraction_execution == "cloudbase-handoff")
         if created:
             _emit(raw, event_name="candidate_image_added", resource_id=result.image.id, analytics_session=x_analytics_session_id, candidate_id=candidate_id)
         return result
@@ -571,9 +653,10 @@ async def get_candidate_image(candidate_image_id: UUID, owner: Owner, raw: Reque
     )
 
 @router.delete("/candidate-images/{candidate_image_id}", status_code=204)
-async def delete_candidate_image(candidate_image_id: UUID, owner: Owner, raw: Request, repository: RequestRepository, x_analytics_session_id: AnalyticsSession = None) -> None:
+async def delete_candidate_image(candidate_image_id: UUID, owner: Owner, raw: Request, repository: RequestRepository, authorization: Annotated[str | None, Header(alias="Authorization")] = None, x_analytics_session_id: AnalyticsSession = None) -> None:
+    storage = _request_storage(raw, owner=owner, authorization=authorization)
     await _service(raw, repository).delete_image(
-        owner=owner, image_id=candidate_image_id, storage=raw.app.state.temporary_storage
+        owner=owner, image_id=candidate_image_id, storage=storage
     )
     _emit(raw, event_name="candidate_image_removed", resource_id=candidate_image_id, analytics_session=x_analytics_session_id)
 
@@ -583,14 +666,15 @@ async def get_job(job_id: UUID, owner: Owner, raw: Request, repository: RequestR
     return result
 
 @router.post("/selection-sessions/{session_id}/analyze", response_model=AnalysisJobResponse, status_code=201)
-async def analyze_selection_session(session_id: UUID, owner: Owner, idempotency_key: IdempotencyKey, raw: Request, repository: RequestRepository, x_analytics_session_id: AnalyticsSession = None) -> AnalysisJobResponse:
+async def analyze_selection_session(session_id: UUID, owner: Owner, idempotency_key: IdempotencyKey, raw: Request, repository: RequestRepository, authorization: Annotated[str | None, Header(alias="Authorization")] = None, x_analytics_session_id: AnalyticsSession = None) -> AnalysisJobResponse:
     service = _service(raw, repository)
+    storage, extraction_task_runner, provider = _request_extraction_resources(raw, owner=owner, authorization=authorization)
     staged = await service.start_staged_extractions(
         session_id=session_id,
         owner=owner,
-        storage=raw.app.state.temporary_storage,
-        task_runner=raw.app.state.extraction_task_runner,
-        provider=raw.app.state.provider,
+        storage=storage,
+        task_runner=extraction_task_runner,
+        provider=provider,
     )
     if staged:
         # The established public response is an AnalysisJobResponse.  The
@@ -682,8 +766,9 @@ async def get_current_extraction(candidate_id: UUID, owner: Owner, raw: Request,
     row,evidence=result; return ExtractionVersionResponse(id=row['id'], candidate_id=row['candidate_id'], source_image_id=row['source_image_id'], source_image_ids=tuple(row['source_image_ids']), status=row['status'], schema_version=row['schema_version'], evidence_items=tuple(EvidenceItem.model_validate(x) for x in evidence), created_at=row['created_at'])
 
 @router.post("/candidates/{candidate_id}/extraction-jobs", response_model=AnalysisJobResponse, status_code=201)
-async def retry_extraction_job(candidate_id: UUID, owner: Owner, idempotency_key: IdempotencyKey, raw: Request, repository: RequestRepository) -> AnalysisJobResponse:
+async def retry_extraction_job(candidate_id: UUID, owner: Owner, idempotency_key: IdempotencyKey, raw: Request, repository: RequestRepository, authorization: Annotated[str | None, Header(alias="Authorization")] = None) -> AnalysisJobResponse:
     try:
-        return await _service(raw, repository).retry_job(owner=owner, candidate_id=candidate_id, idempotency_key=idempotency_key, storage=raw.app.state.temporary_storage, task_runner=raw.app.state.extraction_task_runner, provider=raw.app.state.provider)
+        storage, extraction_task_runner, provider = _request_extraction_resources(raw, owner=owner, authorization=authorization)
+        return await _service(raw, repository).retry_job(owner=owner, candidate_id=candidate_id, idempotency_key=idempotency_key, storage=storage, task_runner=extraction_task_runner, provider=provider)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc

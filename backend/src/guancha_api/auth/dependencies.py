@@ -157,3 +157,19 @@ async def get_owner_context(
 
 
 Owner = Annotated[OwnerContext, Depends(get_owner_context)]
+
+
+def validated_bearer_token_for_owner(
+    *, owner: OwnerContext, authorization: str | None
+) -> str:
+    """Return the already-authenticated request token for downstream APIs.
+
+    ``get_owner_context`` is a dependency of the same route and has already
+    verified this Authorization header.  Re-parsing it here is intentional:
+    the token stays request-local and is never placed in owner state, app state,
+    a database record, or a log field.
+    """
+
+    if not owner.is_authenticated:
+        raise HTTPException(status_code=401, detail="authentication_required")
+    return _bearer_token(authorization)

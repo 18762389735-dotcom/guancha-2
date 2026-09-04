@@ -136,6 +136,7 @@ class Phase2ExtractionService:
         self, *, candidate_id: UUID, idempotency_key: UUID,
         data: bytes, declared_content_type: str, storage: TemporaryPrivateStorage,
         task_runner: TaskRunner, provider: StructuredVisionProvider,
+        defer_initial_dispatch: bool = False,
         owner: OwnerContext | None = None, client_id: UUID | None = None,
     ) -> tuple[UploadCandidateImageResponse, bool]:
         request_owner = resolve_owner(owner=owner, client_id=client_id)
@@ -193,7 +194,7 @@ class Phase2ExtractionService:
         # candidate to reach the provider in one joint call.  The deterministic
         # FakeProvider keeps the established immediate-dispatch unit-test
         # semantics; it never reaches a network or real model.
-        if isinstance(provider, (MiMoVisionProvider, OpenAIResponsesProvider)):
+        if defer_initial_dispatch or isinstance(provider, (MiMoVisionProvider, OpenAIResponsesProvider)):
             return self._upload_response(result.image, result.job), True
         try:
             await task_runner.enqueue(

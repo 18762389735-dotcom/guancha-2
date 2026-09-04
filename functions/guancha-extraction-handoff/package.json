@@ -1,0 +1,12 @@
+{
+  "name": "guancha-extraction-handoff",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cos-nodejs-sdk-v5": "^2.14.0",
+    "pg": "^8.13.1",
+    "tencentcloud-sdk-nodejs": "^4.1.100"
+  }
+}

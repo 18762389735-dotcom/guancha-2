@@ -26,7 +26,10 @@ from guancha_api.application.task_runners import InProcessTaskRunner, TaskEnqueu
 from guancha_api.application.extraction_recovery import (
     extraction_stale_before_from_environment,
 )
-from guancha_api.infrastructure.storage.factory import temporary_private_storage_from_environment
+from guancha_api.infrastructure.storage.factory import (
+    temporary_private_storage_backend_from_environment,
+    temporary_private_storage_from_environment,
+)
 from guancha_api.infrastructure.storage.interfaces import (
     TemporaryImageCleanupError,
     TemporaryPrivateStorage,
@@ -102,12 +105,16 @@ def _database_pool(database_url: str) -> AsyncConnectionPool:
     )
 
 
+def _extraction_execution_from_environment() -> str:
+    return os.getenv(
+        "GUANCHA_EXTRACTION_EXECUTION", DEFAULT_EXTRACTION_EXECUTION
+    ).strip().lower() or DEFAULT_EXTRACTION_EXECUTION
+
+
 def _extraction_task_runner_from_environment() -> TaskRunner:
     """Select only screenshot extraction dispatch; other background work stays local."""
 
-    backend = os.getenv(
-        "GUANCHA_EXTRACTION_EXECUTION", DEFAULT_EXTRACTION_EXECUTION
-    ).strip().lower()
+    backend = _extraction_execution_from_environment()
     if backend in {"", "in-process"}:
         return InProcessTaskRunner()
     if backend == "cloud-function":
@@ -115,12 +122,18 @@ def _extraction_task_runner_from_environment() -> TaskRunner:
         if not region:
             raise RuntimeError("GUANCHA_EXTRACTION_FUNCTION_REGION must not be empty")
         return CloudFunctionExtractionDispatcher.from_environment(region=region)
+    if backend == "cloudbase-handoff":
+        raise RuntimeError(
+            "cloudbase-handoff task runner is request-scoped and cannot be initialized at startup"
+        )
     raise RuntimeError(
-        "GUANCHA_EXTRACTION_EXECUTION must be in-process or cloud-function"
+        "GUANCHA_EXTRACTION_EXECUTION must be in-process or cloud-function or cloudbase-handoff"
     )
 
 
-def _provider_from_environment(storage: TemporaryPrivateStorage) -> StructuredVisionProvider:
+def _provider_from_environment(
+    storage: TemporaryPrivateStorage | None,
+) -> StructuredVisionProvider:
     # Fake is deliberately opt-in.  The competition application must never
     # turn an absent live configuration into a plausible fixture result.
     mode = os.getenv("GUANCHA_PROVIDER", "").lower()
@@ -162,12 +175,16 @@ def _provider_from_environment(storage: TemporaryPrivateStorage) -> StructuredVi
         model = os.getenv("GUANCHA_OPENAI_MODEL")
         if not api_key or not model:
             raise RuntimeError("GUANCHA_PROVIDER=openai requires OPENAI_API_KEY and GUANCHA_OPENAI_MODEL")
+        if storage is None:
+            raise RuntimeError("OpenAI provider requires a request-scoped storage adapter")
         return OpenAIResponsesProvider(api_key=api_key, model=model, storage=storage)
     if mode == "mimo":
         api_key = os.getenv("MIMO_API_KEY")
         model = os.getenv("GUANCHA_MIMO_MODEL")
         if not api_key or not model:
             raise RuntimeError("GUANCHA_PROVIDER=mimo requires MIMO_API_KEY and GUANCHA_MIMO_MODEL")
+        if storage is None:
+            raise RuntimeError("MiMo provider requires a request-scoped storage adapter")
         return MiMoVisionProvider(
             api_key=api_key,
             model=model,
@@ -238,16 +255,46 @@ def create_app(
     auth_gateway: CloudBaseAuthGateway | None = None,
 ) -> FastAPI:
     """Build an injectable API application; tests never need external services."""
+    storage_backend = (
+        "injected"
+        if temporary_storage is not None
+        else temporary_private_storage_backend_from_environment()
+    )
+    extraction_execution = _extraction_execution_from_environment()
+    if (
+        temporary_storage is None
+        and extraction_execution == "cloudbase-handoff"
+        and storage_backend != "cloudbase-http"
+    ):
+        raise RuntimeError(
+            "cloudbase-handoff requires GUANCHA_PRIVATE_STORAGE_BACKEND=cloudbase-http"
+        )
     resolved_task_runner = task_runner or InProcessTaskRunner()
     # Tests and explicitly injected callers retain their existing single-runner
     # behavior. Normal startup selects an extraction-only runner by config.
     resolved_extraction_task_runner = (
         extraction_task_runner
         or task_runner
-        or _extraction_task_runner_from_environment()
+        or (
+            None
+            if extraction_execution == "cloudbase-handoff"
+            else _extraction_task_runner_from_environment()
+        )
     )
-    resolved_temporary_storage = temporary_storage or temporary_private_storage_from_environment()
-    resolved_provider = provider or _provider_from_environment(resolved_temporary_storage)
+    resolved_temporary_storage = (
+        temporary_storage
+        if temporary_storage is not None
+        else (
+            None
+            if storage_backend == "cloudbase-http"
+            else temporary_private_storage_from_environment()
+        )
+    )
+    resolved_provider = provider or (
+        None
+        if storage_backend == "cloudbase-http"
+        else _provider_from_environment(resolved_temporary_storage)
+    )
     resolved_reasoning_provider = reasoning_provider or FakeReasoningProvider()
     resolved_merchant_reply_provider = merchant_reply_provider or _merchant_reply_provider_from_environment()
     resolved_feedback_provider = feedback_provider or FakeFeedbackProvider()
@@ -264,6 +311,9 @@ def create_app(
         application.state.database_pool = database_pool
         application.state.worker_repository_factory = worker_repository_factory
         application.state.temporary_storage = resolved_temporary_storage
+        application.state.storage_backend = storage_backend
+        application.state.extraction_execution = extraction_execution
+        application.state.provider_factory = _provider_from_environment
         application.state.task_runner = resolved_task_runner
         application.state.extraction_task_runner = resolved_extraction_task_runner
         application.state.provider = resolved_provider
@@ -289,7 +339,10 @@ def create_app(
             yield
         finally:
             await application.state.task_runner.shutdown()
-            if application.state.extraction_task_runner is not application.state.task_runner:
+            if (
+                application.state.extraction_task_runner is not None
+                and application.state.extraction_task_runner is not application.state.task_runner
+            ):
                 await application.state.extraction_task_runner.shutdown()
             if owns_repository and application.state.repository is not None:
                 await application.state.repository.close()
@@ -305,6 +358,9 @@ def create_app(
     application.state.task_runner = resolved_task_runner
     application.state.extraction_task_runner = resolved_extraction_task_runner
     application.state.temporary_storage = resolved_temporary_storage
+    application.state.storage_backend = storage_backend
+    application.state.extraction_execution = extraction_execution
+    application.state.provider_factory = _provider_from_environment
     application.state.provider = resolved_provider
     application.state.reasoning_provider = resolved_reasoning_provider
     application.state.merchant_reply_provider = resolved_merchant_reply_provider
