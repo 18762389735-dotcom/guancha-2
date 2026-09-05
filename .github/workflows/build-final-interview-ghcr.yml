@@ -1,0 +1,175 @@
+name: Build final interview image to GHCR
+
+on:
+  push:
+    branches:
+      - ops/build-final-interview-ghcr
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  SOURCE_SHA: 5bc54503ef44132d5bf579a69c71a5cb4ba40706
+  IMAGE: ghcr.io/18762389735-dotcom/guancha-2:interview-5bc54503
+
+jobs:
+  build-inspect-push:
+    name: Build, inspect, and publish final interview image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out exact product source
+        uses: actions/checkout@v4
+        with:
+          ref: 5bc54503ef44132d5bf579a69c71a5cb4ba40706
+          fetch-depth: 1
+
+      - name: Assert exact source SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "SOURCE_SHA=$SOURCE_SHA"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build linux/amd64 image without runtime secrets
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE }}
+          load: true
+          push: false
+          provenance: false
+
+      - name: Inspect image contents and static references
+        id: inspect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker image inspect "$IMAGE" --format 'IMAGE_PLATFORM={{.Os}}/{{.Architecture}}'
+          image_size_bytes="$(docker image inspect "$IMAGE" --format '{{.Size}}')"
+          echo "IMAGE_SIZE_BYTES=$image_size_bytes" | tee -a "$GITHUB_OUTPUT"
+
+          docker run --rm --platform linux/amd64 --entrypoint sh "$IMAGE" -eu -c '
+            test -d /app/assets/ui
+            test -d /app/assets/flavors
+            test -d /app/assets/flavors-normalized
+            test -f "/app/assets/ui/AI分析等待插画.svg"
+            test -f /app/assets/ui/art-can-clean.png
+            test -f /app/assets/ui/art-gaiwan-clean.png
+            test -f /app/assets/ui/art-cup-clean.png
+            test -f /app/assets/ui/art-bag-clean.png
+            find /app/assets/ui -type f -iname "*空状态*" -print -quit | grep -q .
+            find /app/assets/ui -type f -path "*/wordmark*/*" -print -quit | grep -q .
+            test -f /app/test-fixtures/extraction/candidate_a_complete_qingxiang.json
+            test -f /app/test-fixtures/demo-images/candidate-a-qingxiang-1.png
+          '
+
+          cat > /tmp/verify-image-asset-references.py <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          root = Path("/app")
+          runtime_files = [root / "index.html", root / "styles.css", root / "app.js"]
+          runtime_files.extend(root.glob("frontend/**/*.js"))
+          runtime_files.extend(root.glob("frontend/**/*.css"))
+          references = []
+
+          css_pattern = re.compile(r"url\(\s*['\"]?([^'\")]+)")
+          js_pattern = re.compile(r"(?P<ref>(?:/|\./|\.\./)?assets/[^\"'`\s)]+)")
+
+          for path in runtime_files:
+              if not path.is_file():
+                  continue
+              text = path.read_text(encoding="utf-8", errors="ignore")
+              patterns = [css_pattern] if path.suffix == ".css" else [js_pattern]
+              for pattern in patterns:
+                  for match in pattern.finditer(text):
+                      ref = match.group("ref") if "ref" in match.groupdict() else match.group(1)
+                      ref = ref.split("?", 1)[0].split("#", 1)[0]
+                      if any(token in ref for token in ("${", "{{", "<%")):
+                          continue
+                      candidates = []
+                      if ref.startswith("/"):
+                          candidates.append(root / ref.lstrip("/"))
+                      else:
+                          candidates.extend((path.parent / ref, root / ref))
+                      if not any(candidate.is_file() for candidate in candidates):
+                          references.append(f"{path.relative_to(root)} -> {ref}")
+
+          if references:
+              print("UNRESOLVED_STATIC_REFERENCES")
+              print("\n".join(sorted(set(references))))
+              sys.exit(1)
+          print("STATIC_REFERENCES=PASS")
+          PY
+          docker run --rm --platform linux/amd64 --entrypoint python "$IMAGE" - < /tmp/verify-image-asset-references.py
+
+      - name: Verify no build-time secret injection
+        shell: bash
+        run: |
+          set -euo pipefail
+          config="$(docker image inspect "$IMAGE" --format '{{json .Config}}')"
+          history="$(docker history --no-trunc "$IMAGE")"
+          if printf '%s\n%s\n' "$config" "$history" | grep -Eqi 'MIMO_API_KEY|GUANCHA_DATABASE_URL|TENCENTCLOUD_SECRET(ID|KEY)|GITHUB_TOKEN|SECRETKEY|SESSIONTOKEN'; then
+            echo "Forbidden secret material found in image configuration/history"
+            exit 1
+          fi
+          echo "SECRETS_BAKED_INTO_IMAGE=False"
+
+      - name: Log in to GHCR with GitHub token
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push inspected image
+        id: push
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE" | tee /tmp/ghcr-push.log
+          digest="$(sed -n 's/.*digest: \(sha256:[0-9a-fA-F]*\).*/\1/p' /tmp/ghcr-push.log | tail -n 1)"
+          test -n "$digest"
+          echo "IMAGE_DIGEST=$digest" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Record immutable image metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "$IMAGE"
+
+      - name: Check GHCR package visibility
+        id: visibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          visibility="$(gh api "users/18762389735-dotcom/packages/container/guancha-2" --jq '.visibility' 2>/dev/null || true)"
+          if [ -z "$visibility" ]; then
+            visibility="UNKNOWN"
+          fi
+          echo "PACKAGE_VISIBILITY=$visibility" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Publish summary
+        shell: bash
+        run: |
+          {
+            echo "## Final interview image"
+            echo "- Source SHA: $SOURCE_SHA"
+            echo "- Image: $IMAGE"
+            echo "- Platform: linux/amd64"
+            echo "- Image size bytes: ${{ steps.inspect.outputs.IMAGE_SIZE_BYTES }}"
+            echo "- Digest: ${{ steps.push.outputs.IMAGE_DIGEST }}"
+            echo "- Package visibility: ${{ steps.visibility.outputs.PACKAGE_VISIBILITY }}"
+            echo "- Secrets baked into image: False"
+          } >> "$GITHUB_STEP_SUMMARY"
