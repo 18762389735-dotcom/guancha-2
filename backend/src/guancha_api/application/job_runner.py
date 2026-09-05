@@ -124,14 +124,30 @@ class FakeExtractionJobRunner:
                         raise
                     object_keys = (temporary_image_object_key(job_id),)
                     await self.storage.read_private(object_key=object_keys[0])
-            async with asyncio.timeout(self.timeout_seconds):
-                result = await extract_validated_once(
-                    self.provider,
-                    image_object_keys=object_keys,
-                    validate=lambda payload: self._validate_payload(
-                        payload, image_count=len(input_image_ids)
-                    ),
+            if job.processing_mode is ProcessingMode.CACHE_FALLBACK:
+                # The explicit interview sample is deterministic by design:
+                # do not spend a live-provider request to discover whether the
+                # fallback is needed. The exact image hashes remain the safety
+                # boundary, so a fixture mismatch fails closed below.
+                fallback = await self._fallback_for_sample_job(
+                    job_id=job_id,
+                    candidate_id=job.candidate_id,
+                    input_image_ids=input_image_ids,
                 )
+                if fallback is None:
+                    failure = ProviderSchemaInvalidError("approved sample fixture not found")
+                else:
+                    result = fallback
+                    used_fallback = True
+            else:
+                async with asyncio.timeout(self.timeout_seconds):
+                    result = await extract_validated_once(
+                        self.provider,
+                        image_object_keys=object_keys,
+                        validate=lambda payload: self._validate_payload(
+                            payload, image_count=len(input_image_ids)
+                        ),
+                    )
         except asyncio.CancelledError as exc:
             failure = exc
         except BaseException as exc:
@@ -157,24 +173,6 @@ class FakeExtractionJobRunner:
         # column; fixture hashes alone can never authorize this path for a
         # normal user upload.  Storage/read failures are intentionally not
         # treated as provider failures.
-        if (
-            failure is not None
-            and job.processing_mode is ProcessingMode.CACHE_FALLBACK
-            and self.provider.provider_name in {"openai", "mimo"}
-            and isinstance(
-                failure,
-                (TimeoutError, ProviderNetworkExhaustedError, ProviderSchemaInvalidError),
-            )
-        ):
-            fallback = await self._fallback_after_provider_failure(
-                job_id=job_id,
-                candidate_id=job.candidate_id,
-                input_image_ids=input_image_ids,
-            )
-            if fallback is not None:
-                result = fallback
-                failure = None
-                used_fallback = True
         if isinstance(failure, TimeoutError):
             await self._fail(job_id=job_id, error_code=ErrorCode.AI_TIMEOUT)
             return
@@ -248,7 +246,7 @@ class FakeExtractionJobRunner:
             # The repository transaction has rolled back; no partial version is exposed.
             await self._fail(job_id=job_id, error_code=ErrorCode.WORKER_INTERRUPTED)
 
-    async def _fallback_after_provider_failure(
+    async def _fallback_for_sample_job(
         self, *, job_id: UUID, candidate_id: UUID, input_image_ids: tuple[UUID, ...]
     ) -> FakeExtractionPayload | None:
         """Load a result only for an exact, committed project demo image set."""

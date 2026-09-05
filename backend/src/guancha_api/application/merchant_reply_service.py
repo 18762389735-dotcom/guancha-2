@@ -166,18 +166,18 @@ class MerchantReplyService:
             return
         reply, product_evidence = claimed
         try:
-            parsed = await self.provider.parse_merchant_reply(
-                field_key=reply["field_key"], raw_text=reply["raw_text"], product_evidence=product_evidence
-            )
-        except Exception:
             parsed = self._demo_reply_fallback(
                 field_key=str(reply["field_key"]),
                 raw_text=str(reply["raw_text"]),
                 allow_demo_fallback=allow_demo_fallback,
             )
             if parsed is None:
-                await self.repository.fail_merchant_reply_parse(reply_id=reply_id, client_id=repo_owner)
-                raise
+                parsed = await self.provider.parse_merchant_reply(
+                    field_key=reply["field_key"], raw_text=reply["raw_text"], product_evidence=product_evidence
+                )
+        except Exception:
+            await self.repository.fail_merchant_reply_parse(reply_id=reply_id, client_id=repo_owner)
+            raise
         try:
             await self.repository.persist_merchant_reply_parse(
                 reply_id=reply_id, client_id=repo_owner, parsed_status=parsed.reply_status, claims=parsed.claims
@@ -196,7 +196,7 @@ class MerchantReplyService:
         self, *, field_key: str, raw_text: str, allow_demo_fallback: bool
     ) -> MerchantReplyParse | None:
         """Use the existing merchant fixture only for an explicit sample flow."""
-        if not allow_demo_fallback or not isinstance(self.provider, MiMoMerchantReplyReasoningProvider):
+        if not allow_demo_fallback:
             return None
         fixture = FixtureCatalog().load_merchant_reply("merchant-answered")
         claim = next((item for item in fixture.expected_claims if item.get("field_name") == field_key), None)

@@ -181,6 +181,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .analysis-page img { width:210px; height:210px; object-fit:contain; }
 .analysis-page h1 { margin:30px 0 9px; font-family:"STKaiti","KaiTi",serif; font-size:36px; font-weight:400; }
 .analysis-page p { margin:0; color:#777; font-size:15px; }
+.analysis-progress-message { min-height:3.4em; max-width:320px; line-height:1.7; }
 .analysis-dots { display:flex; gap:7px; margin-top:22px; }
 .analysis-dots i { width:6px; height:6px; border-radius:50%; background:#d7d7d7; animation:pulse 1s infinite ease-in-out; }
 .analysis-dots i:nth-child(2) { animation-delay:.16s; }.analysis-dots i:nth-child(3) { animation-delay:.32s; }

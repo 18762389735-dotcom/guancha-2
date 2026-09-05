@@ -60,11 +60,15 @@ class _Repository:
 
 
 class _FailingLiveProvider:
+    def __init__(self) -> None:
+        self.extract_calls = 0
+
     provider_name = "mimo"
     model_identifier = "test-live-model"
     processing_mode = ProcessingMode.OPENAI_VISION
 
     async def extract(self, **_: object) -> dict[str, object]:
+        self.extract_calls += 1
         raise ProviderNetworkError("provider unavailable")
 
     async def repair_structure(self, **_: object) -> dict[str, object]:
@@ -73,12 +77,14 @@ class _FailingLiveProvider:
 
 class _TimingOutLiveProvider(_FailingLiveProvider):
     async def extract(self, **_: object) -> dict[str, object]:
+        self.extract_calls += 1
         await asyncio.sleep(1)
         return {}
 
 
 class _SuccessfulLiveProvider(_FailingLiveProvider):
     async def extract(self, **_: object) -> dict[str, object]:
+        self.extract_calls += 1
         return {
             "product_name": "示例铁观音",
             "tea_category": "乌龙茶",
@@ -95,8 +101,10 @@ class _SuccessfulLiveProvider(_FailingLiveProvider):
 class _FailingMimoProvider(MiMoMerchantReplyReasoningProvider):
     def __init__(self) -> None:
         super().__init__(api_key="test-key", model="test-model")
+        self.parse_calls = 0
 
     async def parse_merchant_reply(self, **_: object):
+        self.parse_calls += 1
         raise ProviderNetworkError("provider unavailable")
 
 
@@ -139,21 +147,35 @@ async def test_approved_sample_provider_failure_uses_existing_fixture() -> None:
     assert {item.field_name for item in repository.completed_evidence} >= {"tea_type", "sample_available"}
 
 
-async def test_approved_sample_live_success_stays_on_live_result_path() -> None:
-    repository = await _runner(ProcessingMode.CACHE_FALLBACK, _SuccessfulLiveProvider())
-
-    assert repository.failure is None
-    assert repository.completed_log is not None
-    assert repository.completed_log.processing_mode is ProcessingMode.LIVE_AI
-    assert {item.field_name for item in repository.completed_evidence} == {"tea_type", "product_name", "tea_category", "tea_subtype"}
-
-
-async def test_sample_timeout_uses_existing_fixture() -> None:
-    repository = await _runner(ProcessingMode.CACHE_FALLBACK, _TimingOutLiveProvider())
+async def test_approved_sample_skips_live_provider_and_uses_fixture_result() -> None:
+    provider = _SuccessfulLiveProvider()
+    repository = await _runner(ProcessingMode.CACHE_FALLBACK, provider)
 
     assert repository.failure is None
     assert repository.completed_log is not None
     assert repository.completed_log.processing_mode is ProcessingMode.CACHE_FALLBACK
+    assert provider.extract_calls == 0
+    assert {item.field_name for item in repository.completed_evidence} >= {"tea_type", "sample_available"}
+
+
+async def test_approved_sample_works_when_live_provider_is_unconfigured() -> None:
+    provider = _FailingLiveProvider()
+    provider.provider_name = "unconfigured"
+    repository = await _runner(ProcessingMode.CACHE_FALLBACK, provider)
+
+    assert repository.failure is None
+    assert repository.completed_log is not None
+    assert provider.extract_calls == 0
+
+
+async def test_sample_timeout_uses_existing_fixture() -> None:
+    provider = _TimingOutLiveProvider()
+    repository = await _runner(ProcessingMode.CACHE_FALLBACK, provider)
+
+    assert repository.failure is None
+    assert repository.completed_log is not None
+    assert repository.completed_log.processing_mode is ProcessingMode.CACHE_FALLBACK
+    assert provider.extract_calls == 0
 
 
 async def test_real_upload_provider_failure_stays_on_normal_error_path() -> None:
@@ -163,8 +185,8 @@ async def test_real_upload_provider_failure_stays_on_normal_error_path() -> None
     assert repository.failure is ErrorCode.AI_PROVIDER_ERROR
 
 
-async def test_merchant_fixture_fallback_is_only_available_to_live_mimo_provider() -> None:
-    provider = MiMoMerchantReplyReasoningProvider(api_key="test-key", model="test-model")
+async def test_merchant_fixture_fallback_requires_explicit_sample_marker() -> None:
+    provider = object()
     service = MerchantReplyService(repository=object(), provider=provider)  # type: ignore[arg-type]
 
     result = service._demo_reply_fallback(
@@ -182,7 +204,8 @@ async def test_merchant_fixture_fallback_is_only_available_to_live_mimo_provider
 async def test_sample_merchant_provider_failure_uses_fixture_before_persisting() -> None:
     reply_id = uuid4()
     repository = _MerchantRepository(reply_id)
-    service = MerchantReplyService(repository=repository, provider=_FailingMimoProvider())  # type: ignore[arg-type]
+    provider = _FailingMimoProvider()
+    service = MerchantReplyService(repository=repository, provider=provider)  # type: ignore[arg-type]
 
     await service.parse(reply_id=reply_id, allow_demo_fallback=True, client_id=uuid4())
 
@@ -191,15 +214,18 @@ async def test_sample_merchant_provider_failure_uses_fixture_before_persisting()
         "answered",
         ({"field_key": "season", "raw_text": "2025年春茶", "normalized_value": "spring"},),
     )
+    assert provider.parse_calls == 0
 
 
 async def test_non_sample_merchant_provider_failure_stays_on_error_path() -> None:
     reply_id = uuid4()
     repository = _MerchantRepository(reply_id)
-    service = MerchantReplyService(repository=repository, provider=_FailingMimoProvider())  # type: ignore[arg-type]
+    provider = _FailingMimoProvider()
+    service = MerchantReplyService(repository=repository, provider=provider)  # type: ignore[arg-type]
 
     with pytest.raises(ProviderNetworkError):
         await service.parse(reply_id=reply_id, allow_demo_fallback=False, client_id=uuid4())
 
     assert repository.failed is True
     assert repository.persisted is None
+    assert provider.parse_calls == 1

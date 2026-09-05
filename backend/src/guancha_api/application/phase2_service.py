@@ -164,7 +164,7 @@ class Phase2ExtractionService:
         try:
             processing_mode = (
                 ProcessingMode.CACHE_FALLBACK
-                if allow_demo_fallback and provider.provider_name in {"openai", "mimo"}
+                if allow_demo_fallback
                 else provider.processing_mode
             )
             result = await self.repository.create_image_and_initial_job(

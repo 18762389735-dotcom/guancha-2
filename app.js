@@ -40,6 +40,7 @@ let merchantReplyInFlight = false;
 let rejudgeInFlight = false;
 let warehouseSaveInFlight = false;
 let brewSaveInFlight = false;
+let analysisDeadlineTimer = null;
 // A cached older stores.js must never make the upload UI unusable.  Its
 // fallback keeps the current page functional; a fresh load restores the
 // IndexedDB-backed persistence path below.
@@ -56,6 +57,13 @@ const PRODUCT_LIMITS = Object.freeze({ maxCandidates: 5, maxImagesPerCandidate: 
 const SAMPLE_CANDIDATE_ASSETS = Object.freeze([
   'test-fixtures/demo-images/candidate-a-qingxiang-1.png',
   'test-fixtures/demo-images/candidate-a-qingxiang-2.png',
+]);
+const ANALYSIS_TOTAL_DEADLINE_MS = 65000;
+const ANALYSIS_PROGRESS_STAGES = Object.freeze([
+  [8000, '正在读取商品信息…'],
+  [20000, '正在整理香型、工艺和商品信息…'],
+  [35000, '正在结合你的偏好进行判断…'],
+  [Infinity, '这张图片信息比较多，分析还需要一点时间…'],
 ]);
 
 const defaultState = {
@@ -358,6 +366,46 @@ function mvpDecision(candidate) {
   return { action: hasRisk ? '建议补充信息' : '可以考虑', reasons: reasons.slice(0, 3) };
   */
 }
+function analysisElapsedMs() {
+  return Number.isFinite(state.analysisStartedAt) ? Math.max(0, Date.now() - state.analysisStartedAt) : 0;
+}
+function analysisProgressMessage(elapsedMs = analysisElapsedMs()) {
+  return ANALYSIS_PROGRESS_STAGES.find(([limit]) => elapsedMs < limit)?.[1] || ANALYSIS_PROGRESS_STAGES.at(-1)[1];
+}
+function clearAnalysisDeadline() {
+  if (analysisDeadlineTimer !== null) {
+    clearTimeout(analysisDeadlineTimer);
+    analysisDeadlineTimer = null;
+  }
+}
+function finishAnalysisDeadline() {
+  clearAnalysisDeadline();
+  delete state.analysisStartedAt;
+  state.analysisDeadlineReached = false;
+}
+function markAnalysisDeadlineReached() {
+  if (state.analysisDeadlineReached) return;
+  state.analysisDeadlineReached = true;
+  GuanchaJobPoller.cancelAll?.();
+  state.candidates.forEach(candidate => {
+    if (['uploading', 'queued', 'processing'].includes(candidate.extractionStatus)) {
+      candidate.extractionStatus = 'failed';
+      candidate.jobError = 'analysis_timeout';
+    }
+  });
+  state.decisionStatus = 'failed';
+  state.decisionError = 'analysis_timeout';
+  saveState();
+  render();
+}
+function beginAnalysisDeadline({ reset = false } = {}) {
+  clearAnalysisDeadline();
+  state.analysisDeadlineReached = false;
+  if (reset || !Number.isFinite(state.analysisStartedAt)) state.analysisStartedAt = Date.now();
+  const remainingMs = ANALYSIS_TOTAL_DEADLINE_MS - analysisElapsedMs();
+  if (remainingMs <= 0) return markAnalysisDeadlineReached();
+  analysisDeadlineTimer = setTimeout(markAnalysisDeadlineReached, remainingMs);
+}
 async function reconcilePersistedCandidateJobs() {
   const persistedCandidates = state.candidates.filter(candidate => candidate?.jobId);
   await Promise.all(persistedCandidates.map(async candidate => {
@@ -539,6 +587,9 @@ async function resumeLiveBackendState() {
     if (error?.code === 'selection_session_not_found') clearStaleRemoteSelection();
     return;
   }
+  if (typeof beginAnalysisDeadline === 'function' && state.activeSelectionFlow === true && state.candidates.some(candidate => ['uploading', 'queued', 'processing'].includes(candidate.extractionStatus))) {
+    beginAnalysisDeadline();
+  }
   for (const candidate of state.candidates) {
     if (!candidate?.serverCandidateId) continue;
     if (['queued', 'processing'].includes(candidate.extractionStatus) && candidate.jobId) startCandidatePolling(candidate);
@@ -620,7 +671,7 @@ function startDecisionPolling(jobId) {
         state.decisionVersionId = decision.id;
         applySessionDecision(decision);
         await refreshSelectionAnswer();
-        state.decisionJobId = null; state.decisionStatus = 'ready'; saveState(); setScreen('result');
+        state.decisionJobId = null; state.decisionStatus = 'ready'; finishAnalysisDeadline(); saveState(); setScreen('result');
       } else if (status.status === 'failed') { state.decisionJobId = null; state.decisionStatus = 'failed'; state.decisionError = status.error_code || 'decision_failed'; saveState(); render(); }
     }});
 }
@@ -775,7 +826,7 @@ async function retryMvpAnalysis(candidate = currentCandidate()) {
     candidate.jobId = job.id; candidate.extractionStatus = job.status; candidate.jobError = null; saveState(); setScreen('analysis');
     GuanchaJobPoller.start({ jobId: job.id, resourceId: candidate.serverCandidateId, versionId: job.id, fetchStatus: apiClient.getJob, getCurrentVersion: () => candidate.jobId, onUpdate: async status => {
       candidate.extractionStatus = status.status;
-      if (status.status === 'completed' && status.extraction_version_id) { applyExtraction(candidate, await apiClient.getCurrentExtraction(candidate.serverCandidateId)); saveState(); setScreen('result'); }
+      if (status.status === 'completed' && status.extraction_version_id) { applyExtraction(candidate, await apiClient.getCurrentExtraction(candidate.serverCandidateId)); finishAnalysisDeadline(); saveState(); setScreen('result'); }
       else if (status.status === 'failed') { candidate.jobError = status.error_code; saveState(); render(); }
     }});
   } catch (error) { candidate.extractionStatus = 'failed'; candidate.jobError = error.code || 'network_error'; saveState(); render(); }
@@ -1090,7 +1141,11 @@ function renderAnalysis() {
   const failedCandidates = state.candidates
     .map((candidate, index) => ({ candidate, index }))
     .filter(({ candidate }) => candidate.extractionStatus === 'failed');
-  if (failedCandidates.length) {
+  if (failedCandidates.length || state.analysisDeadlineReached) {
+    if (state.analysisDeadlineReached) {
+      const retryAction = failedCandidates.length ? 'retry-analysis' : 'retry-decision';
+      return `<section class="analysis-page" aria-live="polite"><img src="${asset('AI分析等待插画.svg')}" alt="分析等待插画" /><h1>分析未完成</h1><p>这次分析没有顺利完成，可以重新试一次。</p><div class="analysis-retry-actions"><button class="primary-btn" data-action="${retryAction}">重新分析</button></div></section>`;
+    }
     const failureItems = failedCandidates.map(({ candidate, index }) => {
       const label = `候选 ${candidate.letter || String.fromCharCode(65 + index)}`;
       return `<li>${escapeHtml(label)}：这张图片暂时没分析成功，请确认截图清晰后再试一次。</li>`;
@@ -1101,7 +1156,7 @@ function renderAnalysis() {
     }).join('');
     return `<section class="analysis-page" aria-live="polite"><img src="${asset('AI分析等待插画.svg')}" alt="分析等待插画" /><h1>分析未完成</h1><p>以下候选未能完成分析，请检查图片或服务后重试。</p><ul class="analysis-failures">${failureItems}</ul><p class="soft-note">已完成的候选信息会保留，不会重复分析。</p><div class="analysis-retry-actions">${retryActions}</div></section>`;
   }
-  return `<section class="analysis-page" aria-live="polite"><img src="${asset('AI分析等待插画.svg')}" alt="分析等待插画" /><h1>正在分析中</h1><p>正在整理这些茶的商品信息、风格线索和与你这次需求有关的差异。</p><div class="analysis-dots"><i></i><i></i><i></i></div></section>`;
+  return `<section class="analysis-page" aria-live="polite"><img src="${asset('AI分析等待插画.svg')}" alt="分析等待插画" /><h1>正在分析中</h1><p class="analysis-progress-message">${analysisProgressMessage()}</p><div class="analysis-dots"><i></i><i></i><i></i></div></section>`;
 }
 
 function appendMerchantReplyForm() {
@@ -1372,7 +1427,7 @@ function detailSection(title, body) { return `<section class="detail-list card">
 function renderSettings() { const signedIn = authClient?.getState().status === 'authenticated'; return `<section class="page settings-page">${greeting()}${titleWithSub('标题_设置.svg','设置','把你的偏好和本地演示数据放在这里。')}<section class="settings-list card"><button data-action="open-preferences"><span>${icon('leaf',23)} 初始口味偏好</span>${icon('right',20)}</button><button data-action="show-evidence"><span>${icon('book',23)} 近期饮用证据</span>${icon('right',20)}</button><button data-action="reset-demo"><span>${icon('jar',23)} 清除本地演示数据</span>${icon('right',20)}</button>${signedIn ? '<button data-action="logout"><span>退出登录</span><span>›</span></button>' : ''}</section>${tabbar()}</section>`; }
 
 function renderOverlay() {
-  if (state.overlay === 'source') return `<div class="overlay" data-action="close-overlay"><section class="sheet"><div class="sheet-handle"></div>${wordmark('add-candidate.svg', 'wordmark--source-add', '添加候选')}<button class="source-choice" data-action="choose-camera"><span>${icon('camera')}</span><b>拍照</b><span>›</span></button><button class="source-choice" data-action="choose-album"><span>${icon('photo')}</span><b>从相册上传商品截图</b><span>›</span></button><button class="source-choice" data-action="use-sample-candidate" ${sampleCandidateInFlight ? 'disabled' : ''}><span>${icon('leaf')}</span><b>${sampleCandidateInFlight ? '正在准备示例候选…' : '使用示例候选'}</b><span>›</span></button><button class="sheet-close" style="display:block;margin:28px auto 0" data-action="close-overlay" aria-label="关闭">${icon('close')}</button></section></div>`;
+  if (state.overlay === 'source') return `<div class="overlay" data-action="close-overlay"><section class="sheet"><div class="sheet-handle"></div>${wordmark('add-candidate.svg', 'wordmark--source-add', '添加候选')}<button class="source-choice" data-action="choose-camera"><span>${icon('camera')}</span><b>拍照</b><span>›</span></button><button class="source-choice" data-action="choose-album"><span>${icon('photo')}</span><b>从相册选择</b><span>›</span></button><button class="source-choice" data-action="use-sample-candidate" ${sampleCandidateInFlight ? 'disabled' : ''}><span>${icon('leaf')}</span><b>${sampleCandidateInFlight ? '正在准备示例候选…' : '使用示例'}</b><span>›</span></button><button class="sheet-close" style="display:block;margin:28px auto 0" data-action="close-overlay" aria-label="关闭">${icon('close')}</button></section></div>`;
   if (state.overlay === 'camera') return `<div class="overlay"><section class="sheet camera-sheet"><div class="sheet-handle"></div><div class="sheet-title-row"><h2 class="sheet-title">拍照识别</h2><button class="sheet-close" data-action="close-overlay" aria-label="关闭">${icon('close')}</button></div><div class="camera-preview"><video id="camera-preview" autoplay playsinline muted aria-label="电脑摄像头预览"></video><div class="camera-fallback" id="camera-fallback" hidden>暂时无法访问电脑摄像头。<br><button class="secondary-btn" data-action="choose-album">从相册选择图片</button></div></div><div class="camera-actions"><button class="camera-cancel" data-action="close-overlay" aria-label="取消">${icon('close',22)}</button><button class="camera-capture" data-action="capture-camera" aria-label="拍摄"></button><span aria-hidden="true"></span></div></section></div>`;
   if (state.overlay === 'need-editor') return `<div class="modal"><form class="modal-box" data-action="save-needs"><h2>编辑本次需求</h2><div class="form-row"><label for="need-taste">口味或偏好</label><input id="need-taste" name="taste" value="${escapeHtml(state.need.taste)}" /></div><div class="form-row"><label for="need-purpose">用途</label><input id="need-purpose" name="purpose" value="${escapeHtml(state.need.purpose)}" /></div><div class="form-row"><label for="need-budget">预算</label><input id="need-budget" name="budget" value="${escapeHtml(state.need.budget)}" /></div><div class="modal-actions"><button class="secondary-btn" type="button" data-action="close-overlay">取消</button><button class="primary-btn" style="width:auto;height:44px;padding:0 18px;font-size:16px" type="submit">保存</button></div></form></div>`;
   if (state.overlay === 'plan-editor') { const p=ensureBrew().plan; return `<div class="modal"><form class="modal-box" data-action="save-plan"><h2>调整冲泡参数</h2><div class="form-row"><label>茶具<input name="ware" value="${escapeHtml(p.ware)}" /></label></div><div class="form-row"><label>注水量<input name="water" value="${escapeHtml(p.water)}" /></label></div><div class="form-row"><label>投茶量<input name="grams" value="${escapeHtml(p.grams)}" /></label></div><div class="form-row"><label>水温<input name="temp" value="${escapeHtml(p.temp)}" /></label></div><div class="form-row"><label>第 1 泡秒数<input type="number" min="3" max="60" name="seconds" value="${p.seconds}" /></label></div><div class="modal-actions"><button class="secondary-btn" type="button" data-action="close-overlay">取消</button><button class="primary-btn" style="width:auto;height:44px;padding:0 18px;font-size:16px" type="submit">保存参数</button></div></form></div>`; }
@@ -1638,6 +1693,7 @@ document.addEventListener('click', event => {
   if (action === 'start-analysis') {
     if (analysisInFlight) return;
     analysisInFlight = true;
+    beginAnalysisDeadline({ reset: true });
     render();
     return Promise.resolve(startMvpAnalysis()).finally(() => {
       analysisInFlight = false;
@@ -1649,9 +1705,10 @@ document.addEventListener('click', event => {
     const candidate = candidateId
       ? state.candidates.find(item => candidateIdentity(item) === candidateId)
       : currentCandidate();
+    beginAnalysisDeadline({ reset: true });
     return retryMvpAnalysis(candidate || currentCandidate());
   }
-  if (action === 'retry-decision') { state.decisionJobId = null; state.decisionStatus = 'not_requested'; saveState(); return maybeStartSessionDecision(); }
+  if (action === 'retry-decision') { state.decisionJobId = null; state.decisionError = null; state.decisionStatus = 'not_requested'; beginAnalysisDeadline({ reset: true }); saveState(); return maybeStartSessionDecision(); }
   if (action === 'ask') return openFollowupQuestions();
   if (action === 'update-merchant-judgement') {
     if (rejudgeInFlight) return;
@@ -2004,6 +2061,7 @@ function stopRuntimeBusinessState() {
   stopBrewTimer();
   stopCamera();
   GuanchaJobPoller.cancelAll?.();
+  clearAnalysisDeadline();
   sampleCandidateInFlight = false;
   analysisInFlight = false;
   merchantReplyInFlight = false;
@@ -2021,6 +2079,13 @@ function authErrorCode(error) {
   if (error?.code === 'post_purchase_sync_failed' || error?.code === 'network_unavailable') return 'post_purchase_sync_failed';
   return 'authentication_service_unavailable';
 }
+function isTransientBootstrapError(error) {
+  return new Set([
+    'network_unavailable', 'service_unavailable', 'backend_unavailable',
+    'database_not_configured', 'post_purchase_sync_failed',
+    'authentication_service_unavailable',
+  ]).has(error?.code);
+}
 function rebuildApiClient() {
   apiClient = GuanchaApi.createApiClient({
     baseUrl: configuredApiBaseUrl,
@@ -2035,41 +2100,53 @@ function hasAccountLocalState() {
 }
 async function enterAuthenticatedProduct() {
   authBootState = { status: 'loading', errorCode: null };
-  try {
-    const currentUser = await apiClient.getMe();
-    const hadLocalState = hasAccountLocalState();
-    const changed = await GuanchaAuth.establishAccountBoundary({ userId: currentUser.id, stores: GuanchaStores });
-    if (changed || !hadLocalState) {
-      stopRuntimeBusinessState();
-      state = freshAuthenticatedState();
-    }
-    const preferenceSync = await hydrateAuthenticatedPreferences();
-    const postPurchaseSync = await hydrateAuthenticatedPostPurchase();
-    state.authView = null;
-    authBootState = { status: 'authenticated', errorCode: null };
-    appReady = true;
-    render();
-    if (!preferenceSync.preferenceLoaded || !preferenceSync.evidenceLoaded || !postPurchaseSync.warehouseLoaded || !postPurchaseSync.journalLoaded) {
-      showToast('偏好暂未从云端同步，已保留当前设置。');
-    }
-    resumeLiveBackendState();
-  } catch (error) {
-    stopRuntimeBusinessState();
-    appReady = false;
-    state.authView = 'login';
-    if (authErrorCode(error) === 'invalid_session') {
-      try {
-        await authClient.signOut();
-        authBootState = { status: 'unauthenticated', errorCode: null };
-      } catch {
-        logoutPending = true;
-        authBootState = { status: 'error', errorCode: 'authentication_service_unavailable' };
+  let bootstrapAttempt = 0;
+  let bootstrapError = null;
+  while (bootstrapAttempt < 2) {
+    try {
+      const currentUser = await apiClient.getMe();
+      const hadLocalState = hasAccountLocalState();
+      const changed = await GuanchaAuth.establishAccountBoundary({ userId: currentUser.id, stores: GuanchaStores });
+      if (changed || !hadLocalState) {
+        stopRuntimeBusinessState();
+        state = freshAuthenticatedState();
       }
-    } else {
-      authBootState = { status: 'error', errorCode: authErrorCode(error) };
+      const preferenceSync = await hydrateAuthenticatedPreferences();
+      const postPurchaseSync = await hydrateAuthenticatedPostPurchase();
+      state.authView = null;
+      authBootState = { status: 'authenticated', errorCode: null };
+      appReady = true;
+      render();
+      if (!preferenceSync.preferenceLoaded || !preferenceSync.evidenceLoaded || !postPurchaseSync.warehouseLoaded || !postPurchaseSync.journalLoaded) {
+        showToast('偏好暂未从云端同步，已保留当前设置。');
+      }
+      resumeLiveBackendState();
+      return;
+    } catch (error) {
+      if (bootstrapAttempt === 0 && isTransientBootstrapError(error)) {
+        bootstrapAttempt = 1;
+        continue;
+      }
+      bootstrapError = error;
+      break;
     }
-    render();
   }
+  const error = bootstrapError || new Error('authenticated bootstrap failed');
+  stopRuntimeBusinessState();
+  appReady = false;
+  state.authView = 'login';
+  if (authErrorCode(error) === 'invalid_session') {
+    try {
+      await authClient.signOut();
+      authBootState = { status: 'unauthenticated', errorCode: null };
+    } catch {
+      logoutPending = true;
+      authBootState = { status: 'error', errorCode: 'authentication_service_unavailable' };
+    }
+  } else {
+    authBootState = { status: 'error', errorCode: authErrorCode(error) };
+  }
+  render();
 }
 function enterAnonymousProduct() {
   appReady = true;

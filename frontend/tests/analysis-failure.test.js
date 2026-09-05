@@ -16,6 +16,7 @@ function renderAnalysisFor(state) {
     candidateIdentity: candidate => candidate.id,
     escapeHtml: value => String(value).replace(/[&<>'"]/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[character])),
     asset: name => `assets/${name}`,
+    analysisProgressMessage: () => '正在读取商品信息…',
   };
   vm.runInNewContext(`${appSource.slice(start, end)}; globalThis.renderAnalysis = renderAnalysis;`, context, { filename: 'app.js' });
   return context.renderAnalysis();
@@ -94,6 +95,19 @@ test('queued or processing candidates without failures remain in the loading sta
 
   assert.match(html, /正在分析中/);
   assert.doesNotMatch(html, /分析未完成/);
+});
+
+test('analysis deadline renders one product-facing retry without exposing internals', () => {
+  const html = renderAnalysisFor({
+    analysisDeadlineReached: true,
+    activeCandidate: 0,
+    candidates: [{ id: 'candidate-a', extractionStatus: 'failed', jobError: 'analysis_timeout' }],
+  });
+
+  assert.match(html, /这次分析没有顺利完成，可以重新试一次/);
+  assert.match(html, /data-action="retry-analysis"/);
+  assert.doesNotMatch(html, /analysis_timeout/);
+  assert.doesNotMatch(html, /jobError|provider|traceback/);
 });
 
 test('retrying one failed candidate preserves the completed candidate state', async () => {
